@@ -8,10 +8,12 @@ use crate::metrics;
 use crate::pool::{PacketPool, Pkt};
 use crate::util::BarrierFlag;
 use crate::parser::SeqExtractor;
-use crossbeam::queue::ArrayQueue;
+use crate::spsc::SpscQueue;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use crate::pool::TsKind;
+#[cfg(target_os = "linux")]
+use crate::pool::PktBuf;
 #[cfg(target_os = "linux")]
 use bytes::BufMut;
 
@@ -22,7 +24,7 @@ pub fn afxdp_loop(
     _queue_id: u32,
     _seq: Arc<dyn SeqExtractor>,
     _chan_name: &str,
-    _q_out: Arc<ArrayQueue<Pkt>>,
+    _q_out: Arc<SpscQueue<Pkt>>,
     _pool: Arc<PacketPool>,
     _shutdown: Arc<BarrierFlag>,
 ) -> anyhow::Result<()> {
@@ -35,7 +37,7 @@ pub fn afxdp_loop(
     _queue_id: u32,
     seq: Arc<dyn SeqExtractor>,
     chan_name: &str,
-    q_out: Arc<ArrayQueue<Pkt>>,
+    q_out: Arc<SpscQueue<Pkt>>,
     pool: Arc<PacketPool>,
     shutdown: Arc<BarrierFlag>,
 ) -> anyhow::Result<()> {
@@ -45,7 +47,7 @@ pub fn afxdp_loop(
     use std::mem::size_of;
     use std::ptr::null_mut;
 
-    // Open AF_PACKET raw socket
+    // Open AF_PACKET raw socket (fallback path)
     let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32) };
     if fd < 0 { return Err(anyhow::anyhow!("AF_PACKET socket failed: {}", std::io::Error::last_os_error())); }
 
@@ -98,6 +100,24 @@ pub fn afxdp_loop(
         )
     };
     if rc != 0 { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("bind AF_PACKET failed")); }
+
+    // Enable PACKET_FANOUT to distribute frames across multiple sockets/threads
+    // when spawning multiple workers. Use HASH policy for even distribution.
+    {
+        const PACKET_FANOUT: libc::c_int = 18; // from linux/if_packet.h
+        const PACKET_FANOUT_HASH: u16 = 0;
+        let group_id: u16 = (_queue_id as u16).wrapping_add(1);
+        let val: u32 = ((group_id as u32) << 16) | (PACKET_FANOUT_HASH as u32);
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                PACKET_FANOUT,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<u32>() as libc::socklen_t,
+            )
+        };
+    }
 
     // Mmap ring
     let ring_len = (block_size as usize) * (block_nr as usize);
@@ -165,7 +185,7 @@ pub fn afxdp_loop(
                     buf.advance_mut(nbytes);
                     let seqv = seq.extract_seq(&buf);
                     if let Some(sv) = seqv {
-                        let pkt = Pkt { buf, len: nbytes, seq: sv, ts_nanos, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                        let pkt = Pkt { buf: PktBuf::Bytes(buf), len: nbytes, seq: sv, ts_nanos, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
                         if let Err(_full) = q_out.push(pkt) {
                             dropped += 1;
                             metrics::inc_rx_drop(chan_name);

@@ -63,7 +63,7 @@ fn run(rx: Receiver<RecoveryRequest>) {
 // the Pkt contract intact. The on-wire replay protocol is venue-specific;
 // replace the body of `fetch_and_inject` accordingly.
 
-use crate::pool::{PacketPool, Pkt, TsKind};
+use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
 
 pub fn spawn_tcp_injector<A: std::net::ToSocketAddrs + Send + 'static>(
     addr: A,
@@ -156,7 +156,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
             read_so_far += n;
         }
         unsafe { bufm.advance_mut(len); }
-        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
+        let mut pkt = Pkt { buf: PktBuf::Bytes(bufm), len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
         // Backpressure: do not drop; block in userspace until space frees
         loop {
             match q_merged.push(pkt) {

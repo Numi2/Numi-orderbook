@@ -16,6 +16,8 @@ pub struct AppConfig {
     pub snapshot: Option<SnapshotCfg>,
     pub recovery: Option<RecoveryCfg>,
     pub afxdp: Option<AfxdpCfg>,
+    #[serde(default)]
+    pub feeds: Option<Feeds>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,6 +90,12 @@ pub struct Merge {
     pub initial_expected_seq: u64,
     pub reorder_window: u64,        // window for out-of-order buffering
     pub max_pending_packets: usize, // hard cap for pending map
+    #[serde(default)]
+    pub dwell_ns: Option<u64>,      // preferred minimum dwell between A/B switches
+    #[serde(default)]
+    pub adaptive: bool,             // enable adaptive reorder window tuning
+    #[serde(default)]
+    pub reorder_window_max: Option<u64>, // cap for adaptive window
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +151,15 @@ pub struct AfxdpCfg {
     pub ifname: String,
     #[serde(default)]
     pub queue_id: u32,
+    #[serde(default)]
+    /// Number of RX queues (RSS) to spawn when using AF_XDP/AF_PACKET ring
+    pub queues: Option<usize>,
+    #[serde(default)]
+    /// UMEM frame size (bytes) for AF_XDP (hint; fallback path ignores)
+    pub umem_frame_size: Option<usize>,
+    #[serde(default)]
+    /// UMEM total frames for AF_XDP (hint; fallback path ignores)
+    pub umem_frame_count: Option<usize>,
 }
 
 fn default_ifname() -> String { "eth0".to_string() }
@@ -174,6 +191,12 @@ impl AppConfig {
         if self.channels.b.workers.unwrap_or(1) > 1 && !self.channels.b.reuse_port {
             anyhow::bail!("channels.b.workers > 1 requires reuse_port = true");
         }
+        if let Some(ref feeds) = self.feeds {
+            for p in &feeds.pops {
+                if p.ws_endpoints.len() != 2 { anyhow::bail!("each pop.ws_endpoints must have 2 entries"); }
+                if p.h3_endpoints.len() != 2 { anyhow::bail!("each pop.h3_endpoints must have 2 entries"); }
+            }
+        }
         Ok(())
     }
 }
@@ -186,3 +209,50 @@ pub enum TimestampingMode {
     Hardware,
     HardwareRaw,
 }
+
+// ---------- Feeds / Publishers ----------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Feeds {
+    #[serde(default)]
+    pub enabled: bool,
+    pub pops: Vec<Pop>,
+    #[serde(default)]
+    pub tls: Option<TlsCfg>,
+    #[serde(default)]
+    pub obo: Option<OboFeedCfg>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Pop {
+    pub name: String,
+    pub ws_endpoints: Vec<String>, // two endpoints per POP
+    pub h3_endpoints: Vec<String>, // two endpoints per POP
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsCfg {
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OboFeedCfg {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub symbols: Option<Vec<String>>, // optional filter
+    #[serde(default)]
+    pub buffers: Option<BuffersCfg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuffersCfg {
+    #[serde(default = "default_pub_queue")] pub pub_queue: usize,
+    #[serde(default = "default_client_max_lag_frames")] pub client_max_lag_frames: usize,
+}
+
+fn default_pub_queue() -> usize { 65536 }
+fn default_client_max_lag_frames() -> usize { 16384 }

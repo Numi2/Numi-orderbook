@@ -165,3 +165,7 @@ On Linux, enabling `[afxdp] enable = true` replaces channel A’s socket RX with
 ### Notes
 
 This code favors clarity on the cold path and extreme efficiency on the hot path. The hot loops avoid heap allocations, hold no locks beyond single‑writer state, and reuse pre‑sized buffers. Configure `max_messages_per_packet` to right‑size per‑packet event vectors.
+
+### Binary OBO feed (raw v1)
+
+This build exposes a binary WebSocket OBO feed (Order‑by‑Order L3 events) with two endpoints per POP for first‑arrival dedupe by sequence. See `docs/obo_raw_v1.md` for wire format and API.

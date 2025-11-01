@@ -4,7 +4,11 @@ use crate::orderbook::OrderBook;
 use crate::parser::Parser;
 use crate::pool::{PacketPool, Pkt};
 use crate::util::{now_nanos, BarrierFlag};
-use crossbeam::queue::ArrayQueue;
+use crate::obo::{map_event_to_obo_parts, OboEventV1};
+use crate::codec_raw::msg_type;
+use crate::codec_raw::channel_id;
+use crate::pubsub::Publisher as OboPublisher;
+use crate::spsc::SpscQueue;
 use crossbeam_channel::Sender;
 use crossbeam_channel::Receiver;
 use log::info;
@@ -18,11 +22,12 @@ pub struct DecodeConfig {
     pub snapshot_tx: Option<Sender<crate::orderbook::BookExport>>,
     pub initial_book: Option<OrderBook>,
     pub snapshot_trigger_rx: Option<Receiver<()>>,
+    pub obo_publisher: Option<OboPublisher>,
 }
 
 // TODO: Group arguments into a DecodeConfig struct to reduce parameter count.
 pub fn decode_loop(
-    q_in: Arc<ArrayQueue<Pkt>>,
+    q_in: Arc<SpscQueue<Pkt>>,
     pool: Arc<PacketPool>,
     parser: Parser,
     shutdown: Arc<BarrierFlag>,
@@ -47,9 +52,11 @@ pub fn decode_loop(
             metrics::inc_decode_pkts();
 
             events.clear();
-            // Destructure to move buffer without extra allocation
-            let Pkt { buf, len, ts_nanos, merge_emit_ns, .. } = pkt;
-            dec.decode_messages(&buf[..len], &mut events);
+            let ts_nanos = pkt.ts_nanos;
+            let _ts_kind = pkt._ts_kind;
+            let merge_emit_ns = pkt.merge_emit_ns;
+            let payload = pkt.payload();
+            dec.decode_messages(payload, &mut events);
             processed_msgs += events.len() as u64;
             metrics::inc_decode_msgs(events.len() as u64);
 
@@ -62,15 +69,40 @@ pub fn decode_loop(
 
             for ev in &events {
                 book.apply(ev);
+                if let Some(pubh) = &cfg.obo_publisher {
+                    let (maybe_instr, maybe_obo) = map_event_to_obo_parts(ev);
+                    if let Some(obo_ev) = maybe_obo {
+                        // Determine instrument id for this event
+                        let instr_opt: Option<u32> = if let Some(i) = maybe_instr { Some(i) } else {
+                            match *ev {
+                                crate::parser::Event::Mod { order_id, .. } => book.instrument_for_order(order_id),
+                                crate::parser::Event::Del { order_id } => book.instrument_for_order(order_id),
+                                crate::parser::Event::Trade { instr, .. } => Some(instr),
+                                _ => None,
+                            }
+                        };
+                        let instr = instr_opt.unwrap_or(0) as u64;
+                        let (msg_ty, payload_bytes) = match obo_ev {
+                            OboEventV1::Add(p) => (msg_type::OBO_ADD, p.as_bytes().to_vec()),
+                            OboEventV1::Modify(p) => (msg_type::OBO_MODIFY, p.as_bytes().to_vec()),
+                            OboEventV1::Cancel(p) => (msg_type::OBO_CANCEL, p.as_bytes().to_vec()),
+                            OboEventV1::Execute(p) => (msg_type::OBO_EXECUTE, p.as_bytes().to_vec()),
+                        };
+                        let seq = pubh.next_seq_for_instrument(instr);
+                        pubh.publish_raw(msg_ty, channel_id::OBO_L3, instr, seq, &payload_bytes);
+                    }
+                }
             }
 
             let now_ns = now_nanos();
             if ts_nanos != 0 && now_ns > ts_nanos {
-                metrics::observe_latency_ns(now_ns - ts_nanos);
+                let d = now_ns - ts_nanos;
+                metrics::observe_latency_ns(d);
+                metrics::observe_latency_by_kind_ns(_ts_kind, d);
             }
 
-            // Return buffer to pool without creating a new BytesMut allocation
-            pool.put(buf);
+            // Return backing buffer to pool (if Bytes variant)
+            pkt.recycle(&pool);
 
             let mut should_snapshot = last_snap.elapsed() >= snap_every;
             if !should_snapshot {

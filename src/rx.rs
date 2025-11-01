@@ -1,10 +1,10 @@
 // src/rx.rs (: metrics)
 use crate::metrics;
 use crate::parser::SeqExtractor;
-use crate::pool::{PacketPool, Pkt, TsKind};
+use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
 use crate::util::{now_nanos};
 use anyhow::Context;
-use crossbeam::queue::ArrayQueue;
+use crate::spsc::SpscQueue;
 use log::debug;
 use nix::errno::Errno;
 use std::net::UdpSocket;
@@ -30,7 +30,7 @@ pub fn rx_loop(
     chan_name: &str,
     sock: &UdpSocket,
     seq: Arc<dyn SeqExtractor>,
-    q_out: Arc<ArrayQueue<Pkt>>,
+    q_out: Arc<SpscQueue<Pkt>>,
     pool: Arc<PacketPool>,
     shutdown: Arc<crate::util::BarrierFlag>,
     cfg: RxConfig,
@@ -120,7 +120,7 @@ pub fn rx_loop(
                         buf.advance_mut(n);
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                            let pkt = Pkt { buf: PktBuf::Bytes(buf), len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);
@@ -213,7 +213,7 @@ pub fn rx_loop(
                         unsafe { buf.advance_mut(n); }
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: kind, merge_emit_ns: 0 };
+                            let pkt = Pkt { buf: PktBuf::Bytes(buf), len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: kind, merge_emit_ns: 0 };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);

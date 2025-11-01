@@ -5,10 +5,17 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 [features]
-default = ["ws", "h3", "obo"]
+default = ["ws", "obo"]
 ws = []
-h3 = []
 obo = []
+# Enable HTTP/3 stack only when feature "h3" is selected
+h3 = [
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:quinn",
+    "dep:rustls",
+    "dep:rcgen",
+]
 [dependencies]
 anyhow = "1.0"
 thiserror = "1.0"
@@ -35,6 +42,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 zerocopy = { version = "0.7", features = ["derive"] }
 tungstenite = { version = "0.21", optional = false }
 url = "2.5"
+http = "0.2"
+# HTTP/3 stack behind feature "h3" to avoid crates that may not be available
+quinn = { version = "0.10", default-features = false, features = ["rustls"], optional = true }
+rustls = { version = "0.21", optional = true }
+h3 = { version = "0.0.8", optional = true }
+h3-quinn = { version = "0.0.8", optional = true }
+rcgen = { version = "0.11", optional = true }
 
 [profile.release]
 lto = "fat"

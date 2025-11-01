@@ -99,3 +99,30 @@ pub fn adaptive_wait(idle_iters: &mut u32, base_spins: u32) {
         *idle_iters = 256; // clamp
     }
 }
+
+// -------- NUMA helpers (best-effort without extra deps) --------
+pub fn iface_numa_node(ifname: &str) -> Option<i32> {
+    let path = format!("/sys/class/net/{}/device/numa_node", ifname);
+    std::fs::read_to_string(path).ok()?.trim().parse::<i32>().ok()
+}
+
+pub fn node_cpulist(node: i32) -> Option<String> {
+    let path = format!("/sys/devices/system/node/node{}/cpulist", node);
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+pub fn cpulist_contains(cpulist: &str, cpu_id: usize) -> bool {
+    // Parse cpulist format like "0-3,8,10-11"
+    for part in cpulist.split(',') {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+        if let Some((a,b)) = part.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                if cpu_id >= lo && cpu_id <= hi { return true; }
+            }
+        } else if let Ok(v) = part.parse::<usize>() {
+            if v == cpu_id { return true; }
+        }
+    }
+    false
+}

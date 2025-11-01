@@ -112,6 +112,46 @@ static E2E_LATENCY: Lazy<Histogram> = Lazy::new(|| {
     h
 });
 
+// Optional per-timestamp-source latency histograms for deeper analysis
+static E2E_LATENCY_SW: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![
+        1e-7, 2e-7, 5e-7,
+        1e-6, 2e-6, 5e-6,
+        1e-5, 2e-5, 5e-5,
+        1e-4,
+    ];
+    let h = Histogram::with_opts(HistogramOpts::new("e2e_latency_seconds_sw", "E2E latency (software timestamps)")
+        .buckets(buckets)).expect("e2e_latency_sw");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
+static E2E_LATENCY_SYS: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![
+        1e-7, 2e-7, 5e-7,
+        1e-6, 2e-6, 5e-6,
+        1e-5, 2e-5, 5e-5,
+        1e-4,
+    ];
+    let h = Histogram::with_opts(HistogramOpts::new("e2e_latency_seconds_hw_sys", "E2E latency (system hardware timestamps)")
+        .buckets(buckets)).expect("e2e_latency_hw_sys");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
+static E2E_LATENCY_RAW: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![
+        1e-7, 2e-7, 5e-7,
+        1e-6, 2e-6, 5e-6,
+        1e-5, 2e-5, 5e-5,
+        1e-4,
+    ];
+    let h = Histogram::with_opts(HistogramOpts::new("e2e_latency_seconds_hw_raw", "E2E latency (raw hardware timestamps)")
+        .buckets(buckets)).expect("e2e_latency_hw_raw");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
 // SummaryVec is not available in our prometheus version; keep histograms only
 
 static STAGE_RX_TO_MERGE: Lazy<Histogram> = Lazy::new(|| {
@@ -143,6 +183,13 @@ static QUEUE_HWM: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 static HWM_TRACK: Lazy<Mutex<HashMap<&'static str, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+static TS_MONO_VIOL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(Opts::new("ts_monotonic_violations", "Timestamp monotonic violations per queue"), &["queue"]) 
+        .expect("ts_monotonic_violations");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 pub fn inc_rx(chan: &str, bytes: usize) {
     RX_PACKETS.with_label_values(&[chan]).inc();
     RX_BYTES.with_label_values(&[chan]).inc_by(bytes as u64);
@@ -171,6 +218,15 @@ pub fn observe_latency_ns(ns: u64) {
     E2E_LATENCY.observe(secs);
 }
 
+pub fn observe_latency_by_kind_ns(kind: crate::pool::TsKind, ns: u64) {
+    let secs = (ns as f64) / 1_000_000_000.0;
+    match kind {
+        crate::pool::TsKind::Sw | crate::pool::TsKind::None => E2E_LATENCY_SW.observe(secs),
+        crate::pool::TsKind::HwSys => E2E_LATENCY_SYS.observe(secs),
+        crate::pool::TsKind::HwRaw => E2E_LATENCY_RAW.observe(secs),
+    }
+}
+
 // pub fn observe_e2e_by_ts_ns(ns: u64, ts_kind: &str) { /* removed */ }
 
 pub fn observe_stage_rx_to_merge_ns(ns: u64) {
@@ -194,6 +250,41 @@ pub fn set_queue_len(queue: &'static str, len: usize) {
         QUEUE_HWM.with_label_values(&[queue]).set(*e);
     }
 }
+
+pub fn inc_ts_mono_violation(queue: &'static str) {
+    TS_MONO_VIOL.with_label_values(&[queue]).inc();
+}
+
+// Outbound (WS/H3) -----
+
+static WS_CLIENTS: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new("ws_clients", "Number of connected websocket clients").expect("ws_clients");
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+static OUT_FRAMES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new("out_frames_total", "Frames sent to clients").expect("out_frames_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static OUT_BYTES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new("out_bytes_total", "Bytes sent to clients").expect("out_bytes_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static DROPPED_CLIENTS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new("dropped_clients_total", "Clients dropped due to lag/gap").expect("dropped_clients_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+pub fn inc_ws_clients(delta: i64) { WS_CLIENTS.add(delta); }
+pub fn inc_out_frames() { OUT_FRAMES.inc(); }
+pub fn inc_out_bytes(n: usize) { OUT_BYTES.inc_by(n as u64); }
+pub fn inc_dropped_clients() { DROPPED_CLIENTS.inc(); }
 
 pub fn spawn_http<A: ToSocketAddrs + Send + 'static>(addr: A, snapshot_trigger: Option<Sender<()>>) -> thread::JoinHandle<()> {
     let addr_string = addr.to_socket_addrs().ok()

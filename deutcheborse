@@ -86,3 +86,5 @@ Sources:
 	•	Deutsche Börse “High Precision Timestamps” Service Brief (hardware timestamp at network edge for accurate latency measurement)
 	•	Deutsche Börse Cloud Access Point PoC – Multicast A/B feeds ￼ (redundant multicast stream design for reliability)
 	•	Eurex T7 Release Notes – Recovery and state management ￼ (out-of-band recovery, start-of-day snapshots, client order book maintenance)
+
+    -Numan Thabit

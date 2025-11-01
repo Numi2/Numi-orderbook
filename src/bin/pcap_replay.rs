@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 6 {
-        eprintln!("usage: pcap_replay <pcap_file> <group> <port> <iface_ipv4> <pps>");
+        eprintln!("usage: pcap_replay <pcap_file> <group> <port> <iface_ipv4> <pps> [report_ms]");
         std::process::exit(2);
     }
     let path = &args[1];
@@ -15,6 +15,7 @@ fn main() -> anyhow::Result<()> {
     let iface: Ipv4Addr = args[4].parse()?;
     let pps: u64 = args[5].parse()?;
     let nanos_per_pkt = if pps == 0 { 0 } else { 1_000_000_000u64 / pps };
+    let report_ms: u64 = if args.len() > 6 { args[6].parse().unwrap_or(1000) } else { 1000 };
 
     // Open destination socket
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -33,6 +34,8 @@ fn main() -> anyhow::Result<()> {
     let le = magic == 0xA1B2C3D4 || magic == 0xA1B23C4D; // basic check
     off = 24; // skip global header
     let start = std::time::Instant::now();
+    let mut last_report = start;
+    let mut sent_last = 0u64;
     let mut sent = 0u64;
     while off + 16 <= data.len() {
         let (incl_len, _) = if le { read_le_u32(&data, off + 8) } else { read_be_u32(&data, off + 8) };
@@ -44,6 +47,14 @@ fn main() -> anyhow::Result<()> {
         let _ = sock.send_to(pkt, &dest.into());
         sent += 1;
         if nanos_per_pkt > 0 { busy_sleep_nanos(nanos_per_pkt); }
+        if last_report.elapsed().as_millis() as u64 >= report_ms {
+            let interval = last_report.elapsed().as_secs_f64();
+            let delta = sent - sent_last;
+            let mpps = (delta as f64) / 1_000_000.0 / interval;
+            eprintln!("rate: {:.3} Mpps ({} pkts in {:.3} s)", mpps, delta, interval);
+            last_report = std::time::Instant::now();
+            sent_last = sent;
+        }
     }
     eprintln!("replayed {} packets in {:?}", sent, start.elapsed());
     Ok(())

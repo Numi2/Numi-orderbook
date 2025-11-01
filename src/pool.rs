@@ -2,6 +2,7 @@
 use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
 use std::sync::Arc;
+use std::slice;
 
 pub struct PacketPool {
     inner: Arc<ArrayQueue<BytesMut>>,
@@ -11,8 +12,8 @@ pub struct PacketPool {
 impl PacketPool {
     pub fn new(pool_size: usize, max_packet_size: usize) -> anyhow::Result<Self> {
         let q = Arc::new(ArrayQueue::new(pool_size));
-        // Pre-allocate a portion of the pool to warm caches and reduce first-packet jitters
-        let prealloc = pool_size.min(1024);
+        // Pre-allocate the entire pool to warm caches and avoid runtime allocations
+        let prealloc = pool_size;
         for _ in 0..prealloc {
             let _ = q.push(BytesMut::with_capacity(max_packet_size));
         }
@@ -42,8 +43,15 @@ impl PacketPool {
 pub enum TsKind { None = 0, Sw = 1, HwSys = 2, HwRaw = 3 }
 
 #[derive(Debug)]
+pub enum PktBuf {
+    Bytes(BytesMut),
+    #[allow(dead_code)]
+    Umem { ptr: *mut u8, len: usize, frame_idx: u32 },
+}
+
+#[derive(Debug)]
 pub struct Pkt {
-    pub buf: BytesMut,
+    pub buf: PktBuf,
     pub len: usize,
     pub seq: u64,
     pub ts_nanos: u64,
@@ -51,6 +59,24 @@ pub struct Pkt {
     pub _ts_kind: TsKind,
     /// Timestamp when merge forwarded the packet to decode queue
     pub merge_emit_ns: u64,
+}
+
+impl Pkt {
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        match &self.buf {
+            PktBuf::Bytes(b) => &b[..self.len],
+            PktBuf::Umem { ptr, len, .. } => unsafe { slice::from_raw_parts(*ptr as *const u8, *len) },
+        }
+    }
+
+    #[inline]
+    pub fn recycle(self, pool: &PacketPool) {
+        match self.buf {
+            PktBuf::Bytes(b) => pool.put(b),
+            PktBuf::Umem { .. } => { /* TODO: return to UMEM completion ring */ }
+        }
+    }
 }
 
 

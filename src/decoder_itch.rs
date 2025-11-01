@@ -18,11 +18,18 @@
 
 use crate::parser::{Event, MessageDecoder, Side};
 use hashbrown::HashMap;
-use std::sync::Mutex;
+use std::cell::UnsafeCell;
 
 pub struct Itch50Decoder {
-    inner: Mutex<Inner>,
+    // Decoder is used by a single decode thread; we avoid mutex overhead.
+    inner: UnsafeCell<Inner>,
 }
+
+// Safety: We only use this decoder from a single thread (decode thread). We still
+// need to satisfy trait bounds (Send + Sync) because the parser is cloned across
+// threads but the decoder is not used there.
+unsafe impl Send for Itch50Decoder {}
+unsafe impl Sync for Itch50Decoder {}
 
 #[derive(Default)]
 struct Inner {
@@ -42,7 +49,7 @@ struct OrderState {
 
 impl Itch50Decoder {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(Inner::default()) }
+        Self { inner: UnsafeCell::new(Inner::default()) }
     }
 }
 
@@ -54,9 +61,7 @@ impl MessageDecoder for Itch50Decoder {
     #[inline]
     fn decode_messages(&self, payload: &[u8], out: &mut Vec<Event>) {
         let mut off = 0usize;
-
-        // Lock once per packet for minimal overhead.
-        let mut st = self.inner.lock().expect("itch decoder mutex");
+        let st: &mut Inner = unsafe { &mut *self.inner.get() };
 
         while off + 3 <= payload.len() {
             let msg_len = be_u16(&payload[off..off + 2]) as usize;
@@ -77,14 +82,14 @@ impl MessageDecoder for Itch50Decoder {
             off += msg_len - 1;
 
             match typ {
-                'A' => on_add(body, &mut st, out, /*with_mpid*/ false),
-                'F' => on_add(body, &mut st, out, /*with_mpid*/ true),
-                'E' => on_exec(body, &mut st, out, /*with_price*/ false),
-                'C' => on_exec(body, &mut st, out, /*with_price*/ true),
-                'X' => on_cancel(body, &mut st, out),
-                'D' => on_delete(body, &mut st, out),
-                'U' => on_replace(body, &mut st, out),
-                'P' => on_trade(body, &mut st, out),
+                'A' => on_add(body, st, out, /*with_mpid*/ false),
+                'F' => on_add(body, st, out, /*with_mpid*/ true),
+                'E' => on_exec(body, st, out, /*with_price*/ false),
+                'C' => on_exec(body, st, out, /*with_price*/ true),
+                'X' => on_cancel(body, st, out),
+                'D' => on_delete(body, st, out),
+                'U' => on_replace(body, st, out),
+                'P' => on_trade(body, st, out),
                 'R' => on_stock_directory(body, &mut st),
                 // skip harmlessly
                 _ => { /* ignore other admin/metadata messages */ }
