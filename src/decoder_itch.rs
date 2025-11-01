@@ -109,7 +109,7 @@ impl MessageDecoder for Itch50Decoder {
 #[inline] fn be_u64(b: &[u8]) -> u64 { u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
 
 #[inline]
-fn read_fixed<const N: usize>(b: &[u8], off: &mut usize) -> Option<&[u8; N]> {
+fn read_fixed<'a, const N: usize>(b: &'a [u8], off: &mut usize) -> Option<&'a [u8; N]> {
     if *off + N <= b.len() {
         // SAFETY: slice length checked
         let ptr = &b[*off..*off + N];
@@ -121,11 +121,11 @@ fn read_fixed<const N: usize>(b: &[u8], off: &mut usize) -> Option<&[u8; N]> {
 }
 
 #[inline]
-fn read_u16(b: &[u8], off: &mut usize) -> Option<u16> { read_fixed::<2>(b, off).map(|v| be_u16(v)) }
+fn read_u16(b: &[u8], off: &mut usize) -> Option<u16> { read_fixed::<2>(b, off).map(|v| u16::from_be_bytes(*v)) }
 #[inline]
-fn read_u32(b: &[u8], off: &mut usize) -> Option<u32> { read_fixed::<4>(b, off).map(|v| be_u32(v)) }
+fn read_u32(b: &[u8], off: &mut usize) -> Option<u32> { read_fixed::<4>(b, off).map(|v| u32::from_be_bytes(*v)) }
 #[inline]
-fn read_u64(b: &[u8], off: &mut usize) -> Option<u64> { read_fixed::<8>(b, off).map(|v| be_u64(v)) }
+fn read_u64(b: &[u8], off: &mut usize) -> Option<u64> { read_fixed::<8>(b, off).map(|v| u64::from_be_bytes(*v)) }
 
 fn on_stock_directory(body: &[u8], st: &mut Inner) {
     // 'R' Stock Directory (varies by venue/version). We only keep symbol by locate for debugging.

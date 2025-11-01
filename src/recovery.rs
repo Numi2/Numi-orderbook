@@ -4,6 +4,9 @@ use crate::metrics;
 use crossbeam::queue::ArrayQueue;
 use std::sync::Arc;
 use std::thread;
+use bytes::BufMut;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 
 #[derive(Debug, Clone)]
 pub enum RecoveryRequest {
@@ -60,17 +63,18 @@ fn run(rx: Receiver<RecoveryRequest>) {
 // the Pkt contract intact. The on-wire replay protocol is venue-specific;
 // replace the body of `fetch_and_inject` accordingly.
 
-use crate::pool::{PacketPool, Pkt};
+use crate::pool::{PacketPool, Pkt, TsKind};
 
 pub fn spawn_tcp_injector<A: std::net::ToSocketAddrs + Send + 'static>(
     addr: A,
     q_merged: Arc<ArrayQueue<Pkt>>,
     pool: Arc<PacketPool>,
+    backlog_path: Option<String>,
 ) -> (Client, RecoveryHandle) {
     let (tx, rx) = crossbeam_channel::bounded::<RecoveryRequest>(1024);
     let join = std::thread::Builder::new()
         .name("recovery-tcp".into())
-        .spawn(move || run_injector(addr, q_merged, pool, rx))
+        .spawn(move || run_injector(addr, q_merged, pool, rx, backlog_path))
         .expect("spawn recovery injector");
     (Client { tx }, RecoveryHandle { join })
 }
@@ -80,12 +84,18 @@ fn run_injector<A: std::net::ToSocketAddrs>(
     q_merged: Arc<ArrayQueue<Pkt>>,
     pool: Arc<PacketPool>,
     rx: Receiver<RecoveryRequest>,
+    backlog_path: Option<String>,
 ) {
     log::info!("recovery injector running (tcp={:?})", addr.to_socket_addrs().ok().and_then(|mut it| it.next()));
+    let mut backlog = backlog_path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
     while let Ok(req) = rx.recv() {
         match req {
             RecoveryRequest::Gap { from, to } => {
                 if from > to { continue; }
+                if let Some(f) = backlog.as_mut() {
+                    let _ = writeln!(f, "gap {} {}", from, to);
+                    let _ = f.flush();
+                }
                 if let Err(e) = fetch_and_inject(&addr, from, to, &q_merged, &pool) {
                     log::error!("replay fetch failed: {e:?}");
                 }
@@ -132,7 +142,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
             read_so_far += n;
         }
         unsafe { bufm.advance_mut(len); }
-        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R' };
+        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
         // Backpressure: do not drop; block in userspace until space frees
         loop {
             match q_merged.push(pkt) {

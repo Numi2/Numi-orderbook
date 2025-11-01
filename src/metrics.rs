@@ -1,11 +1,13 @@
 // src/metrics.rs
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use std::net::ToSocketAddrs;
 use std::thread;
 use crossbeam_channel::Sender;
+use std::sync::Mutex;
+use hashbrown::HashMap;
 
 static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
@@ -110,6 +112,43 @@ static E2E_LATENCY: Lazy<Histogram> = Lazy::new(|| {
     h
 });
 
+// SummaryVec is not available in our prometheus version; keep histograms only
+
+static STAGE_RX_TO_MERGE: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![1e-7, 2e-7, 5e-7, 1e-6, 2e-6, 5e-6, 1e-5, 2e-5];
+    let h = Histogram::with_opts(HistogramOpts::new("stage_rx_to_merge_seconds", "RX to merge forwarding latency").buckets(buckets)).expect("stage_rx_to_merge");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
+static STAGE_MERGE_TO_DECODE: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![1e-7, 2e-7, 5e-7, 1e-6, 2e-6, 5e-6, 1e-5, 2e-5];
+    let h = Histogram::with_opts(HistogramOpts::new("stage_merge_to_decode_seconds", "Merge to decode dequeue latency").buckets(buckets)).expect("stage_merge_to_decode");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
+static STAGE_DECODE_APPLY: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![1e-7, 2e-7, 5e-7, 1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4];
+    let h = Histogram::with_opts(HistogramOpts::new("stage_decode_apply_seconds", "Decode and apply time per packet").buckets(buckets)).expect("stage_decode_apply");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
+static QUEUE_LEN: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(Opts::new("queue_len", "Current length of internal queues"), &["queue"]).expect("queue_len");
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+static QUEUE_HWM: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(Opts::new("queue_hwm", "High-water mark of internal queues"), &["queue"]).expect("queue_hwm");
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+static HWM_TRACK: Lazy<Mutex<HashMap<&'static str, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 pub fn inc_rx(chan: &str, bytes: usize) {
     RX_PACKETS.with_label_values(&[chan]).inc();
     RX_BYTES.with_label_values(&[chan]).inc_by(bytes as u64);
@@ -138,6 +177,33 @@ pub fn observe_latency_ns(ns: u64) {
     E2E_LATENCY.observe(secs);
 }
 
+// pub fn observe_e2e_by_ts_ns(ns: u64, ts_kind: &str) { /* removed */ }
+
+pub fn observe_stage_rx_to_merge_ns(ns: u64) {
+    let secs = (ns as f64) / 1_000_000_000.0;
+    STAGE_RX_TO_MERGE.observe(secs);
+}
+
+pub fn observe_stage_merge_to_decode_ns(ns: u64) {
+    let secs = (ns as f64) / 1_000_000_000.0;
+    STAGE_MERGE_TO_DECODE.observe(secs);
+}
+
+pub fn observe_stage_decode_apply_ns(ns: u64) {
+    let secs = (ns as f64) / 1_000_000_000.0;
+    STAGE_DECODE_APPLY.observe(secs);
+}
+
+pub fn set_queue_len(queue: &'static str, len: usize) {
+    QUEUE_LEN.with_label_values(&[queue]).set(len as i64);
+    let mut hwm = HWM_TRACK.lock().unwrap();
+    let e = hwm.entry(queue).or_insert(0);
+    if *e < len as i64 {
+        *e = len as i64;
+        QUEUE_HWM.with_label_values(&[queue]).set(*e);
+    }
+}
+
 pub fn spawn_http<A: ToSocketAddrs + Send + 'static>(addr: A, snapshot_trigger: Option<Sender<()>>) -> thread::JoinHandle<()> {
     let addr_string = addr.to_socket_addrs().ok()
         .and_then(|mut it| it.next())
@@ -163,6 +229,11 @@ pub fn spawn_http<A: ToSocketAddrs + Send + 'static>(addr: A, snapshot_trigger: 
                     let ok = snapshot_trigger.as_ref().map(|tx| tx.try_send(())).is_some();
                     let status = if ok { 202 } else { 503 };
                     let _ = req.respond(tiny_http::Response::empty(status));
+                } else if url == "/live" || url == "/healthz" {
+                    let _ = req.respond(tiny_http::Response::from_string("OK").with_status_code(200));
+                } else if url == "/ready" {
+                    // Minimal readiness: server up and metrics registry available
+                    let _ = req.respond(tiny_http::Response::from_string("READY").with_status_code(200));
                 } else {
                     let _ = req.respond(tiny_http::Response::empty(404));
                 }

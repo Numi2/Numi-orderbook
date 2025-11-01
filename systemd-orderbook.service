@@ -1,0 +1,19 @@
+[Unit]
+Description=Orderbook Market Data Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/orderbook /etc/orderbook/config.toml
+WorkingDirectory=/var/lib/orderbook
+Restart=always
+RestartSec=1
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+
+

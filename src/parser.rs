@@ -2,6 +2,7 @@
 use crate::config::{Endian, ParserKind};
 use crate::decoder_itch::Itch50Decoder;
 use crate::decoder_eobi::EobiSbeDecoder;
+use crate::decoder_fast::FastEmdiDecoder;
 use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 
@@ -61,7 +62,7 @@ pub fn build_parser(kind: ParserKind, seq: SeqCfg, max_per_packet: usize) -> any
 
     let dec_impl: Arc<dyn MessageDecoder> = match kind {
         ParserKind::FixedBinary => Arc::new(EobiSbeDecoder::new()),
-        ParserKind::FastLike => Arc::new(FastLikeDecoder::default()),
+        ParserKind::FastLike => Arc::new(FastEmdiDecoder::new()),
         ParserKind::Itch50 => Arc::new(Itch50Decoder::new()),
     };
 
@@ -110,15 +111,4 @@ impl SeqExtractor for FixedSeq {
 // FixedBinaryDecoder was a synthetic format used for bring-up. It has been
 // replaced by a real EOBI/SBE-like implementation in `decoder_eobi.rs`.
 
-#[derive(Default)]
-struct FastLikeDecoder;
-impl MessageDecoder for FastLikeDecoder {
-    fn decode_messages(&self, payload: &[u8], out: &mut Vec<Event>) {
-        if payload.is_empty() {
-            out.push(Event::Heartbeat);
-        } else {
-            // Reuse the SBE/EOBI-like framing for FAST-like testing environments.
-            EobiSbeDecoder::default().decode_messages(payload, out);
-        }
-    }
-}
+// FastLike is implemented by FastEmdiDecoder in decoder_fast.rs

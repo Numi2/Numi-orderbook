@@ -6,7 +6,9 @@ mod metrics;
 mod net;
 mod orderbook;
 mod parser;
+mod decoder_eobi;
 mod decoder_itch;
+mod decoder_fast;
 mod rx_afxdp;
 mod pool;
 mod recovery;
@@ -29,14 +31,26 @@ use std::thread;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
 fn main() -> anyhow::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
     let cfg_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
+    // Load config before logger to allow JSON formatting choice
     let cfg = AppConfig::from_file(&cfg_path)?;
+
+    if cfg.general.json_logs {
+        let mut b = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+        b.format(|buf, record| {
+            use std::io::Write;
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            writeln!(buf, "{{\"ts\":\"{}\",\"level\":\"{}\",\"target\":\"{}\",\"msg\":\"{}\"}}",
+                ts, record.level(), record.target(), record.args().to_string().replace('"', "'"))
+        }).init();
+    } else {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    }
+
     info!("loaded config: {:?}", cfg);
 
     let shutdown = Arc::new(BarrierFlag::default());
@@ -110,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     // Recovery manager: TCP injector if enabled, else logger-only
     let (recovery_client, recovery_handle) = if let Some(rcfg) = &cfg.recovery {
         if rcfg.enable_injector {
-            recovery::spawn_tcp_injector(rcfg.endpoint.clone(), q_merged.clone(), pool.clone())
+            recovery::spawn_tcp_injector(rcfg.endpoint.clone(), q_merged.clone(), pool.clone(), rcfg.backlog_path.clone())
         } else {
             recovery::spawn_logger()
         }
@@ -131,10 +145,11 @@ fn main() -> anyhow::Result<()> {
     let t_rx_a = if cfg.afxdp.as_ref().map(|c| c.enable).unwrap_or(false) {
         let ifname = cfg.afxdp.as_ref().unwrap().ifname.clone();
         let qid = cfg.afxdp.as_ref().unwrap().queue_id;
+        let seq_a = parser.seq_extractor();
         thread::Builder::new().name("afxdp".into()).spawn(move || {
             pin_to_core_if_set(cfg.cpu.a_rx_core);
             set_realtime_priority_if(cfg.cpu.rt_priority);
-            if let Err(e) = rx_afxdp::afxdp_loop(&ifname, qid, q_a, pool_a, rx_a_shutdown) {
+            if let Err(e) = rx_afxdp::afxdp_loop(&ifname, qid, seq_a, "A", q_a, pool_a, rx_a_shutdown) {
                 error!("afxdp failed: {e:?}");
             }
         })?
@@ -146,6 +161,7 @@ fn main() -> anyhow::Result<()> {
             let pool_ai = pool.clone();
             let q_ai = q_rx_a.clone();
             let parser_ai = parser.clone();
+            let cfg = cfg.clone();
             let name = format!("rx-A-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
                 pin_to_core_if_set(cfg.cpu.a_rx_core);
@@ -159,7 +175,7 @@ fn main() -> anyhow::Result<()> {
                     rx_a_shutdown_i,
                     cfg.general.spin_loops_per_yield,
                     cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-                    cfg.channels.a.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
+                    cfg.channels.a.timestamping.clone(),
                 ) {
                     error!("rx-A failed: {e:?}");
                 }
@@ -179,6 +195,7 @@ fn main() -> anyhow::Result<()> {
             let pool_bi = pool.clone();
             let q_bi = q_rx_b.clone();
             let parser_bi = parser.clone();
+            let cfg = cfg.clone();
             let name = format!("rx-B-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
                 pin_to_core_if_set(cfg.cpu.b_rx_core);
@@ -192,7 +209,7 @@ fn main() -> anyhow::Result<()> {
                     rx_b_shutdown_i,
                     cfg.general.spin_loops_per_yield,
                     cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-                    cfg.channels.b.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
+                    cfg.channels.b.timestamping.clone(),
                 ) {
                     error!("rx-B failed: {e:?}");
                 }
@@ -206,13 +223,14 @@ fn main() -> anyhow::Result<()> {
     let merge_shutdown = shutdown.clone();
     let parser_m = parser.clone();
     let recovery_cli = recovery_client.clone();
+    let q_merged_for_merge = q_merged.clone();
     let t_merge = thread::Builder::new().name("merge".into()).spawn(move || {
         pin_to_core_if_set(cfg.cpu.merge_core);
         set_realtime_priority_if(cfg.cpu.rt_priority);
         if let Err(e) = merge_loop(
             q_rx_a,
             q_rx_b,
-            q_merged,
+            q_merged_for_merge,
             parser_m.seq_extractor(),
             cfg.merge.initial_expected_seq,
             cfg.merge.reorder_window,

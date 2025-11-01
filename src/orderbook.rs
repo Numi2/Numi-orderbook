@@ -35,35 +35,7 @@ struct Level {
 impl Level {
     #[inline] fn is_empty(&self) -> bool { self.count == 0 }
 
-    fn push_back(&mut self, h: Handle, orders: &mut Slab<Node>) {
-        let n = &mut orders[h];
-        n.prev = self.tail;
-        n.next = None;
-        match self.tail {
-            Some(t) => { orders[t].next = Some(h); }
-            None => { self.head = Some(h); }
-        }
-        self.tail = Some(h);
-        self.count += 1;
-        self.total_qty += n.qty;
-    }
-
-    fn unlink(&mut self, h: Handle, orders: &mut Slab<Node>) {
-        let (prev, next, qty) = {
-            let n = &orders[h];
-            (n.prev, n.next, n.qty)
-        };
-        if let Some(p) = prev { orders[p].next = next; } else { self.head = next; }
-        if let Some(nh) = next { orders[nh].prev = prev; } else { self.tail = prev; }
-        self.count -= 1;
-        self.total_qty -= qty;
-    }
-
-    fn set_qty(&mut self, h: Handle, new_qty: i64, orders: &mut Slab<Node>) {
-        let n = &mut orders[h];
-        self.total_qty += new_qty - n.qty;
-        n.qty = new_qty;
-    }
+    // Methods operating purely on Level are kept minimal; order-node mutation is handled in InstrumentBook
 
     /// Iterate handles FIFO from head to tail
     fn iter_fifo<'a>(&self, orders: &'a Slab<Node>) -> LevelIter<'a> {
@@ -102,24 +74,53 @@ impl InstrumentBook {
 
     fn add(&mut self, order_id: u64, price: i64, qty: i64, side: Side) -> Handle {
         let h = self.orders.insert(Node::new(order_id, price, qty, side));
-        let lvl = self.levels_mut(side).entry(price).or_default();
-        lvl.push_back(h, &mut self.orders);
+        // Obtain previous tail without holding the level borrow across order mutations
+        let prev_tail = {
+            let lvl = self.levels_mut(side).entry(price).or_default();
+            lvl.tail
+        };
+        if let Some(t) = prev_tail { self.orders[t].next = Some(h); }
+        {
+            let n = &mut self.orders[h];
+            n.prev = prev_tail;
+            n.next = None;
+        }
+        {
+            let lvl = self.levels_mut(side).entry(price).or_default();
+            if prev_tail.is_none() { lvl.head = Some(h); }
+            lvl.tail = Some(h);
+            lvl.count += 1;
+            lvl.total_qty += qty;
+        }
         h
     }
 
     fn set_qty(&mut self, h: Handle, new_qty: i64) {
-        let price = self.orders[h].price;
-        let side  = self.orders[h].side;
+        let (price, side, old_qty) = {
+            let n = &self.orders[h];
+            (n.price, n.side, n.qty)
+        };
+        {
+            let n = &mut self.orders[h];
+            n.qty = new_qty;
+        }
         if let Some(lvl) = self.levels_mut(side).get_mut(&price) {
-            lvl.set_qty(h, new_qty, &mut self.orders);
+            lvl.total_qty += new_qty - old_qty;
         }
     }
 
     fn cancel(&mut self, h: Handle) {
-        let price = self.orders[h].price;
-        let side  = self.orders[h].side;
+        let (price, side, prev, next, qty) = {
+            let n = &self.orders[h];
+            (n.price, n.side, n.prev, n.next, n.qty)
+        };
+        if let Some(p) = prev { self.orders[p].next = next; }
+        if let Some(nh) = next { self.orders[nh].prev = prev; }
         if let Some(lvl) = self.levels_mut(side).get_mut(&price) {
-            lvl.unlink(h, &mut self.orders);
+            if prev.is_none() { lvl.head = next; }
+            if next.is_none() { lvl.tail = prev; }
+            lvl.count = lvl.count.saturating_sub(1);
+            lvl.total_qty -= qty;
             if lvl.is_empty() {
                 self.levels_mut(side).remove(&price);
             }
@@ -174,10 +175,6 @@ impl OrderBook {
 
     pub fn set_consume_trades(&mut self, v: bool) {
         self.consume_trades = v;
-    }
-
-    pub fn set_consume_trades(&mut self, on: bool) {
-        self.consume_trades = on;
     }
 
     #[inline]

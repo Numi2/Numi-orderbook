@@ -8,7 +8,7 @@ my experimeent in building an exchange‑style market‑data stack. inspired hea
 - **In‑memory full‑depth order book** with price–time semantics
 - **Snapshots** (export/import) and **Prometheus metrics**
 - **Recovery injector** (TCP) that feeds recovered sequences into the same pipeline
-- **Kernel bypass ready**: optional AF_XDP receiver preserves the `Pkt` buffer contract
+- **Kernel-bypass style RX**: optional AF_XDP path with high-performance PACKET_MMAP ring fallback
 
 ### Architecture
 
@@ -23,6 +23,7 @@ my experimeent in building an exchange‑style market‑data stack. inspired hea
 
 - **EOBI/SBE‑like**: default when `parser.kind = "fixed_binary"`. Frames are parsed with minimal copies and mapped to `Event`s.
 - **ITCH 5.0**: `parser.kind = "itch50"`. Includes stateful handling of add/modify/execute/cancel/replace and trades.
+- **FAST/EMDI‑like**: `parser.kind = "fast_like"`. Minimal, production‑ready subset decoder using stop‑bit integers and presence maps sufficient for Add/Mod/Del/Trade.
 
 ### Build
 
@@ -47,6 +48,7 @@ merge_queue_capacity = 65536
 spin_loops_per_yield = 64
 rx_recvmmsg_batch = 32        # repeated recv/recvmsg per loop (>=1)
 mlock_all = true              # mlockall current+future pages (Linux)
+json_logs = false             # structured JSON logs to stdout
 
 [sequence]
 offset = 0
@@ -107,6 +109,7 @@ enable_writer = true
 [recovery]
 enable_injector = false
 endpoint = "127.0.0.1:9000"  # venue‑specific replay endpoint (if enabled)
+backlog_path = "/var/lib/t7_like/recovery.log"  # optional append-only gap log
 
 [afxdp]
 enable = false                # if true, replaces channel A socket RX with AF_XDP
@@ -132,6 +135,7 @@ Some venues do not send explicit Mod/Del updates after a trade. If your feed has
 
 - Prometheus endpoint at `/metrics` on `metrics.bind`
 - Trigger on-demand snapshot with `GET /snapshot` (returns 202 on success)
+- Health endpoints: `/live`, `/ready`, `/healthz`
 - Examples: `rx_packets{chan="A"}`, `rx_bytes{chan="B"}`, `merge_gaps`, `decode_messages`, `book_live_orders`, `e2e_latency_seconds`
 
 ### Snapshots
@@ -139,9 +143,9 @@ Some venues do not send explicit Mod/Del updates after a trade. If your feed has
 - Periodic writer saves atomically to the configured path
 - On startup, the snapshot is loaded if present and `load_on_start = true`
 
-### AF_XDP
+### AF_XDP / PACKET_MMAP
 
-An AF_XDP receiver is stubbed and Linux-only. Enable via `[afxdp] enable = true` to replace channel A’s socket RX; on non-Linux builds it will error out. Production UMEM/ring wiring is required on your target NIC/driver.
+On Linux, enabling `[afxdp] enable = true` replaces channel A’s socket RX with a high‑performance mmap’ed packet ring. The code attempts AF_XDP if available and falls back to PACKET_RX_RING (TPACKET_V2) for broad compatibility. Packets are parsed to UDP payload and fed into the pipeline with a single copy into the pool buffer.
 
 ### Directory layout
 

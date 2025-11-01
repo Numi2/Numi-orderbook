@@ -20,7 +20,7 @@ pub fn merge_loop(
     recovery: Option<RecoveryClient>,
 ) -> anyhow::Result<()> {
     let cap: usize = (reorder_window as usize).saturating_add(1);
-    let mut ring: Vec<Option<Pkt>> = vec![None; cap];
+    let mut ring: Vec<Option<Pkt>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;
 
     // Prefer-A with hysteresis: start preferring A; switch if we forward
@@ -41,13 +41,13 @@ pub fn merge_loop(
             let pkt = if take_a_first { q_a.pop() } else { q_b.pop() };
             if let Some(pkt) = pkt {
                 let s = pkt.seq;
-                if std::hint::unlikely(s < next_seq) {
+                if s < next_seq {
                     metrics::inc_merge_dup();
                     continue;
                 }
-                if std::hint::likely(s == next_seq) {
+                if s == next_seq {
                     let chan = if pkt.chan == b'A' { "A" } else { "B" };
-                    forward(&q_out, pkt)?;
+                    forward(&q_out, pkt);
                     metrics::inc_merge_forward_chan(chan);
                     next_seq = next_seq.wrapping_add(1);
                     moved = true;
@@ -58,7 +58,7 @@ pub fn merge_loop(
                             pending_count = pending_count.saturating_sub(1);
                             metrics::inc_merge_ooo();
                             let c = if node.chan == b'A' { "A" } else { "B" };
-                            forward(&q_out, node)?;
+                            forward(&q_out, node);
                             metrics::inc_merge_forward_chan(c);
                             next_seq = next_seq.wrapping_add(1);
                         } else {
@@ -90,7 +90,7 @@ pub fn merge_loop(
                     }
                 } else {
                     let distance = s.wrapping_sub(next_seq);
-                    if std::hint::likely(distance <= reorder_window) && pending_count < max_pending {
+                    if distance <= reorder_window && pending_count < max_pending {
                         let idx = (s % (cap as u64)) as usize;
                         if ring[idx].is_some() {
                             metrics::inc_merge_dup();
@@ -125,6 +125,20 @@ pub fn merge_loop(
 }
 
 #[inline]
-fn forward(q_out: &Arc<ArrayQueue<Pkt>>, pkt: Pkt) -> anyhow::Result<()> {
-    q_out.push(pkt).map_err(|_| anyhow::anyhow!("merge output queue full"))
+fn forward(q_out: &Arc<ArrayQueue<Pkt>>, mut pkt: Pkt) {
+    // Stage timing and mark merge emit time
+    let now = crate::util::now_nanos();
+    if pkt.ts_nanos != 0 && now > pkt.ts_nanos {
+        metrics::observe_stage_rx_to_merge_ns(now - pkt.ts_nanos);
+    }
+    pkt.merge_emit_ns = now;
+    loop {
+        match q_out.push(pkt) {
+            Ok(()) => break,
+            Err(ret) => {
+                pkt = ret;
+                crate::util::spin_wait(32);
+            }
+        }
+    }
 }

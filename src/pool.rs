@@ -36,6 +36,10 @@ impl PacketPool {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TsKind { None = 0, Sw = 1, HwSys = 2, HwRaw = 3 }
+
 #[derive(Debug)]
 pub struct Pkt {
     pub buf: BytesMut,
@@ -43,6 +47,9 @@ pub struct Pkt {
     pub seq: u64,
     pub ts_nanos: u64,
     pub chan: u8,
+    pub ts_kind: TsKind,
+    /// Timestamp when merge forwarded the packet to decode queue
+    pub merge_emit_ns: u64,
 }
 
 

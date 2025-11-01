@@ -29,6 +29,8 @@ pub struct General {
     pub rx_recvmmsg_batch: Option<usize>, // if Some(N>1), enable batched recvmmsg
     #[serde(default)]
     pub mlock_all: bool,            // mlockall current+future (Linux; best-effort)
+    #[serde(default)]
+    pub json_logs: bool,            // structured JSON logs to stdout
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +103,9 @@ pub struct RecoveryCfg {
     pub enable_injector: bool,
     /// TCP endpoint of replay service (e.g. "10.0.0.1:9000")
     pub endpoint: String,
+    #[serde(default)]
+    /// Optional path to append-only backlog of gap requests
+    pub backlog_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,6 +166,12 @@ impl AppConfig {
         }
         if self.merge.reorder_window == 0 {
             anyhow::bail!("merge.reorder_window must be > 0");
+        }
+        if self.channels.a.workers.unwrap_or(1) > 1 && !self.channels.a.reuse_port {
+            anyhow::bail!("channels.a.workers > 1 requires reuse_port = true");
+        }
+        if self.channels.b.workers.unwrap_or(1) > 1 && !self.channels.b.reuse_port {
+            anyhow::bail!("channels.b.workers > 1 requires reuse_port = true");
         }
         Ok(())
     }
