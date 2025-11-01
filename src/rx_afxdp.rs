@@ -165,7 +165,7 @@ pub fn afxdp_loop(
                     buf.advance_mut(nbytes);
                     let seqv = seq.extract_seq(&buf);
                     if let Some(sv) = seqv {
-                        let pkt = Pkt { buf, len: nbytes, seq: sv, ts_nanos, chan: chan_id, ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                        let pkt = Pkt { buf, len: nbytes, seq: sv, ts_nanos, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
                         if let Err(_full) = q_out.push(pkt) {
                             dropped += 1;
                             metrics::inc_rx_drop(chan_name);

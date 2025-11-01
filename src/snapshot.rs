@@ -69,7 +69,7 @@ fn current_time_ns() -> u64 {
 use crossbeam_channel::{Receiver, Sender};
 
 pub struct SnapshotWriter {
-    tx: Sender<BookExport>,
+    _tx: Sender<BookExport>,
     join: thread::JoinHandle<()>,
 }
 
@@ -80,7 +80,7 @@ impl SnapshotWriter {
             .name("snapshot-writer".into())
             .spawn(move || run_writer(path, rx))
             .expect("spawn snapshot writer");
-        (tx.clone(), SnapshotWriter { tx, join })
+        (tx.clone(), SnapshotWriter { _tx: tx, join })
     }
 
     pub fn join(self) {

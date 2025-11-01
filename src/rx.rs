@@ -114,7 +114,7 @@ pub fn rx_loop(
                         buf.advance_mut(n);
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);
@@ -207,7 +207,7 @@ pub fn rx_loop(
                         unsafe { buf.advance_mut(n); }
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, ts_kind: kind, merge_emit_ns: 0 };
+                            let pkt = Pkt { buf, len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: kind, merge_emit_ns: 0 };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);

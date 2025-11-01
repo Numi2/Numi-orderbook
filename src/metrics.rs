@@ -128,12 +128,7 @@ static STAGE_MERGE_TO_DECODE: Lazy<Histogram> = Lazy::new(|| {
     h
 });
 
-static STAGE_DECODE_APPLY: Lazy<Histogram> = Lazy::new(|| {
-    let buckets = vec![1e-7, 2e-7, 5e-7, 1e-6, 2e-6, 5e-6, 1e-5, 2e-5, 5e-5, 1e-4];
-    let h = Histogram::with_opts(HistogramOpts::new("stage_decode_apply_seconds", "Decode and apply time per packet").buckets(buckets)).expect("stage_decode_apply");
-    REGISTRY.register(Box::new(h.clone())).ok();
-    h
-});
+// removed: decode stage histogram; e2e plus stage boundaries suffice
 
 static QUEUE_LEN: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(Opts::new("queue_len", "Current length of internal queues"), &["queue"]).expect("queue_len");
@@ -180,39 +175,24 @@ pub fn observe_latency_ns(ns: u64) {
 // pub fn observe_e2e_by_ts_ns(ns: u64, ts_kind: &str) { /* removed */ }
 
 pub fn observe_stage_rx_to_merge_ns(ns: u64) {
-    #[cfg(feature = "heavy_metrics")]
-    {
-        let secs = (ns as f64) / 1_000_000_000.0;
-        STAGE_RX_TO_MERGE.observe(secs);
-    }
+    let secs = (ns as f64) / 1_000_000_000.0;
+    STAGE_RX_TO_MERGE.observe(secs);
 }
 
 pub fn observe_stage_merge_to_decode_ns(ns: u64) {
-    #[cfg(feature = "heavy_metrics")]
-    {
-        let secs = (ns as f64) / 1_000_000_000.0;
-        STAGE_MERGE_TO_DECODE.observe(secs);
-    }
+    let secs = (ns as f64) / 1_000_000_000.0;
+    STAGE_MERGE_TO_DECODE.observe(secs);
 }
 
-pub fn observe_stage_decode_apply_ns(ns: u64) {
-    #[cfg(feature = "heavy_metrics")]
-    {
-        let secs = (ns as f64) / 1_000_000_000.0;
-        STAGE_DECODE_APPLY.observe(secs);
-    }
-}
+// removed
 
 pub fn set_queue_len(queue: &'static str, len: usize) {
-    #[cfg(feature = "heavy_metrics")]
-    {
-        QUEUE_LEN.with_label_values(&[queue]).set(len as i64);
-        let mut hwm = HWM_TRACK.lock().unwrap();
-        let e = hwm.entry(queue).or_insert(0);
-        if *e < len as i64 {
-            *e = len as i64;
-            QUEUE_HWM.with_label_values(&[queue]).set(*e);
-        }
+    QUEUE_LEN.with_label_values(&[queue]).set(len as i64);
+    let mut hwm = HWM_TRACK.lock().unwrap();
+    let e = hwm.entry(queue).or_insert(0);
+    if *e < len as i64 {
+        *e = len as i64;
+        QUEUE_HWM.with_label_values(&[queue]).set(*e);
     }
 }
 

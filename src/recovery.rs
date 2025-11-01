@@ -95,17 +95,16 @@ fn run_injector<A: std::net::ToSocketAddrs>(
         if lo > hi { continue; }
         // Drain more and coalesce
         while let Ok(next) = rx.try_recv() {
-            if let RecoveryRequest::Gap { from, to } = next {
-                if from <= hi.saturating_add(1) && to >= lo.saturating_sub(1) {
-                    // overlap or adjacent
-                    if from < lo { lo = from; }
-                    if to > hi { hi = to; }
-                } else {
-                    // Non-overlapping; log and keep current, push back by logging both
-                    if let Some(f) = backlog.as_mut() {
-                        let _ = writeln!(f, "gap {} {}", from, to);
-                        let _ = f.flush();
-                    }
+            let (from, to) = match next { RecoveryRequest::Gap { from, to } => (from, to) };
+            if from <= hi.saturating_add(1) && to >= lo.saturating_sub(1) {
+                // overlap or adjacent
+                if from < lo { lo = from; }
+                if to > hi { hi = to; }
+            } else {
+                // Non-overlapping; log individually
+                if let Some(f) = backlog.as_mut() {
+                    let _ = writeln!(f, "gap {} {}", from, to);
+                    let _ = f.flush();
                 }
             }
         }
@@ -157,7 +156,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
             read_so_far += n;
         }
         unsafe { bufm.advance_mut(len); }
-        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
+        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
         // Backpressure: do not drop; block in userspace until space frees
         loop {
             match q_merged.push(pkt) {
@@ -171,5 +170,4 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     }
 
     Ok(())
-}
 }

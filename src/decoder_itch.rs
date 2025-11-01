@@ -105,7 +105,9 @@ impl MessageDecoder for Itch50Decoder {
 }
 
 #[inline] fn be_u16(b: &[u8]) -> u16 { u16::from_be_bytes([b[0], b[1]]) }
+#[allow(dead_code)]
 #[inline] fn be_u32(b: &[u8]) -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
+#[allow(dead_code)]
 #[inline] fn be_u64(b: &[u8]) -> u64 { u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
 
 #[inline]

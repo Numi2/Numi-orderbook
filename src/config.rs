@@ -74,6 +74,7 @@ pub struct ChannelCfg {
     pub iface_addr: Ipv4Addr,       // local interface IPv4 of the NIC to join on
     pub reuse_port: bool,
     pub recv_buffer_bytes: u32,     // e.g., 64<<20
+    #[allow(dead_code)]
     pub busy_poll_us: Option<u32>,  // Linux SO_BUSY_POLL (optional)
     pub nonblocking: bool,          // true for busy-spin recv path
     #[serde(default)]
