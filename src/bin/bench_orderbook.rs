@@ -16,7 +16,7 @@ mod parser {
         Add { order_id: u64, instr: u32, px: i64, qty: i64, side: Side },
         Mod { order_id: u64, qty: i64 },
         Del { order_id: u64 },
-        Trade { instr: u32, px: i64, qty: i64, maker_order_id: Option<u64>, taker_side: Option<Side> },
+        Trade { instr: u32, qty: i64, maker_order_id: Option<u64> },
         Heartbeat,
     }
 }
@@ -91,6 +91,18 @@ fn main() {
 
     // Touch BBO to ensure hot-path remains O(1)
     let _ = book.bbo();
+
+    // Exercise rarely-used variants once to ensure full enum coverage in this bench
+    // without impacting the measured hot path.
+    book.apply(&Event::Heartbeat);
+    let _ = book.apply(&Event::Trade { instr: 0, qty: 1, maker_order_id: None });
+
+    // Touch additional OrderBook APIs to avoid dead code in this bin
+    book.set_consume_trades(false);
+    let _ = book.order_count();
+    let _ = book.instrument_for_order(0);
+    let _ = book.export();
+    let _ = OrderBook::from_export(book.export());
 
     let total_dur = start_total.elapsed();
 

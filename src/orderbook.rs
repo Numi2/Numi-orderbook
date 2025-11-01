@@ -18,7 +18,6 @@ fn from_nz(nz: NonZeroUsize) -> Handle { nz.get() - 1 }
 
 #[derive(Clone, Debug)]
 struct Node {
-    order_id: u64,
     price: i64,
     qty: i64,
     side: Side,
@@ -27,8 +26,8 @@ struct Node {
 }
 
 impl Node {
-    #[inline] fn new(order_id: u64, price: i64, qty: i64, side: Side) -> Self {
-        Self { order_id, price, qty, side, prev: None, next: None }
+    #[inline] fn new(price: i64, qty: i64, side: Side) -> Self {
+        Self { price, qty, side, prev: None, next: None }
     }
 }
 
@@ -288,8 +287,8 @@ impl InstrumentBook {
     }
 
     #[inline]
-    fn add(&mut self, order_id: u64, price: i64, qty: i64, side: Side) -> Handle {
-        let h = self.orders.insert(Node::new(order_id, price, qty, side));
+    fn add(&mut self, price: i64, qty: i64, side: Side) -> Handle {
+        let h = self.orders.insert(Node::new(price, qty, side));
         // Obtain previous tail without holding the level borrow across order mutations
         let prev_tail: Option<NonZeroUsize> = { let lvl = self.ensure_level_mut(side, price); lvl.tail };
         let h_nz = to_nz(h);
@@ -474,7 +473,7 @@ impl OrderBook {
         match *ev {
             Event::Add { order_id, instr, px, qty, side } => {
                 let book = self.book_mut(instr);
-                let h = book.add(order_id, px, qty, side);
+                let h = book.add(px, qty, side);
                 self.index.insert(order_id, (instr, h));
                 self.last_instr = Some(instr);
             }
@@ -529,7 +528,7 @@ impl OrderBook {
         for e in events {
             match *e {
                 Event::Add { order_id, instr: ev_instr, px, qty, side } if ev_instr == instr => {
-                    let h = { let b = self.book_mut(instr); b.add(order_id, px, qty, side) };
+                    let h = { let b = self.book_mut(instr); b.add(px, qty, side) };
                     self.index.insert(order_id, (instr, h));
                     self.last_instr = Some(instr);
                 }
@@ -606,6 +605,12 @@ impl OrderBook {
 
     pub fn export(&self) -> BookExport {
         let mut instruments = Vec::with_capacity(self.books.len());
+        // Build a fast reverse map from (instr, handle) -> order_id for snapshot assembly.
+        // This preserves FIFO per price level while avoiding storing order_id in Node.
+        let mut handle_to_id: HashMap<(u32, Handle), u64> = HashMap::with_capacity(self.index.len());
+        for (oid, (ins, h)) in self.index.iter() {
+            handle_to_id.insert((*ins, *h), *oid);
+        }
         for (instr, book) in self.books.iter() {
             let mut orders = Vec::with_capacity(book.orders.len());
             // Bids: best->worst (desc), FIFO per level
@@ -615,7 +620,9 @@ impl OrderBook {
                         let price = book.bids_grid.start_price + (i as i64)*book.bids_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
-                            orders.push(OrderExport { order_id: n.order_id, price, qty: n.qty, side: Side::Bid });
+                            if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
+                                orders.push(OrderExport { order_id: oid, price, qty: n.qty, side: Side::Bid });
+                            }
                         }
                     }
                 }
@@ -623,7 +630,9 @@ impl OrderBook {
             for (price, lvl) in book.bids_overflow.iter().rev() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    orders.push(OrderExport { order_id: n.order_id, price: *price, qty: n.qty, side: Side::Bid });
+                    if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
+                        orders.push(OrderExport { order_id: oid, price: *price, qty: n.qty, side: Side::Bid });
+                    }
                 }
             }
             // Asks: best->worst (asc), FIFO per level
@@ -633,7 +642,9 @@ impl OrderBook {
                         let price = book.asks_grid.start_price + (i as i64)*book.asks_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
-                            orders.push(OrderExport { order_id: n.order_id, price, qty: n.qty, side: Side::Ask });
+                            if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
+                                orders.push(OrderExport { order_id: oid, price, qty: n.qty, side: Side::Ask });
+                            }
                         }
                     }
                 }
@@ -641,7 +652,9 @@ impl OrderBook {
             for (price, lvl) in book.asks_overflow.iter() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    orders.push(OrderExport { order_id: n.order_id, price: *price, qty: n.qty, side: Side::Ask });
+                    if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
+                        orders.push(OrderExport { order_id: oid, price: *price, qty: n.qty, side: Side::Ask });
+                    }
                 }
             }
             instruments.push(InstrumentExport { instr: *instr, orders });
@@ -654,7 +667,7 @@ impl OrderBook {
         for ie in exp.instruments {
             for o in ie.orders {
                 let book = ob.book_mut(ie.instr);
-                let h = book.add(o.order_id, o.price, o.qty, o.side);
+                let h = book.add(o.price, o.qty, o.side);
                 ob.index.insert(o.order_id, (ie.instr, h));
             }
             ob.last_instr = Some(ie.instr);
@@ -670,8 +683,8 @@ mod tests {
     #[test]
     fn fifo_within_level_and_totals() {
         let mut b = InstrumentBook::new();
-        let h1 = b.add(1, 100, 10, Side::Bid);
-        let h2 = b.add(2, 100, 20, Side::Bid);
+        let h1 = b.add(100, 10, Side::Bid);
+        let h2 = b.add(100, 20, Side::Bid);
         let lvl = b.get_level(Side::Bid, 100).unwrap();
         let mut it = lvl.iter_fifo(&b.orders);
         assert_eq!(it.next(), Some(h1));
@@ -691,7 +704,7 @@ mod tests {
     #[test]
     fn remove_empty_levels() {
         let mut b = InstrumentBook::new();
-        let h1 = b.add(1, 101, 10, Side::Ask);
+        let h1 = b.add(101, 10, Side::Ask);
         b.cancel(h1);
         assert!(b.get_level(Side::Ask, 101).is_none());
     }

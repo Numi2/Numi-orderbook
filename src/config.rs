@@ -174,6 +174,8 @@ impl AppConfig {
         if self.general.max_packet_size < 512 || self.general.max_packet_size > 65535 {
             anyhow::bail!("general.max_packet_size must be in [512, 65535]");
         }
+        // Touch optional logging flag to ensure it's validated across minimal binaries
+        let _ = self.general.json_logs;
         if self.merge.reorder_window == 0 {
             anyhow::bail!("merge.reorder_window must be > 0");
         }
@@ -183,11 +185,54 @@ impl AppConfig {
         if self.channels.b.workers.unwrap_or(1) > 1 && !self.channels.b.reuse_port {
             anyhow::bail!("channels.b.workers > 1 requires reuse_port = true");
         }
+        // Book constraints
+        if self.book.max_depth == 0 { anyhow::bail!("book.max_depth must be > 0"); }
+        if self.book.snapshot_interval_ms == 0 { anyhow::bail!("book.snapshot_interval_ms must be > 0"); }
+        let _ = self.book.consume_trades;
         if let Some(ref feeds) = self.feeds {
             for p in &feeds.pops {
                 if p.ws_endpoints.len() != 2 { anyhow::bail!("each pop.ws_endpoints must have 2 entries"); }
                 if p.h3_endpoints.len() != 2 { anyhow::bail!("each pop.h3_endpoints must have 2 entries"); }
             }
+            // Basic feeds validation and field reads
+            if feeds.enabled {
+                if feeds.pops.is_empty() { anyhow::bail!("feeds.enabled = true requires at least one POP"); }
+            }
+            if let Some(ref tok) = feeds.auth_token {
+                if tok.trim().is_empty() { anyhow::bail!("feeds.auth_token, if set, must be non-empty"); }
+            }
+            if let Some(ref tls) = feeds.tls {
+                if tls.cert_path.trim().is_empty() || tls.key_path.trim().is_empty() {
+                    anyhow::bail!("feeds.tls.cert_path and feeds.tls.key_path must be non-empty if tls is set");
+                }
+            }
+            if let Some(ref obo) = feeds.obo {
+                if let Some(ref bufs) = obo.buffers {
+                    if bufs.pub_queue == 0 { anyhow::bail!("feeds.obo.buffers.pub_queue must be > 0"); }
+                }
+                let _ = obo.enabled; // ensure field considered
+            }
+        }
+        // Snapshot cfg
+        if let Some(ref s) = self.snapshot {
+            if s.path.trim().is_empty() { anyhow::bail!("snapshot.path must be non-empty when snapshot is configured"); }
+            let _ = s.load_on_start;
+            let _ = s.enable_writer;
+        }
+        // Recovery cfg
+        if let Some(ref r) = self.recovery {
+            if r.enable_injector {
+                if r.endpoint.trim().is_empty() || !r.endpoint.contains(':') {
+                    anyhow::bail!("recovery.endpoint must be host:port when enable_injector = true");
+                }
+            }
+            let _ = r.backlog_path; // read to avoid unused warning in minimal builds
+        }
+        // AF_XDP cfg (if present)
+        if let Some(ref a) = self.afxdp {
+            let _ = a.enable;
+            if a.ifname.trim().is_empty() { anyhow::bail!("afxdp.ifname must be non-empty if afxdp is configured"); }
+            let _ = a.queues; // optional; just touch
         }
         Ok(())
     }

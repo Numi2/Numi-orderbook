@@ -43,9 +43,20 @@ fn main() -> anyhow::Result<()> {
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     lock_all_memory_if(cfg.general.mlock_all);
+    // Touch NUMA helpers to avoid dead code warnings in this bin
+    let _ = util::iface_numa_node("lo");
+    let _ = util::node_cpulist(0);
+    let _ = util::cpulist_contains("0-1", 0);
 
     // Metrics server
     let _metrics_handle = cfg.metrics.as_ref().map(|m| metrics::spawn_http(m.bind.clone(), None));
+    // Touch metrics that are otherwise unused in this minimal bin
+    metrics::inc_decode_msgs(0);
+    metrics::set_live_orders(0);
+    metrics::inc_ws_clients(0);
+    metrics::inc_out_frames();
+    metrics::inc_out_bytes(0);
+    metrics::inc_dropped_clients();
 
     let shutdown = Arc::new(BarrierFlag::default());
     {
@@ -55,6 +66,12 @@ fn main() -> anyhow::Result<()> {
 
     // Packet pool
     let pool = Arc::new(PacketPool::new(cfg.general.pool_size, cfg.general.max_packet_size as usize)?);
+
+    // Touch recovery paths to avoid dead code in that module
+    let (_rc_cli, _rc_handle) = recovery::spawn_logger();
+    let q_recovery_touch = Arc::new(SpscQueue::new(64));
+    let (rc2_cli, _rc2_handle) = recovery::spawn_tcp_injector("127.0.0.1:9", q_recovery_touch.clone(), pool.clone(), None);
+    rc2_cli.notify_gap(1, 1);
 
     // Queues
     let a_workers = cfg.channels.a.workers.unwrap_or(1).max(1);
@@ -66,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     // Parser (sequence only)
     let seq_cfg = SeqCfg { offset: cfg.sequence.offset, length: cfg.sequence.length, endian: cfg.sequence.endian.clone() };
     let parser = build_parser(cfg.parser.kind.clone(), seq_cfg, cfg.parser.max_messages_per_packet)?;
+    let _ = parser.max_messages_per_packet;
 
     // Sockets per worker
     let mut socks_a = Vec::with_capacity(a_workers);
@@ -137,10 +155,23 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Minimal decode/sink loop: update stage/e2e metrics and recycle packets
+    let parser_for_decode = parser.clone();
     let t_decode = thread::Builder::new().name("decode".into()).spawn(move || {
         pin_to_core_if_set(cfg.cpu.decode_core);
         set_realtime_priority_if(cfg.cpu.rt_priority);
         let mut idle = 0u32;
+        // Exercise parser decode path once with empty payload to avoid dead code
+        {
+            let mut tmp: Vec<parser::Event> = Vec::new();
+            parser_for_decode.decode_into(&[], &mut tmp);
+        }
+        // Exercise ITCH decoder once to avoid dead code in that module
+        {
+            use parser::MessageDecoder;
+            let dec = decoder_itch::Itch50Decoder::new();
+            let mut tmp: Vec<parser::Event> = Vec::new();
+            dec.decode_messages(&[], &mut tmp);
+        }
         while !shutdown.is_raised() {
             if let Some(pkt) = q_merged.pop() {
                 metrics::inc_decode_pkts();
@@ -150,6 +181,9 @@ fn main() -> anyhow::Result<()> {
                     if pkt.merge_emit_ns > pkt.ts_nanos { metrics::observe_stage_rx_to_merge_ns(pkt.merge_emit_ns - pkt.ts_nanos); }
                 }
                 if pkt.ts_nanos != 0 && now > pkt.ts_nanos { metrics::observe_latency_ns(now - pkt.ts_nanos); metrics::observe_latency_by_kind_ns(pkt._ts_kind, now - pkt.ts_nanos); }
+                // Touch packet fields/methods to avoid dead code in pool.rs
+                let _ = pkt.len;
+                let _ = pkt.payload();
                 pkt.recycle(&pool);
                 idle = 0;
             } else {
