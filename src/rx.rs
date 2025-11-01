@@ -2,7 +2,7 @@
 use crate::metrics;
 use crate::parser::SeqExtractor;
 use crate::pool::{PacketPool, Pkt, TsKind};
-use crate::util::{now_nanos, spin_wait};
+use crate::util::{now_nanos};
 use anyhow::Context;
 use crossbeam::queue::ArrayQueue;
 use log::debug;
@@ -10,7 +10,9 @@ use nix::errno::Errno;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
+#[cfg(target_os = "linux")]
+use bytes::BytesMut;
 #[cfg(target_os = "linux")]
 use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
 #[cfg(target_os = "linux")]
@@ -43,14 +45,29 @@ pub fn rx_loop(
 
     // Preallocate vectors for recvmmsg path to avoid per-iteration allocations
     #[cfg(target_os = "linux")]
-    let mut bufs: Vec<BytesMut> = if use_recvmmsg { Vec::with_capacity(batch) } else { Vec::new() };
+    let mut bufs: Vec<BytesMut> = if use_recvmmsg { (0..batch).map(|_| BytesMut::new()).collect() } else { Vec::new() };
     #[cfg(target_os = "linux")]
-    let mut iovecs: Vec<libc::iovec> = if use_recvmmsg { Vec::with_capacity(batch) } else { Vec::new() };
+    let mut iovecs: Vec<libc::iovec> = if use_recvmmsg { (0..batch).map(|_| libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }).collect() } else { Vec::new() };
     #[cfg(target_os = "linux")]
-    let mut hdrs: Vec<libc::mmsghdr> = if use_recvmmsg { Vec::with_capacity(batch) } else { Vec::new() };
+    let mut hdrs: Vec<libc::mmsghdr> = if use_recvmmsg {
+        let mut v = Vec::with_capacity(batch);
+        for i in 0..batch {
+            let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
+            mh.msg_name = std::ptr::null_mut();
+            mh.msg_namelen = 0;
+            mh.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            mh.msg_iovlen = 1;
+            mh.msg_control = std::ptr::null_mut();
+            mh.msg_controllen = 0;
+            mh.msg_flags = 0;
+            v.push(libc::mmsghdr { msg_hdr: mh, msg_len: 0 });
+        }
+        v
+    } else { Vec::new() };
 
     let queue_label: &'static str = if chan_name == "A" { "rx_a" } else { "rx_b" };
     let mut iter: u64 = 0;
+    let mut idle_iters: u32 = 0;
     loop {
         if shutdown.is_raised() { break; }
 
@@ -63,33 +80,13 @@ pub fn rx_loop(
         if use_recvmmsg {
             #[cfg(target_os = "linux")]
             unsafe {
-                // Prepare buffers and mmsghdrs for batched receive (reuse preallocated vectors)
-                bufs.clear();
-                iovecs.clear();
-                hdrs.clear();
-
-                for _ in 0..batch {
-                    let mut b = pool.get();
-                    let s = b.chunk_mut();
-                    let iov = libc::iovec {
-                        iov_base: s.as_mut_ptr() as *mut libc::c_void,
-                        iov_len: s.len(),
-                    };
-                    iovecs.push(iov);
-                    bufs.push(b);
-                }
-
+                // Prepare buffers and update iovecs in-place
                 for i in 0..batch {
-                    let mut msghdr: libc::msghdr = std::mem::zeroed();
-                    msghdr.msg_name = std::ptr::null_mut();
-                    msghdr.msg_namelen = 0;
-                    msghdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
-                    msghdr.msg_iovlen = 1;
-                    msghdr.msg_control = std::ptr::null_mut();
-                    msghdr.msg_controllen = 0;
-                    msghdr.msg_flags = 0;
-                    let mmsg = libc::mmsghdr { msg_hdr: msghdr, msg_len: 0 };
-                    hdrs.push(mmsg);
+                    bufs[i] = pool.get();
+                    let s = bufs[i].chunk_mut();
+                    iovecs[i].iov_base = s.as_mut_ptr() as *mut libc::c_void;
+                    iovecs[i].iov_len = s.len();
+                    hdrs[i].msg_len = 0;
                 }
 
                 let ret = libc::recvmmsg(
@@ -113,7 +110,7 @@ pub fn rx_loop(
                     let count = ret as usize;
                     for i in 0..count {
                         let n = hdrs[i].msg_len as usize;
-                        let mut buf = std::mem::replace(&mut bufs[i], BytesMut::new());
+                        let mut buf = std::mem::take(&mut bufs[i]);
                         buf.advance_mut(n);
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
@@ -133,8 +130,8 @@ pub fn rx_loop(
                     }
                     // Return unused buffers to pool
                     for j in count..batch {
-                        let b = std::mem::replace(&mut bufs[j], BytesMut::new());
-                        pool.put(b);
+                        let b = std::mem::take(&mut bufs[j]);
+                        if b.capacity() > 0 { pool.put(b); }
                     }
                 } else {
                     // ret == 0 unlikely for DONTWAIT but handle conservatively
@@ -236,13 +233,38 @@ pub fn rx_loop(
             }
         }
 
-        if !progressed {
-            spin_wait(spin_loops_per_yield);
-        }
+        if !progressed { crate::util::adaptive_wait(&mut idle_iters, spin_loops_per_yield); } else { idle_iters = 0; }
 
         iter = iter.wrapping_add(1);
         if (iter & 0x3fff) == 0 { metrics::set_queue_len(queue_label, q_out.len()); }
     }
 
     Ok(())
+}
+
+// Backward-compatible adapter preserving the older boolean timestamping API
+#[allow(dead_code)]
+pub fn rx_loop_compat(
+    chan_name: &str,
+    sock: &UdpSocket,
+    seq: Arc<dyn SeqExtractor>,
+    q_out: Arc<ArrayQueue<Pkt>>,
+    pool: Arc<PacketPool>,
+    shutdown: Arc<crate::util::BarrierFlag>,
+    spin_loops_per_yield: u32,
+    rx_batch: usize,
+    timestamping: bool,
+) -> anyhow::Result<()> {
+    let ts_mode = if timestamping { Some(crate::config::TimestampingMode::Software) } else { None };
+    rx_loop(
+        chan_name,
+        sock,
+        seq,
+        q_out,
+        pool,
+        shutdown,
+        spin_loops_per_yield,
+        rx_batch,
+        ts_mode,
+    )
 }

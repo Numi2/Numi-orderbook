@@ -3,12 +3,16 @@
 // contract and queueing model.
 
 
+#[cfg(target_os = "linux")]
 use crate::metrics;
-use crate::pool::{PacketPool, Pkt, TsKind};
-use crate::util::{BarrierFlag, spin_wait};
+use crate::pool::{PacketPool, Pkt};
+use crate::util::BarrierFlag;
 use crate::parser::SeqExtractor;
 use crossbeam::queue::ArrayQueue;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use crate::pool::TsKind;
+#[cfg(target_os = "linux")]
 use bytes::BufMut;
 
 /// Receive loop using a high-performance packet ring on Linux (TPACKET_V2 fallback if AF_XDP is unavailable).
@@ -134,7 +138,7 @@ pub fn afxdp_loop(
         let hdr_ptr = unsafe { (ring as *mut u8).add(off) as *mut Tpacket2Hdr };
         let status = unsafe { (*hdr_ptr).tp_status };
         if (status & TP_STATUS_USER) == 0 {
-            spin_wait(64);
+            crate::util::spin_wait(64);
             continue;
         }
 

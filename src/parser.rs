@@ -24,6 +24,7 @@ pub trait MessageDecoder: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Side { Bid, Ask }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Event {
     Add {

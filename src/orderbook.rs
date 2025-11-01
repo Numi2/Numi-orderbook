@@ -135,6 +135,7 @@ impl InstrumentBook {
         (bid, ask)
     }
 
+    #[allow(dead_code)]
     fn top_n(&self, n: usize) -> (SmallVec<[(i64,i64); 32]>, SmallVec<[(i64,i64); 32]>) {
         let mut bids = SmallVec::<[(i64,i64); 32]>::new();
         let mut asks = SmallVec::<[(i64,i64); 32]>::new();
@@ -145,7 +146,7 @@ impl InstrumentBook {
 }
 
 pub struct OrderBook {
-    depth_for_reporting: usize,
+    _depth_for_reporting: usize,
     books: HashMap<u32, InstrumentBook>,
     index: HashMap<u64, (u32, Handle)>,
     last_instr: Option<u32>,
@@ -155,7 +156,7 @@ pub struct OrderBook {
 impl OrderBook {
     pub fn new(depth_for_reporting: usize) -> Self {
         Self {
-            depth_for_reporting,
+            _depth_for_reporting: depth_for_reporting,
             books: HashMap::new(),
             index: HashMap::new(),
             last_instr: None,
@@ -163,9 +164,10 @@ impl OrderBook {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_with_options(depth_for_reporting: usize, consume_trades: bool) -> Self {
         Self {
-            depth_for_reporting,
+            _depth_for_reporting: depth_for_reporting,
             books: HashMap::new(),
             index: HashMap::new(),
             last_instr: None,
@@ -242,8 +244,9 @@ impl OrderBook {
         (None, None)
     }
 
+    #[allow(dead_code)]
     pub fn top_n_of(&self, instr: u32, n: usize) -> Option<(SmallVec<[(i64,i64); 32]>, SmallVec<[(i64,i64); 32]>)> {
-        self.books.get(&instr).map(|b| b.top_n(n.min(self.depth_for_reporting)))
+        self.books.get(&instr).map(|b| b.top_n(n))
     }
 
     pub fn order_count(&self) -> usize { self.index.len() }
@@ -294,6 +297,40 @@ impl OrderBook {
             ob.last_instr = Some(ie.instr);
         }
         ob
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifo_within_level_and_totals() {
+        let mut b = InstrumentBook::new();
+        let h1 = b.add(1, 100, 10, Side::Bid);
+        let h2 = b.add(2, 100, 20, Side::Bid);
+        let lvl = b.bids.get(&100).unwrap();
+        let mut it = lvl.iter_fifo(&b.orders);
+        assert_eq!(it.next(), Some(h1));
+        assert_eq!(it.next(), Some(h2));
+        assert_eq!(lvl.total_qty, 30);
+
+        b.set_qty(h1, 5);
+        let lvl = b.bids.get(&100).unwrap();
+        assert_eq!(lvl.total_qty, 25);
+
+        b.cancel(h2);
+        let lvl = b.bids.get(&100).unwrap();
+        assert_eq!(lvl.total_qty, 5);
+        assert_eq!(lvl.count, 1);
+    }
+
+    #[test]
+    fn remove_empty_levels() {
+        let mut b = InstrumentBook::new();
+        let h1 = b.add(1, 101, 10, Side::Ask);
+        b.cancel(h1);
+        assert!(b.asks.get(&101).is_none());
     }
 }
 

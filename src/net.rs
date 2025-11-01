@@ -1,5 +1,5 @@
 // src/net.rs
-use crate::config::{ChannelCfg, TimestampingMode};
+use crate::config::ChannelCfg;
 use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
@@ -29,8 +29,8 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
     sock.join_multicast_v4(&group, &iface).context("join_multicast_v4")?;
 
     // Optional busy-poll hint (Linux only)
+    #[cfg(target_os = "linux")]
     if let Some(us) = cfg.busy_poll_us {
-        #[cfg(target_os = "linux")]
         unsafe {
             use std::os::fd::AsRawFd;
             let fd = sock.as_raw_fd();
@@ -52,8 +52,8 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
         let fd = sock.as_raw_fd();
         unsafe {
             match mode {
-                TimestampingMode::Off => {}
-                TimestampingMode::Software => {
+                crate::config::TimestampingMode::Off => {}
+                crate::config::TimestampingMode::Software => {
                     // Enable nanosecond software timestamps (simpler path)
                     let on: libc::c_int = 1;
                     let _ = libc::setsockopt(
@@ -64,7 +64,7 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
                         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                     );
                 }
-                TimestampingMode::Hardware | TimestampingMode::HardwareRaw => {
+                crate::config::TimestampingMode::Hardware | crate::config::TimestampingMode::HardwareRaw => {
                     // Use SO_TIMESTAMPING and return SCM_TIMESTAMPING (timespec[3])
                     // Choose RAW_HARDWARE when requested, otherwise SYSTEM_HARDWARE.
                     #[allow(non_upper_case_globals)]
@@ -80,7 +80,7 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
                     let mut flags = RX_SW | SW; // keep software as fallback
                     flags |= RX_HW;
                     flags |= match mode {
-                        TimestampingMode::HardwareRaw => RAW_HW,
+                        crate::config::TimestampingMode::HardwareRaw => RAW_HW,
                         _ => SYS_HW,
                     };
                     let _ = libc::setsockopt(

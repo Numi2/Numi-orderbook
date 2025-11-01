@@ -154,7 +154,9 @@ fn on_add(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, with_mpid: bool) {
     // stock symbol (ignored for book logic)
     let _stock = read_fixed::<8>(body, &mut o).unwrap();
     let price = read_u32(body, &mut o).unwrap() as i64;
-    if with_mpid { o += 4; /* mpid */ }
+    if with_mpid {
+        // Ignore MPID bytes; no further fields are read here so no need to advance offset
+    }
 
     let side = if side_ch == b'B' { Side::Bid } else { Side::Ask };
     let instr = locate as u32;
@@ -187,7 +189,7 @@ fn on_exec(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, _with_price: bool)
     // skip match number
     let _ = read_u64(body, &mut o);
 
-    if let Some(mut s) = st.orders.get_mut(&order_ref).cloned() {
+    if let Some(s) = st.orders.get_mut(&order_ref).cloned() {
         let new_qty = (s.qty - executed).max(0);
         if new_qty > 0 {
             // emit absolute qty
@@ -295,7 +297,7 @@ fn on_trade(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     let _match = read_u64(body, &mut o).unwrap();
 
     // Reduce maker order if we track it
-    if let Some(mut s) = st.orders.get_mut(&order_ref).cloned() {
+    if let Some(s) = st.orders.get_mut(&order_ref).cloned() {
         let new_qty = (s.qty - shares).max(0);
         if new_qty > 0 {
             out.push(Event::Mod { order_id: order_ref, qty: new_qty });

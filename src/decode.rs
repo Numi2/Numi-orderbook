@@ -35,6 +35,7 @@ pub fn decode_loop(
     let mut processed_pkts: u64 = 0;
     let mut processed_msgs: u64 = 0;
 
+    let mut idle_iters: u32 = 0;
     while !shutdown.is_raised() {
         if let Some(pkt) = q_in.pop() {
             processed_pkts += 1;
@@ -42,10 +43,17 @@ pub fn decode_loop(
 
             events.clear();
             // Destructure to move buffer without extra allocation
-            let Pkt { buf, len, ts_nanos, .. } = pkt;
+            let Pkt { buf, len, ts_nanos, merge_emit_ns, .. } = pkt;
             dec.decode_messages(&buf[..len], &mut events);
             processed_msgs += events.len() as u64;
             metrics::inc_decode_msgs(events.len() as u64);
+
+            // Stage latency (merge -> decode)
+            if merge_emit_ns > 0 {
+                let now_ns = now_nanos();
+                if now_ns > merge_emit_ns { metrics::observe_stage_merge_to_decode_ns(now_ns - merge_emit_ns); }
+                if merge_emit_ns > ts_nanos { metrics::observe_stage_rx_to_merge_ns(merge_emit_ns - ts_nanos); }
+            }
 
             for ev in &events {
                 book.apply(ev);
@@ -82,7 +90,7 @@ pub fn decode_loop(
                 last_snap = Instant::now();
             }
         } else {
-            crate::util::spin_wait(64);
+            crate::util::adaptive_wait(&mut idle_iters, 64);
         }
     }
     Ok(())

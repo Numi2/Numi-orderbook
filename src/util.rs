@@ -34,6 +34,18 @@ pub fn pin_to_core_if_set(core_index: Option<usize>) {
 }
 
 #[inline]
+pub fn pin_to_core_with_offset(base_core_index: Option<usize>, offset: usize) {
+    if let Some(base) = base_core_index {
+        if let Some(cores) = core_affinity::get_core_ids() {
+            let target = base.saturating_add(offset);
+            if let Some(core_id) = cores.into_iter().find(|c| c.id == target) {
+                let _ = core_affinity::set_for_current(core_id);
+            }
+        }
+    }
+}
+
+#[inline]
 pub fn now_nanos() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -62,14 +74,28 @@ pub fn lock_all_memory_if(cfg: bool) {
 }
 
 #[inline]
-pub fn set_realtime_priority_if(priority: Option<i32>) {
+pub fn set_realtime_priority_if(_priority: Option<i32>) {
     #[cfg(target_os = "linux")]
-    if let Some(pri) = priority {
+    if let Some(pri) = _priority {
         unsafe {
             let param = libc::sched_param { sched_priority: pri as i32 };
             let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
         }
     }
 }
-
-
+ 
+// Adaptive idle: escalate from spin -> yield -> short sleep to reduce CPU when idle
+#[inline]
+pub fn adaptive_wait(idle_iters: &mut u32, base_spins: u32) {
+    if *idle_iters < 64 {
+        spin_wait(base_spins);
+        *idle_iters += 1;
+    } else if *idle_iters < 256 {
+        std::thread::yield_now();
+        *idle_iters += 1;
+    } else {
+        // small sleep; keeps latency reasonable while avoiding 100% CPU when idle
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        *idle_iters = 256; // clamp
+    }
+}

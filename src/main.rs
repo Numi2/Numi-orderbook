@@ -66,7 +66,7 @@ fn main() -> anyhow::Result<()> {
 
     // Snapshot trigger channel (for HTTP /snapshot) and Metrics HTTP
     let (snaptr_tx, snaptr_rx): (Sender<()>, Receiver<()>) = bounded(8);
-    let _metrics_handle = if let Some(m) = &cfg.metrics {
+    let metrics_handle = if let Some(m) = &cfg.metrics {
         Some(metrics::spawn_http(m.bind.clone(), Some(snaptr_tx.clone())))
     } else { None };
 
@@ -134,13 +134,8 @@ fn main() -> anyhow::Result<()> {
 
     // RX threads
     let rx_a_shutdown = shutdown.clone();
-    let rx_b_shutdown = shutdown.clone();
     let pool_a = pool.clone();
-    let pool_b = pool.clone();
     let q_a = q_rx_a.clone();
-    let q_b = q_rx_b.clone();
-    let parser_a = parser.clone();
-    let parser_b = parser.clone();
 
     let t_rx_a = if cfg.afxdp.as_ref().map(|c| c.enable).unwrap_or(false) {
         let ifname = cfg.afxdp.as_ref().unwrap().ifname.clone();
@@ -164,7 +159,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = cfg.clone();
             let name = format!("rx-A-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
-                pin_to_core_if_set(cfg.cpu.a_rx_core);
+                crate::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
                 if let Err(e) = rx_loop(
                     "A",
@@ -198,7 +193,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = cfg.clone();
             let name = format!("rx-B-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
-                pin_to_core_if_set(cfg.cpu.b_rx_core);
+                crate::util::pin_to_core_with_offset(cfg.cpu.b_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
                 if let Err(e) = rx_loop(
                     "B",
@@ -270,6 +265,19 @@ fn main() -> anyhow::Result<()> {
     if t_decode.join().is_err() { error!("decode thread panicked"); }
     if let Some(h) = snapshot_handle { h.join(); }
     recovery_handle.join();
+    // Gracefully stop metrics HTTP (poke /shutdown and join)
+    if let Some(m) = &cfg.metrics {
+        request_http_shutdown(&m.bind);
+    }
+    if let Some(h) = metrics_handle { let _ = h.join(); }
     info!("clean shutdown");
     Ok(())
+}
+
+fn request_http_shutdown(addr: &str) {
+    use std::io::Write;
+    if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+        let _ = s.write_all(b"GET /shutdown HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let _ = s.flush();
+    }
 }

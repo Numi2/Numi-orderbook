@@ -88,18 +88,33 @@ fn run_injector<A: std::net::ToSocketAddrs>(
 ) {
     log::info!("recovery injector running (tcp={:?})", addr.to_socket_addrs().ok().and_then(|mut it| it.next()));
     let mut backlog = backlog_path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
-    while let Ok(req) = rx.recv() {
-        match req {
-            RecoveryRequest::Gap { from, to } => {
-                if from > to { continue; }
-                if let Some(f) = backlog.as_mut() {
-                    let _ = writeln!(f, "gap {} {}", from, to);
-                    let _ = f.flush();
-                }
-                if let Err(e) = fetch_and_inject(&addr, from, to, &q_merged, &pool) {
-                    log::error!("replay fetch failed: {e:?}");
+    // Simple coalescing of pending gaps: on each received gap, drain additional
+    // requests non-blockingly and merge overlapping/adjacent ranges before fetch.
+    while let Ok(first) = rx.recv() {
+        let (mut lo, mut hi) = match first { RecoveryRequest::Gap { from, to } => (from, to) };
+        if lo > hi { continue; }
+        // Drain more and coalesce
+        while let Ok(next) = rx.try_recv() {
+            if let RecoveryRequest::Gap { from, to } = next {
+                if from <= hi.saturating_add(1) && to >= lo.saturating_sub(1) {
+                    // overlap or adjacent
+                    if from < lo { lo = from; }
+                    if to > hi { hi = to; }
+                } else {
+                    // Non-overlapping; log and keep current, push back by logging both
+                    if let Some(f) = backlog.as_mut() {
+                        let _ = writeln!(f, "gap {} {}", from, to);
+                        let _ = f.flush();
+                    }
                 }
             }
+        }
+        if let Some(f) = backlog.as_mut() {
+            let _ = writeln!(f, "gap {} {}", lo, hi);
+            let _ = f.flush();
+        }
+        if let Err(e) = fetch_and_inject(&addr, lo, hi, &q_merged, &pool) {
+            log::error!("replay fetch failed: {e:?}");
         }
     }
 }
@@ -156,4 +171,5 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     }
 
     Ok(())
+}
 }

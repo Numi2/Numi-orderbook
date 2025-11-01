@@ -20,16 +20,18 @@ pub fn merge_loop(
     recovery: Option<RecoveryClient>,
 ) -> anyhow::Result<()> {
     let cap: usize = (reorder_window as usize).saturating_add(1);
-    let mut ring: Vec<Option<Pkt>> = (0..cap).map(|_| None).collect();
+    let mut ring: Vec<Option<(u64, Pkt)>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;
 
-    // Prefer-A with hysteresis: start preferring A; switch if we forward
-    // a certain number of consecutive non-preferred packets.
+    // Prefer-A with hysteresis: start preferring A; consider switching based on consecutive
+    // non-preferred forwards and a minimum dwell time since the last switch.
     let mut prefer_a: bool = true;
     let mut streak_preferred: u32 = 0;
     let mut streak_nonpreferred: u32 = 0;
     const SWITCH_TO_B_AFTER: u32 = 2; // consecutive non-preferred forwards
     const SWITCH_TO_A_AFTER: u32 = 8; // consecutive preferred forwards to flip back
+    let mut last_switch_ns: u64 = crate::util::now_nanos();
+    const MIN_DWELL_NS: u64 = 2_000_000; // 2ms dwell before allowing another switch
     metrics::set_merge_preferred_is_a(true);
 
     while !shutdown.is_raised() {
@@ -54,7 +56,12 @@ pub fn merge_loop(
                     // Drain contiguous buffered packets
                     loop {
                         let idx = (next_seq % (cap as u64)) as usize;
-                        if let Some(node) = ring[idx].take() {
+                        if let Some((stored_seq, node)) = ring[idx].take() {
+                            if stored_seq != next_seq {
+                                // stale/aliased entry; drop it and stop draining
+                                ring[idx] = Some((stored_seq, node));
+                                break;
+                            }
                             pending_count = pending_count.saturating_sub(1);
                             metrics::inc_merge_ooo();
                             let c = if node.chan == b'A' { "A" } else { "B" };
@@ -73,30 +80,48 @@ pub fn merge_loop(
                         streak_preferred = streak_preferred.saturating_add(1);
                         streak_nonpreferred = 0;
                         if !prefer_a && streak_preferred >= SWITCH_TO_A_AFTER {
+                            if crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
                             prefer_a = true;
                             streak_preferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(true);
+                                last_switch_ns = crate::util::now_nanos();
+                            }
                         }
                     } else {
                         streak_nonpreferred = streak_nonpreferred.saturating_add(1);
                         streak_preferred = 0;
                         if prefer_a && streak_nonpreferred >= SWITCH_TO_B_AFTER {
+                            if crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
                             prefer_a = false;
                             streak_nonpreferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(false);
+                                last_switch_ns = crate::util::now_nanos();
+                            }
                         }
                     }
                 } else {
                     let distance = s.wrapping_sub(next_seq);
                     if distance <= reorder_window && pending_count < max_pending {
                         let idx = (s % (cap as u64)) as usize;
-                        if ring[idx].is_some() {
-                            metrics::inc_merge_dup();
-                        } else {
-                            ring[idx] = Some(pkt);
-                            pending_count += 1;
+                        match &ring[idx] {
+                            Some((seq_in_slot, _)) => {
+                                if *seq_in_slot == s {
+                                    metrics::inc_merge_dup();
+                                } else if *seq_in_slot < next_seq {
+                                    // stale slot from an old window; replace
+                                    ring[idx] = Some((s, pkt));
+                                    pending_count += 1;
+                                } else {
+                                    // different seq still in-window shouldn't alias due to cap, but guard anyway
+                                    metrics::inc_merge_dup();
+                                }
+                            }
+                            None => {
+                                ring[idx] = Some((s, pkt));
+                                pending_count += 1;
+                            }
                         }
                     } else {
                         metrics::inc_merge_gap();

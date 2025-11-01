@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     let mut f = File::open(path)?;
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
-    let mut off = 0usize;
+    let mut off: usize;
     if data.len() < 24 { anyhow::bail!("pcap too small"); }
     let magic = u32::from_le_bytes([data[0],data[1],data[2],data[3]]);
     let le = magic == 0xA1B2C3D4 || magic == 0xA1B23C4D; // basic check
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut sent = 0u64;
     while off + 16 <= data.len() {
-        let (incl_len, n) = if le { read_le_u32(&data, off + 8) } else { read_be_u32(&data, off + 8) };
+        let (incl_len, _) = if le { read_le_u32(&data, off + 8) } else { read_be_u32(&data, off + 8) };
         off += 16;
         if off + (incl_len as usize) > data.len() { break; }
         let pkt = &data[off..off + incl_len as usize];

@@ -180,27 +180,39 @@ pub fn observe_latency_ns(ns: u64) {
 // pub fn observe_e2e_by_ts_ns(ns: u64, ts_kind: &str) { /* removed */ }
 
 pub fn observe_stage_rx_to_merge_ns(ns: u64) {
-    let secs = (ns as f64) / 1_000_000_000.0;
-    STAGE_RX_TO_MERGE.observe(secs);
+    #[cfg(feature = "heavy_metrics")]
+    {
+        let secs = (ns as f64) / 1_000_000_000.0;
+        STAGE_RX_TO_MERGE.observe(secs);
+    }
 }
 
 pub fn observe_stage_merge_to_decode_ns(ns: u64) {
-    let secs = (ns as f64) / 1_000_000_000.0;
-    STAGE_MERGE_TO_DECODE.observe(secs);
+    #[cfg(feature = "heavy_metrics")]
+    {
+        let secs = (ns as f64) / 1_000_000_000.0;
+        STAGE_MERGE_TO_DECODE.observe(secs);
+    }
 }
 
 pub fn observe_stage_decode_apply_ns(ns: u64) {
-    let secs = (ns as f64) / 1_000_000_000.0;
-    STAGE_DECODE_APPLY.observe(secs);
+    #[cfg(feature = "heavy_metrics")]
+    {
+        let secs = (ns as f64) / 1_000_000_000.0;
+        STAGE_DECODE_APPLY.observe(secs);
+    }
 }
 
 pub fn set_queue_len(queue: &'static str, len: usize) {
-    QUEUE_LEN.with_label_values(&[queue]).set(len as i64);
-    let mut hwm = HWM_TRACK.lock().unwrap();
-    let e = hwm.entry(queue).or_insert(0);
-    if *e < len as i64 {
-        *e = len as i64;
-        QUEUE_HWM.with_label_values(&[queue]).set(*e);
+    #[cfg(feature = "heavy_metrics")]
+    {
+        QUEUE_LEN.with_label_values(&[queue]).set(len as i64);
+        let mut hwm = HWM_TRACK.lock().unwrap();
+        let e = hwm.entry(queue).or_insert(0);
+        if *e < len as i64 {
+            *e = len as i64;
+            QUEUE_HWM.with_label_values(&[queue]).set(*e);
+        }
     }
 }
 
@@ -234,6 +246,9 @@ pub fn spawn_http<A: ToSocketAddrs + Send + 'static>(addr: A, snapshot_trigger: 
                 } else if url == "/ready" {
                     // Minimal readiness: server up and metrics registry available
                     let _ = req.respond(tiny_http::Response::from_string("READY").with_status_code(200));
+                } else if url == "/shutdown" {
+                    let _ = req.respond(tiny_http::Response::from_string("BYE").with_status_code(200));
+                    break;
                 } else {
                     let _ = req.respond(tiny_http::Response::empty(404));
                 }
