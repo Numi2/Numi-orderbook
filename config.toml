@@ -1,0 +1,62 @@
+# config.toml 
+[general]
+max_packet_size = 2048
+pool_size = 65536
+rx_queue_capacity = 65536
+merge_queue_capacity = 65536
+spin_loops_per_yield = 64
+
+[sequence]
+offset = 0
+length = 8
+endian = "be"
+
+[parser]
+kind = "fixed_binary"
+max_messages_per_packet = 128
+
+[channels.a]
+group = "239.10.10.1"
+port = 5001
+iface_addr = "10.0.0.11"
+reuse_port = true
+recv_buffer_bytes = 67108864
+busy_poll_us = 50
+nonblocking = true
+
+[channels.b]
+group = "239.10.10.2"
+port = 5001
+iface_addr = "10.0.0.12"
+reuse_port = true
+recv_buffer_bytes = 67108864
+busy_poll_us = 50
+nonblocking = true
+
+[merge]
+initial_expected_seq = 1
+reorder_window = 512
+max_pending_packets = 131072
+
+[book]
+max_depth = 50
+snapshot_interval_ms = 1000
+consume_trades = false
+
+[cpu]
+a_rx_core = 2
+b_rx_core = 4
+merge_core = 6
+decode_core = 8
+
+[metrics]
+bind = "0.0.0.0:9100"
+
+[snapshot]
+path = "/var/lib/t7_like/book.snap"
+load_on_start = true
+enable_writer = true
+
+[recovery]
+enable_injector = false
+endpoint = "127.0.0.1:9000"

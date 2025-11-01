@@ -1,0 +1,34 @@
+
+[package]
+name = "orderbok"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+crossbeam = "0.8"
+crossbeam-utils = "0.8"
+crossbeam-channel = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+nix = { version = "0.29", default-features = false, features = ["socket", "net", "time"] }
+bytes = "1.6"
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+core_affinity = "0.8"
+ctrlc = "3.4"
+hashbrown = "0.14"
+slab = "0.4"
+smallvec = "1.13"
+once_cell = "1.19"
+prometheus = "0.13"
+tiny_http = "0.12"
+bincode = "1.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
