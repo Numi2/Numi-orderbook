@@ -17,6 +17,7 @@ pub trait SeqExtractor: Send + Sync + 'static {
     fn extract_seq(&self, pkt: &[u8]) -> Option<u64>;
 }
 
+#[allow(dead_code)]
 pub trait MessageDecoder: Send + Sync + 'static {
     fn decode_messages(&self, payload: &[u8], out: &mut Vec<Event>);
 }
@@ -49,22 +50,42 @@ pub enum Event {
 #[derive(Clone)]
 pub struct Parser {
     seq: Arc<dyn SeqExtractor>,
-    dec: Arc<dyn MessageDecoder>,
+    dec: DecoderImpl,
     pub max_messages_per_packet: usize,
 }
 
+#[derive(Clone)]
+enum DecoderImpl {
+    Fixed(EobiSbeDecoder), // FixedBinary -> EOBI/SBE-like
+    Fast(FastEmdiDecoder),
+    Itch(Itch50Decoder),
+}
+
+impl DecoderImpl {
+    #[inline]
+    fn decode(&self, payload: &[u8], out: &mut Vec<Event>) {
+        match self {
+            DecoderImpl::Fixed(d) => d.decode_messages(payload, out),
+            DecoderImpl::Fast(d) => d.decode_messages(payload, out),
+            DecoderImpl::Itch(d) => d.decode_messages(payload, out),
+        }
+    }
+}
+
 impl Parser {
+    #[inline]
     pub fn seq_extractor(&self) -> Arc<dyn SeqExtractor> { self.seq.clone() }
-    pub fn decoder(&self) -> Arc<dyn MessageDecoder> { self.dec.clone() }
+    #[inline]
+    pub fn decode_into(&self, payload: &[u8], out: &mut Vec<Event>) { self.dec.decode(payload, out) }
 }
 
 pub fn build_parser(kind: ParserKind, seq: SeqCfg, max_per_packet: usize) -> anyhow::Result<Parser> {
     let seq_impl: Arc<dyn SeqExtractor> = Arc::new(FixedSeq { cfg: seq.clone() });
 
-    let dec_impl: Arc<dyn MessageDecoder> = match kind {
-        ParserKind::FixedBinary => Arc::new(EobiSbeDecoder::new()),
-        ParserKind::FastLike => Arc::new(FastEmdiDecoder::new()),
-        ParserKind::Itch50 => Arc::new(Itch50Decoder::new()),
+    let dec_impl: DecoderImpl = match kind {
+        ParserKind::FixedBinary => DecoderImpl::Fixed(EobiSbeDecoder::new()),
+        ParserKind::FastLike => DecoderImpl::Fast(FastEmdiDecoder::new()),
+        ParserKind::Itch50 => DecoderImpl::Itch(Itch50Decoder::new()),
     };
 
     Ok(Parser {

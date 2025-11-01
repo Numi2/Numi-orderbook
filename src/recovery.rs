@@ -1,7 +1,6 @@
 // src/recovery.rs
 use crossbeam_channel::{Receiver, Sender};
 use crate::metrics;
-use crossbeam::queue::ArrayQueue;
 use std::sync::Arc;
 use std::thread;
 use bytes::BufMut;
@@ -26,12 +25,13 @@ impl Client {
 }
 
 pub struct RecoveryHandle {
-    join: thread::JoinHandle<()>,
+    _join: thread::JoinHandle<()>,
 }
 
 impl RecoveryHandle {
+    #[allow(dead_code)]
     pub fn join(self) {
-        let _ = self.join.join();
+        let _ = self._join.join();
     }
 }
 
@@ -43,7 +43,7 @@ pub fn spawn_logger() -> (Client, RecoveryHandle) {
         .name("recovery".into())
         .spawn(move || run(rx))
         .expect("spawn recovery");
-    (Client { tx }, RecoveryHandle { join })
+    (Client { tx }, RecoveryHandle { _join: join })
 }
 
 fn run(rx: Receiver<RecoveryRequest>) {
@@ -51,6 +51,7 @@ fn run(rx: Receiver<RecoveryRequest>) {
     while let Ok(req) = rx.recv() {
         match req {
             RecoveryRequest::Gap { from, to } => {
+                let _ = (from, to); // Use fields to avoid warning
                 log::warn!("GAP detected; recommend out-of-band recovery for [{from}..{to}]");
                 // TODO: integrate TCP/unicast replay client here.
             }
@@ -64,24 +65,25 @@ fn run(rx: Receiver<RecoveryRequest>) {
 // replace the body of `fetch_and_inject` accordingly.
 
 use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
+use crate::spsc::SpscQueue;
 
 pub fn spawn_tcp_injector<A: std::net::ToSocketAddrs + Send + 'static>(
     addr: A,
-    q_merged: Arc<ArrayQueue<Pkt>>,
+    q_recovery: Arc<SpscQueue<Pkt>>, // dedicated recovery->merge SPSC queue
     pool: Arc<PacketPool>,
     backlog_path: Option<String>,
 ) -> (Client, RecoveryHandle) {
     let (tx, rx) = crossbeam_channel::bounded::<RecoveryRequest>(1024);
     let join = std::thread::Builder::new()
         .name("recovery-tcp".into())
-        .spawn(move || run_injector(addr, q_merged, pool, rx, backlog_path))
+        .spawn(move || run_injector(addr, q_recovery, pool, rx, backlog_path))
         .expect("spawn recovery injector");
-    (Client { tx }, RecoveryHandle { join })
+    (Client { tx }, RecoveryHandle { _join: join })
 }
 
 fn run_injector<A: std::net::ToSocketAddrs>(
     addr: A,
-    q_merged: Arc<ArrayQueue<Pkt>>,
+    q_recovery: Arc<SpscQueue<Pkt>>, // recovery->merge input
     pool: Arc<PacketPool>,
     rx: Receiver<RecoveryRequest>,
     backlog_path: Option<String>,
@@ -112,7 +114,7 @@ fn run_injector<A: std::net::ToSocketAddrs>(
             let _ = writeln!(f, "gap {} {}", lo, hi);
             let _ = f.flush();
         }
-        if let Err(e) = fetch_and_inject(&addr, lo, hi, &q_merged, &pool) {
+        if let Err(e) = fetch_and_inject(&addr, lo, hi, &q_recovery, &pool) {
             log::error!("replay fetch failed: {e:?}");
         }
     }
@@ -122,7 +124,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     addr: &A,
     from: u64,
     to: u64,
-    q_merged: &Arc<ArrayQueue<Pkt>>,
+    q_recovery: &Arc<SpscQueue<Pkt>>, // recovery->merge input
     pool: &Arc<PacketPool>,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
@@ -156,10 +158,10 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
             read_so_far += n;
         }
         unsafe { bufm.advance_mut(len); }
-        let mut pkt = Pkt { buf: PktBuf::Bytes(bufm), len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: crate::util::now_nanos() };
+        let mut pkt = Pkt { buf: PktBuf::Bytes(bufm), len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
         // Backpressure: do not drop; block in userspace until space frees
         loop {
-            match q_merged.push(pkt) {
+            match q_recovery.push(pkt) {
                 Ok(()) => { metrics::inc_decode_pkts(); break; }
                 Err(returned) => {
                     pkt = returned;

@@ -126,3 +126,5 @@ pub fn cpulist_contains(cpulist: &str, cpu_id: usize) -> bool {
     }
     false
 }
+
+// These functions are used in main.rs for NUMA validation

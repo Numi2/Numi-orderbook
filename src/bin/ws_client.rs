@@ -16,9 +16,11 @@ fn main() {
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
     let txa = tx.clone();
-    thread::spawn(move || connect_and_forward(&url_a, auth.as_deref(), txa));
+    let auth_a = auth.clone();
+    thread::spawn(move || connect_and_forward(&url_a, auth_a.as_deref(), txa));
     let txb = tx.clone();
-    thread::spawn(move || connect_and_forward(&url_b, auth.as_deref(), txb));
+    let auth_b = auth.clone();
+    thread::spawn(move || connect_and_forward(&url_b, auth_b.as_deref(), txb));
 
     let mut last_seq_by_instr: HashMap<u64, u64> = HashMap::new();
     loop {
@@ -36,11 +38,11 @@ fn main() {
 }
 
 fn connect_and_forward(url: &str, auth: Option<&str>, tx: crossbeam_channel::Sender<Vec<u8>>) {
-    let mut req = http::Request::builder().uri(url);
+    let mut req = tungstenite::http::Request::builder().uri(url);
     if let Some(tok) = auth { req = req.header("Authorization", format!("Bearer {}", tok)); }
     let req = req.body(()).unwrap();
     let (mut ws, _) = tungstenite::connect(req).expect("ws connect");
-    while let Ok(msg) = ws.read_message() {
+    while let Ok(msg) = ws.read() {
         if let Message::Binary(b) = msg { let _ = tx.send(b); }
     }
 }

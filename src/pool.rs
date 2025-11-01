@@ -61,6 +61,11 @@ pub struct Pkt {
     pub merge_emit_ns: u64,
 }
 
+// Safety: Packet buffers are transferred across threads via SPSC queues.
+// BytesMut is Send. The UMEM pointer represents a frame owned by the runtime
+// which is reclaimed out of band; we treat it as Send here.
+unsafe impl Send for Pkt {}
+
 impl Pkt {
     #[inline]
     pub fn payload(&self) -> &[u8] {

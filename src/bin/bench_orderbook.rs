@@ -68,7 +68,7 @@ fn main() {
             let i = (x as usize) % orders_per_instr;
             let oid: u64 = ((instr as u64) << 32) | (i as u64);
             // New qty in [1, 200]
-            let new_qty = 1 + ((x as i64) & 0x7F) as i64 + 72;
+            let new_qty = 1 + (((x as i64) & 0x7F)) + 72;
             buf.push(Event::Mod { order_id: oid, qty: new_qty });
             if buf.len() == batch_size { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); buf.clear(); }
         }

@@ -183,13 +183,6 @@ static QUEUE_HWM: Lazy<IntGaugeVec> = Lazy::new(|| {
 
 static HWM_TRACK: Lazy<Mutex<HashMap<&'static str, i64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-static TS_MONO_VIOL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(Opts::new("ts_monotonic_violations", "Timestamp monotonic violations per queue"), &["queue"]) 
-        .expect("ts_monotonic_violations");
-    REGISTRY.register(Box::new(c.clone())).ok();
-    c
-});
-
 pub fn inc_rx(chan: &str, bytes: usize) {
     RX_PACKETS.with_label_values(&[chan]).inc();
     RX_BYTES.with_label_values(&[chan]).inc_by(bytes as u64);
@@ -249,10 +242,6 @@ pub fn set_queue_len(queue: &'static str, len: usize) {
         *e = len as i64;
         QUEUE_HWM.with_label_values(&[queue]).set(*e);
     }
-}
-
-pub fn inc_ts_mono_violation(queue: &'static str) {
-    TS_MONO_VIOL.with_label_values(&[queue]).inc();
 }
 
 // Outbound (WS/H3) -----

@@ -131,23 +131,6 @@ Some venues do not send explicit Mod/Del updates after a trade. If your feed has
 - **IRQ/NAPI budget**: tune per driver; consider busy‑polling userspace receive loops
 - **NUMA locality**: bind threads to the NIC’s NUMA node; keep queues and memory local
 
-### Metrics
-
-- Prometheus endpoint at `/metrics` on `metrics.bind`
-- Trigger on-demand snapshot with `GET /snapshot` (returns 202 on success)
-- Health endpoints: `/live`, `/ready`, `/healthz`
-- Examples: `rx_packets{chan="A"}`, `rx_bytes{chan="B"}`, `merge_gaps`, `decode_messages`, `book_live_orders`, `e2e_latency_seconds`
-
-### Snapshots
-
-- Periodic writer saves atomically to the configured path
-- On startup, the snapshot is loaded if present and `load_on_start = true`
-
-### AF_XDP / PACKET_MMAP
-
-On Linux, enabling `[afxdp] enable = true` replaces channel A’s socket RX with a high‑performance mmap’ed packet ring. The code attempts AF_XDP if available and falls back to PACKET_RX_RING (TPACKET_V2) for broad compatibility. Packets are parsed to UDP payload and fed into the pipeline with a single copy into the pool buffer.
-
-### Directory layout
 
 - `src/rx.rs` — UDP receive (timestamping, batching)
 - `src/rx_afxdp.rs` — AF_XDP receive loop
@@ -165,7 +148,3 @@ On Linux, enabling `[afxdp] enable = true` replaces channel A’s socket RX with
 ### Notes
 
 This code favors clarity on the cold path and extreme efficiency on the hot path. The hot loops avoid heap allocations, hold no locks beyond single‑writer state, and reuse pre‑sized buffers. Configure `max_messages_per_packet` to right‑size per‑packet event vectors.
-
-### Binary OBO feed (raw v1)
-
-This build exposes a binary WebSocket OBO feed (Order‑by‑Order L3 events) with two endpoints per POP for first‑arrival dedupe by sequence. See `docs/obo_raw_v1.md` for wire format and API.

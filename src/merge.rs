@@ -25,6 +25,7 @@ pub fn merge_loop(
     cfg: MergeConfig,
     shutdown: Arc<BarrierFlag>,
     recovery: Option<RecoveryClient>,
+    q_recovery_in: Option<Arc<SpscQueue<Pkt>>>, // optional recovery->merge SPSC queue
 ) -> anyhow::Result<()> {
     let MergeConfig { mut next_seq, mut reorder_window, max_pending, dwell_ns, adaptive, reorder_window_max } = cfg;
     let cap: usize = (reorder_window as usize).saturating_add(1);
@@ -55,6 +56,59 @@ pub fn merge_loop(
 
     while !shutdown.is_raised() {
         let mut moved = false;
+
+        // Drain at most a small batch of recovered packets each loop to avoid starvation
+        if let Some(ref qrec) = q_recovery_in {
+            // up to 32 per iteration
+            for _ in 0..32 {
+                if let Some(pkt) = qrec.pop() {
+                    let s = pkt.seq;
+                    if s < next_seq {
+                        metrics::inc_merge_dup();
+                    } else if s == next_seq {
+                        forward(&q_out, pkt);
+                        metrics::inc_merge_forward_chan("R");
+                        next_seq = next_seq.wrapping_add(1);
+                        moved = true;
+                        // Drain contiguous buffered packets
+                        loop {
+                            let idx = (next_seq % (cap as u64)) as usize;
+                            if let Some((stored_seq, node)) = ring[idx].take() {
+                                if stored_seq != next_seq {
+                                    ring[idx] = Some((stored_seq, node));
+                                    break;
+                                }
+                                pending_count = pending_count.saturating_sub(1);
+                                metrics::inc_merge_ooo();
+                                let c = if node.chan == b'A' { "A" } else if node.chan == b'B' { "B" } else { "R" };
+                                forward(&q_out, node);
+                                metrics::inc_merge_forward_chan(c);
+                                next_seq = next_seq.wrapping_add(1);
+                                forwarded_since_check = forwarded_since_check.saturating_add(1);
+                            } else { break; }
+                        }
+                    } else {
+                        let distance = s.wrapping_sub(next_seq);
+                        if distance <= reorder_window && pending_count < max_pending {
+                            let idx = (s % (cap as u64)) as usize;
+                            match &ring[idx] {
+                                Some((seq_in_slot, _)) => {
+                                    if *seq_in_slot == s { metrics::inc_merge_dup(); }
+                                    else if *seq_in_slot < next_seq { ring[idx] = Some((s, pkt)); pending_count += 1; }
+                                    else { metrics::inc_merge_dup(); }
+                                }
+                                None => { ring[idx] = Some((s, pkt)); pending_count += 1; }
+                            }
+                        } else {
+                            metrics::inc_merge_gap();
+                            recent_gaps = recent_gaps.saturating_add(1);
+                            metrics::inc_merge_gap_chan("R");
+                            if let Some(ref cli) = recovery { if s > next_seq { cli.notify_gap(next_seq, s - 1); } }
+                        }
+                    }
+                } else { break; }
+            }
+        }
 
         // Try preferred first, then the other (round-robin across workers)
         for src in 0..2 {
@@ -208,11 +262,17 @@ fn forward(q_out: &Arc<SpscQueue<Pkt>>, mut pkt: Pkt) {
         metrics::observe_stage_rx_to_merge_ns(now - pkt.ts_nanos);
     }
     pkt.merge_emit_ns = now;
+    let mut spins: u32 = 0;
     loop {
         match q_out.push(pkt) {
             Ok(()) => break,
             Err(ret) => {
                 pkt = ret;
+                spins = spins.wrapping_add(1);
+                if (spins & 0x0fff) == 0 {
+                    // Warn periodically if we're consistently back-pressured
+                    warn!("merge->decode backpressure: spins={} q_len~{}", spins, q_out.len());
+                }
                 crate::util::spin_wait(32);
             }
         }

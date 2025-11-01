@@ -61,3 +61,21 @@ This project loosely follows the Keep a Changelog format.
 - HTTP/3 server is behind the `h3` feature and not enabled by default.
 - Clients should connect to both endpoints per POP and keep the first-arriving frame per `(instrument_id, sequence)`.
 
+
+
+### Metrics
+
+- Prometheus endpoint at `/metrics` on `metrics.bind`
+- Trigger on-demand snapshot with `GET /snapshot` (returns 202 on success)
+- Health endpoints: `/live`, `/ready`, `/healthz`
+- Examples: `rx_packets{chan="A"}`, `rx_bytes{chan="B"}`, `merge_gaps`, `decode_messages`, `book_live_orders`, `e2e_latency_seconds`
+
+### Snapshots
+
+- Periodic writer saves atomically to the configured path
+- On startup, the snapshot is loaded if present and `load_on_start = true`
+
+### AF_XDP / PACKET_MMAP
+
+On Linux, enabling `[afxdp] enable = true` replaces channel A’s socket RX with a high‑performance mmap’ed packet ring. The code attempts AF_XDP if available and falls back to PACKET_RX_RING (TPACKET_V2) for broad compatibility. Packets are parsed to UDP payload and fed into the pipeline with a single copy into the pool buffer.
+

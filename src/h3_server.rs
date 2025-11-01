@@ -58,8 +58,7 @@ fn run_h3_listener(bus: &Bus, bind_addr: &str, cert_path: Option<&str>, key_path
                             loop {
                                 match sub.recv_next_blocking() {
                                     Ok(bytes) => { let _ = send.write(&bytes); }
-                                    Err(RecvError::Gap) => { break; }
-                                    Err(RecvError::Closed) => { break; }
+                                    Err(RecvError::Gap { .. }) => { break; }
                                 }
                             }
                             let _ = send.finish();

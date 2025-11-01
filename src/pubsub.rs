@@ -5,7 +5,9 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::codec_raw::{self, FrameHeaderV1};
 use crate::util::now_nanos;
+use zerocopy::AsBytes;
 
+#[derive(Clone)]
 pub struct Bus {
     inner: Arc<Inner>,
 }
@@ -38,7 +40,6 @@ struct Ring {
 #[derive(Debug)]
 pub enum RecvError {
     Gap { from: u64, to: u64 },
-    Closed,
 }
 
 impl Bus {

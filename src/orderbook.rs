@@ -46,11 +46,13 @@ impl Level {
     // Methods operating purely on Level are kept minimal; order-node mutation is handled in InstrumentBook
 
     /// Iterate handles FIFO from head to tail
+    #[allow(dead_code)] // Used in export
     fn iter_fifo<'a>(&self, orders: &'a Slab<Node>) -> LevelIter<'a> {
         LevelIter { orders, cur: self.head }
     }
 }
 
+#[allow(dead_code)] // Used via iter_fifo in export
 struct LevelIter<'a> {
     orders: &'a Slab<Node>,
     cur: Option<NonZeroUsize>,
@@ -66,10 +68,111 @@ impl<'a> Iterator for LevelIter<'a> {
     }
 }
 
-#[derive(Default)]
+// Tick-addressable fixed grid for hot-path price levels, with overflow map fallback.
+struct PriceGrid {
+    initialized: bool,
+    start_price: i64, // price at index 0
+    tick: i64,
+    slots: Vec<Option<Level>>, // length is power-of-two preferred but not required
+}
+
+impl PriceGrid {
+    #[inline]
+    fn new(tick: i64, span: usize) -> Self {
+        let mut v = Vec::with_capacity(span);
+        for _ in 0..span { v.push(None); }
+        Self { initialized: false, start_price: 0, tick, slots: v }
+    }
+
+    #[inline]
+    fn init_around(&mut self, price: i64) {
+        // Center the window around the given price (floor to tick), placing it in the middle.
+        let half = (self.slots.len() / 2) as i64;
+        let aligned = price - (price.rem_euclid(self.tick));
+        self.start_price = aligned - half * self.tick;
+        self.initialized = true;
+    }
+
+    #[inline]
+    fn price_to_idx(&self, price: i64) -> Option<usize> {
+        if !self.initialized { return None; }
+        let d = price - self.start_price;
+        if d < 0 { return None; }
+        if d % self.tick != 0 { return None; }
+        let idx = (d / self.tick) as usize;
+        if idx < self.slots.len() { Some(idx) } else { None }
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Used in tests
+    fn get(&self, price: i64) -> Option<&Level> {
+        if let Some(i) = self.price_to_idx(price) {
+            self.slots[i].as_ref()
+        } else { None }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, price: i64) -> Option<&mut Level> {
+        if let Some(i) = self.price_to_idx(price) {
+            // Safety: exclusive borrow of self allows mutable ref
+            if self.slots[i].is_some() { self.slots[i].as_mut() } else { None }
+        } else { None }
+    }
+
+    #[inline]
+    fn get_mut_or_create(&mut self, price: i64) -> Option<&mut Level> {
+        if !self.initialized { self.init_around(price); }
+        if let Some(i) = self.price_to_idx(price) {
+            if self.slots[i].is_none() { self.slots[i] = Some(Level::default()); }
+            self.slots[i].as_mut()
+        } else { None }
+    }
+
+    #[inline]
+    fn remove(&mut self, price: i64) -> bool {
+        if let Some(i) = self.price_to_idx(price) {
+            if self.slots[i].as_ref().map(|l| l.is_empty()).unwrap_or(false) {
+                self.slots[i] = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn best_bid_candidate(&self) -> Option<(i64, i64)> {
+        // Highest price first
+        for i in (0..self.slots.len()).rev() {
+            if let Some(l) = &self.slots[i] {
+                if !l.is_empty() {
+                    let p = self.start_price + (i as i64) * self.tick;
+                    return Some((p, l.total_qty));
+                }
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn best_ask_candidate(&self) -> Option<(i64, i64)> {
+        // Lowest price first
+        for i in 0..self.slots.len() {
+            if let Some(l) = &self.slots[i] {
+                if !l.is_empty() {
+                    let p = self.start_price + (i as i64) * self.tick;
+                    return Some((p, l.total_qty));
+                }
+            }
+        }
+        None
+    }
+}
+
 struct InstrumentBook {
-    bids: BTreeMap<i64, Level>,
-    asks: BTreeMap<i64, Level>,
+    bids_grid: PriceGrid,
+    asks_grid: PriceGrid,
+    bids_overflow: BTreeMap<i64, Level>,
+    asks_overflow: BTreeMap<i64, Level>,
     orders: Slab<Node>,
     // Cached best prices and quantities for O(1) BBO
     best_bid: Option<i64>,
@@ -80,13 +183,15 @@ struct InstrumentBook {
 
 impl InstrumentBook {
     #[cfg(test)]
-    fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new(), orders: Slab::with_capacity(1<<20) } }
+    fn new() -> Self { Self { bids_grid: PriceGrid::new(1, 16384), asks_grid: PriceGrid::new(1, 16384), bids_overflow: BTreeMap::new(), asks_overflow: BTreeMap::new(), orders: Slab::with_capacity(1<<20), best_bid: None, best_ask: None, best_bid_qty: 0, best_ask_qty: 0 } }
 
     #[inline]
     fn with_capacity(order_slab_capacity: usize) -> Self {
         Self {
-            bids: BTreeMap::new(),
-            asks: BTreeMap::new(),
+            bids_grid: PriceGrid::new(1, 16384),
+            asks_grid: PriceGrid::new(1, 16384),
+            bids_overflow: BTreeMap::new(),
+            asks_overflow: BTreeMap::new(),
             orders: Slab::with_capacity(order_slab_capacity),
             best_bid: None,
             best_ask: None,
@@ -96,28 +201,107 @@ impl InstrumentBook {
     }
 
     #[inline]
-    fn levels_mut(&mut self, side: Side) -> &mut BTreeMap<i64, Level> {
-        match side { Side::Bid => &mut self.bids, Side::Ask => &mut self.asks }
+    fn ensure_level_mut(&mut self, side: Side, price: i64) -> &mut Level {
+        match side {
+            Side::Bid => {
+                if let Some(l) = self.bids_grid.get_mut_or_create(price) { return l; }
+                self.bids_overflow.entry(price).or_default()
+            }
+            Side::Ask => {
+                if let Some(l) = self.asks_grid.get_mut_or_create(price) { return l; }
+                self.asks_overflow.entry(price).or_default()
+            }
+        }
+    }
+
+    #[inline]
+    fn get_level_mut(&mut self, side: Side, price: i64) -> Option<&mut Level> {
+        match side {
+            Side::Bid => {
+                if let Some(l) = self.bids_grid.get_mut(price) { return Some(l); }
+                self.bids_overflow.get_mut(&price)
+            }
+            Side::Ask => {
+                if let Some(l) = self.asks_grid.get_mut(price) { return Some(l); }
+                self.asks_overflow.get_mut(&price)
+            }
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Used in tests
+    fn get_level(&self, side: Side, price: i64) -> Option<&Level> {
+        match side {
+            Side::Bid => {
+                if let Some(l) = self.bids_grid.get(price) { return Some(l); }
+                self.bids_overflow.get(&price)
+            }
+            Side::Ask => {
+                if let Some(l) = self.asks_grid.get(price) { return Some(l); }
+                self.asks_overflow.get(&price)
+            }
+        }
+    }
+
+    #[inline]
+    fn remove_level_if_empty(&mut self, side: Side, price: i64) -> bool {
+        match side {
+            Side::Bid => {
+                if self.bids_grid.remove(price) { return true; }
+                if let Some(l) = self.bids_overflow.get(&price) { if l.is_empty() { self.bids_overflow.remove(&price); return true; } }
+                false
+            }
+            Side::Ask => {
+                if self.asks_grid.remove(price) { return true; }
+                if let Some(l) = self.asks_overflow.get(&price) { if l.is_empty() { self.asks_overflow.remove(&price); return true; } }
+                false
+            }
+        }
+    }
+
+    #[inline]
+    fn recompute_best_after_removal(&mut self, side: Side) {
+        match side {
+            Side::Bid => {
+                let grid_cand = self.bids_grid.best_bid_candidate();
+                let of_cand = self.bids_overflow.iter().next_back().map(|(p,l)| (*p, l.total_qty));
+                let pick = match (grid_cand, of_cand) {
+                    (Some(g), Some(o)) => if g.0 >= o.0 { Some(g) } else { Some(o) },
+                    (Some(g), None) => Some(g),
+                    (None, Some(o)) => Some(o),
+                    (None, None) => None,
+                };
+                if let Some((p, q)) = pick { self.best_bid = Some(p); self.best_bid_qty = q; } else { self.best_bid = None; self.best_bid_qty = 0; }
+            }
+            Side::Ask => {
+                let grid_cand = self.asks_grid.best_ask_candidate();
+                let of_cand = self.asks_overflow.iter().next().map(|(p,l)| (*p, l.total_qty));
+                let pick = match (grid_cand, of_cand) {
+                    (Some(g), Some(o)) => if g.0 <= o.0 { Some(g) } else { Some(o) },
+                    (Some(g), None) => Some(g),
+                    (None, Some(o)) => Some(o),
+                    (None, None) => None,
+                };
+                if let Some((p, q)) = pick { self.best_ask = Some(p); self.best_ask_qty = q; } else { self.best_ask = None; self.best_ask_qty = 0; }
+            }
+        }
     }
 
     #[inline]
     fn add(&mut self, order_id: u64, price: i64, qty: i64, side: Side) -> Handle {
         let h = self.orders.insert(Node::new(order_id, price, qty, side));
         // Obtain previous tail without holding the level borrow across order mutations
-        let prev_tail: Option<NonZeroUsize> = {
-            let lvl = self.levels_mut(side).entry(price).or_default();
-            lvl.tail
-        };
+        let prev_tail: Option<NonZeroUsize> = { let lvl = self.ensure_level_mut(side, price); lvl.tail };
         let h_nz = to_nz(h);
         if let Some(t) = prev_tail { self.orders[from_nz(t)].next = Some(h_nz); }
-        let mut new_total_opt: Option<i64> = None;
         {
             let n = &mut self.orders[h];
             n.prev = prev_tail;
             n.next = None;
         }
+        let new_total_opt: Option<i64>;
         {
-            let lvl = self.levels_mut(side).entry(price).or_default();
+            let lvl = self.ensure_level_mut(side, price);
             if prev_tail.is_none() { lvl.head = Some(h_nz); }
             lvl.tail = Some(h_nz);
             lvl.count += 1;
@@ -127,7 +311,7 @@ impl InstrumentBook {
         if let Some(new_total) = new_total_opt {
             match side {
                 Side::Bid => {
-                    if self.best_bid.map_or(true, |b| price > b) {
+                    if self.best_bid.is_none_or(|b| price > b) {
                         self.best_bid = Some(price);
                         self.best_bid_qty = new_total;
                     } else if self.best_bid == Some(price) {
@@ -135,7 +319,7 @@ impl InstrumentBook {
                     }
                 }
                 Side::Ask => {
-                    if self.best_ask.map_or(true, |a| price < a) {
+                    if self.best_ask.is_none_or(|a| price < a) {
                         self.best_ask = Some(price);
                         self.best_ask_qty = new_total;
                     } else if self.best_ask == Some(price) {
@@ -158,7 +342,7 @@ impl InstrumentBook {
             n.qty = new_qty;
         }
         let mut new_total_opt: Option<i64> = None;
-        if let Some(lvl) = self.levels_mut(side).get_mut(&price) { lvl.total_qty += new_qty - old_qty; new_total_opt = Some(lvl.total_qty); }
+        if let Some(lvl) = self.get_level_mut(side, price) { lvl.total_qty += new_qty - old_qty; new_total_opt = Some(lvl.total_qty); }
         if let Some(new_total) = new_total_opt {
             match side {
                 Side::Bid => if self.best_bid == Some(price) { self.best_bid_qty = new_total; },
@@ -178,7 +362,7 @@ impl InstrumentBook {
         let mut remove_level = false;
         let is_best = match side { Side::Bid => self.best_bid == Some(price), Side::Ask => self.best_ask == Some(price) };
         let mut new_best_qty: Option<i64> = None;
-        if let Some(lvl) = self.levels_mut(side).get_mut(&price) {
+        if let Some(lvl) = self.get_level_mut(side, price) {
             if prev.is_none() { lvl.head = next; }
             if next.is_none() { lvl.tail = prev; }
             lvl.count = lvl.count.saturating_sub(1);
@@ -188,32 +372,8 @@ impl InstrumentBook {
         }
         {
             if remove_level {
-                // Drop the mutable borrow to the level before removing it from the map
-                self.levels_mut(side).remove(&price);
-                match side {
-                    Side::Bid => {
-                        if is_best {
-                            if let Some((p,l)) = self.bids.iter().next_back() {
-                                self.best_bid = Some(*p);
-                                self.best_bid_qty = l.total_qty;
-                            } else {
-                                self.best_bid = None;
-                                self.best_bid_qty = 0;
-                            }
-                        }
-                    }
-                    Side::Ask => {
-                        if is_best {
-                            if let Some((p,l)) = self.asks.iter().next() {
-                                self.best_ask = Some(*p);
-                                self.best_ask_qty = l.total_qty;
-                            } else {
-                                self.best_ask = None;
-                                self.best_ask_qty = 0;
-                            }
-                        }
-                    }
-                }
+                let _removed = self.remove_level_if_empty(side, price);
+                if is_best { self.recompute_best_after_removal(side); }
             } else if let Some(q) = new_best_qty {
                 match side {
                     Side::Bid => if is_best { self.best_bid_qty = q; },
@@ -225,7 +385,6 @@ impl InstrumentBook {
     }
 
     #[inline]
-    #[inline]
     fn bbo(&self) -> Bbo {
         let bid = self.best_bid.map(|p| (p, self.best_bid_qty));
         let ask = self.best_ask.map(|p| (p, self.best_ask_qty));
@@ -236,8 +395,22 @@ impl InstrumentBook {
     fn top_n(&self, n: usize) -> (Depth32, Depth32) {
         let mut bids = SmallVec::<[(i64,i64); 32]>::new();
         let mut asks = SmallVec::<[(i64,i64); 32]>::new();
-        for (p,l) in self.bids.iter().rev().take(n) { bids.push((*p, l.total_qty)); }
-        for (p,l) in self.asks.iter().take(n) { asks.push((*p, l.total_qty)); }
+        // Bids: grid high->low, then overflow high->low
+        for i in (0..self.bids_grid.slots.len()).rev() {
+            if let Some(l) = &self.bids_grid.slots[i] { if !l.is_empty() {
+                let p = self.bids_grid.start_price + (i as i64)*self.bids_grid.tick;
+                bids.push((p, l.total_qty)); if bids.len() >= n { break; }
+            }}
+        }
+        if bids.len() < n { for (p,l) in self.bids_overflow.iter().rev() { bids.push((*p, l.total_qty)); if bids.len() >= n { break; } } }
+        // Asks: grid low->high, then overflow low->high
+        for i in 0..self.asks_grid.slots.len() {
+            if let Some(l) = &self.asks_grid.slots[i] { if !l.is_empty() {
+                let p = self.asks_grid.start_price + (i as i64)*self.asks_grid.tick;
+                asks.push((p, l.total_qty)); if asks.len() >= n { break; }
+            }}
+        }
+        if asks.len() < n { for (p,l) in self.asks_overflow.iter() { asks.push((*p, l.total_qty)); if asks.len() >= n { break; } } }
         (bids, asks)
     }
 }
@@ -291,7 +464,6 @@ impl OrderBook {
         self.consume_trades = v;
     }
 
-    #[inline]
     #[inline]
     fn book_mut(&mut self, instr: u32) -> &mut InstrumentBook {
         self.books.entry(instr).or_insert_with(|| InstrumentBook::with_capacity(self.default_slab_capacity))
@@ -349,13 +521,9 @@ impl OrderBook {
         }
     }
 
-    #[inline]
-    pub fn apply_many(&mut self, events: &[Event]) {
-        for e in events { self.apply(e); }
-    }
-
     /// Optimized batch apply for a known instrument: reuses the same book when possible.
     /// Events for other instruments fall back to the single-event path.
+    #[allow(dead_code)]
     pub fn apply_many_for_instr(&mut self, instr: u32, events: &[Event]) {
         let consume_trades = self.consume_trades;
         for e in events {
@@ -441,27 +609,39 @@ impl OrderBook {
         for (instr, book) in self.books.iter() {
             let mut orders = Vec::with_capacity(book.orders.len());
             // Bids: best->worst (desc), FIFO per level
-            for (price, lvl) in book.bids.iter().rev() {
+            for i in (0..book.bids_grid.slots.len()).rev() {
+                if let Some(lvl) = &book.bids_grid.slots[i] {
+                    if !lvl.is_empty() {
+                        let price = book.bids_grid.start_price + (i as i64)*book.bids_grid.tick;
+                        for h in lvl.iter_fifo(&book.orders) {
+                            let n = &book.orders[h];
+                            orders.push(OrderExport { order_id: n.order_id, price, qty: n.qty, side: Side::Bid });
+                        }
+                    }
+                }
+            }
+            for (price, lvl) in book.bids_overflow.iter().rev() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    orders.push(OrderExport {
-                        order_id: n.order_id,
-                        price: *price,
-                        qty: n.qty,
-                        side: Side::Bid,
-                    });
+                    orders.push(OrderExport { order_id: n.order_id, price: *price, qty: n.qty, side: Side::Bid });
                 }
             }
             // Asks: best->worst (asc), FIFO per level
-            for (price, lvl) in book.asks.iter() {
+            for i in 0..book.asks_grid.slots.len() {
+                if let Some(lvl) = &book.asks_grid.slots[i] {
+                    if !lvl.is_empty() {
+                        let price = book.asks_grid.start_price + (i as i64)*book.asks_grid.tick;
+                        for h in lvl.iter_fifo(&book.orders) {
+                            let n = &book.orders[h];
+                            orders.push(OrderExport { order_id: n.order_id, price, qty: n.qty, side: Side::Ask });
+                        }
+                    }
+                }
+            }
+            for (price, lvl) in book.asks_overflow.iter() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    orders.push(OrderExport {
-                        order_id: n.order_id,
-                        price: *price,
-                        qty: n.qty,
-                        side: Side::Ask,
-                    });
+                    orders.push(OrderExport { order_id: n.order_id, price: *price, qty: n.qty, side: Side::Ask });
                 }
             }
             instruments.push(InstrumentExport { instr: *instr, orders });
@@ -492,18 +672,18 @@ mod tests {
         let mut b = InstrumentBook::new();
         let h1 = b.add(1, 100, 10, Side::Bid);
         let h2 = b.add(2, 100, 20, Side::Bid);
-        let lvl = b.bids.get(&100).unwrap();
+        let lvl = b.get_level(Side::Bid, 100).unwrap();
         let mut it = lvl.iter_fifo(&b.orders);
         assert_eq!(it.next(), Some(h1));
         assert_eq!(it.next(), Some(h2));
         assert_eq!(lvl.total_qty, 30);
 
         b.set_qty(h1, 5);
-        let lvl = b.bids.get(&100).unwrap();
+        let lvl = b.get_level(Side::Bid, 100).unwrap();
         assert_eq!(lvl.total_qty, 25);
 
         b.cancel(h2);
-        let lvl = b.bids.get(&100).unwrap();
+        let lvl = b.get_level(Side::Bid, 100).unwrap();
         assert_eq!(lvl.total_qty, 5);
         assert_eq!(lvl.count, 1);
     }
@@ -513,7 +693,7 @@ mod tests {
         let mut b = InstrumentBook::new();
         let h1 = b.add(1, 101, 10, Side::Ask);
         b.cancel(h1);
-        assert!(b.asks.get(&101).is_none());
+        assert!(b.get_level(Side::Ask, 101).is_none());
     }
 }
 

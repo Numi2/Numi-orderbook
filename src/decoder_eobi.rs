@@ -1,4 +1,4 @@
-// src/decoder_eobi.rs
+
 // Numan - decoder_eobi.rs: EOBI/SBE-like (Eurex/Deutsche Börse style); little-endian SBE header [block_len, template_id, schema, version]; templates; stateless.
 //  maps venue messages
 // to the engine's Event model. This is not a full Eurex spec, but follows
@@ -8,7 +8,7 @@
 //
 use crate::parser::{Event, MessageDecoder, Side};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct EobiSbeDecoder;
 
 impl EobiSbeDecoder {
@@ -40,28 +40,34 @@ impl MessageDecoder for EobiSbeDecoder {
     }
 }
 
-#[inline] fn le_u16(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
+#[inline]
+#[allow(dead_code)] // Used in decode_messages
+fn le_u16(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
 
 // Fast unaligned little-endian loads for hot path (caller must pre-check length)
 #[inline(always)]
+#[allow(dead_code)] // Used in decode_* functions
 unsafe fn read_le_u32_unchecked(b: &[u8], off: usize) -> u32 {
     let p = b.as_ptr().add(off) as *const u32;
     u32::from_le(p.read_unaligned())
 }
 
 #[inline(always)]
+#[allow(dead_code)] // Used in decode_* functions
 unsafe fn read_le_u64_unchecked(b: &[u8], off: usize) -> u64 {
     let p = b.as_ptr().add(off) as *const u64;
     u64::from_le(p.read_unaligned())
 }
 
 #[inline(always)]
+#[allow(dead_code)] // Used in decode_* functions
 unsafe fn read_le_i64_unchecked(b: &[u8], off: usize) -> i64 {
     let p = b.as_ptr().add(off) as *const i64;
     i64::from_le(p.read_unaligned())
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn decode_add(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 8 + 4 + 1 + 8 + 8;
     if body.len() < LEN { return; }
@@ -78,6 +84,7 @@ fn decode_add(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 8 + 8;
     if body.len() < LEN { return; }
@@ -89,6 +96,7 @@ fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn decode_del(body: &[u8], out: &mut Vec<Event>) {
     if body.len() < 8 { return; }
     unsafe {
@@ -98,6 +106,7 @@ fn decode_del(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn decode_trade(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 4 + 8 + 8 + 8 + 1;
     if body.len() < LEN { return; }

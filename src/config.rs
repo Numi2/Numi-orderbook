@@ -150,16 +150,8 @@ pub struct AfxdpCfg {
     #[serde(default = "default_ifname")]
     pub ifname: String,
     #[serde(default)]
-    pub queue_id: u32,
-    #[serde(default)]
     /// Number of RX queues (RSS) to spawn when using AF_XDP/AF_PACKET ring
     pub queues: Option<usize>,
-    #[serde(default)]
-    /// UMEM frame size (bytes) for AF_XDP (hint; fallback path ignores)
-    pub umem_frame_size: Option<usize>,
-    #[serde(default)]
-    /// UMEM total frames for AF_XDP (hint; fallback path ignores)
-    pub umem_frame_count: Option<usize>,
 }
 
 fn default_ifname() -> String { "eth0".to_string() }
@@ -227,7 +219,6 @@ pub struct Feeds {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Pop {
-    pub name: String,
     pub ws_endpoints: Vec<String>, // two endpoints per POP
     pub h3_endpoints: Vec<String>, // two endpoints per POP
 }
@@ -243,16 +234,12 @@ pub struct OboFeedCfg {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
-    pub symbols: Option<Vec<String>>, // optional filter
-    #[serde(default)]
     pub buffers: Option<BuffersCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuffersCfg {
     #[serde(default = "default_pub_queue")] pub pub_queue: usize,
-    #[serde(default = "default_client_max_lag_frames")] pub client_max_lag_frames: usize,
 }
 
 fn default_pub_queue() -> usize { 65536 }
-fn default_client_max_lag_frames() -> usize { 16384 }

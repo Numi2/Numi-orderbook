@@ -15,7 +15,7 @@
 
 use crate::parser::{Event, MessageDecoder, Side};
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct FastEmdiDecoder;
 
 impl FastEmdiDecoder { pub fn new() -> Self { Self } }
@@ -50,6 +50,7 @@ impl MessageDecoder for FastEmdiDecoder {
 }
 
 #[inline]
+#[allow(dead_code)] // Used in decode_messages
 fn read_pmap(b: &[u8], mut off: usize) -> (u64, usize) {
     let mut v: u64 = 0;
     let mut shift: u32 = 0;
@@ -67,6 +68,7 @@ fn read_pmap(b: &[u8], mut off: usize) -> (u64, usize) {
 }
 
 #[inline]
+#[allow(dead_code)] // Used in decode_messages and on_* functions
 fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
     let mut v: u64 = 0;
     let mut shift: u32 = 0;
@@ -84,46 +86,49 @@ fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
 }
 
 #[inline]
-fn read_sbi_i64(b: &[u8], off: usize) -> (i64, usize) {
-    let (uv, n) = read_sbi_u64(b, off);
-    (zigzag_decode(uv), n)
-}
-
-#[inline]
-fn zigzag_decode(u: u64) -> i64 { ((u >> 1) as i64) ^ (-((u & 1) as i64)) }
-
-#[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn on_add(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
     let (order_id, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
     let (instr, n2) = read_sbi_u64(body, o); o += n2; if n2 == 0 { return; }
     if o >= body.len() { return; }
     let side = if body[o] == 0 { Side::Bid } else { Side::Ask }; o += 1;
-    let (px, n3) = read_sbi_i64(body, o); o += n3; if n3 == 0 { return; }
-    let (qty, n4) = read_sbi_i64(body, o); if n4 == 0 { return; }
+    // Inline zigzag decode
+    let (uv_px, n3) = read_sbi_u64(body, o); o += n3; if n3 == 0 { return; }
+    let px = ((uv_px >> 1) as i64) ^ (-((uv_px & 1) as i64));
+    let (uv_qty, n4) = read_sbi_u64(body, o); if n4 == 0 { return; }
+    let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
     out.push(Event::Add { order_id, instr: instr as u32, px, qty, side });
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn on_mod(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
     let (order_id, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
-    let (qty, _n2) = read_sbi_i64(body, o);
+    // Inline zigzag decode
+    let (uv_qty, _n2) = read_sbi_u64(body, o);
+    let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
     out.push(Event::Mod { order_id, qty });
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn on_del(body: &[u8], out: &mut Vec<Event>) {
     let (order_id, _n1) = read_sbi_u64(body, 0);
     out.push(Event::Del { order_id });
 }
 
 #[inline]
+#[allow(dead_code)] // Called from decode_messages
 fn on_trade(body: &[u8], out: &mut Vec<Event>, pmap: u64) {
     let mut o = 0usize;
     let (instr, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
-    let (px, n2) = read_sbi_i64(body, o); o += n2; if n2 == 0 { return; }
-    let (qty, n3) = read_sbi_i64(body, o); o += n3; if n3 == 0 { return; }
+    // Inline zigzag decode
+    let (uv_px, n2) = read_sbi_u64(body, o); o += n2; if n2 == 0 { return; }
+    let px = ((uv_px >> 1) as i64) ^ (-((uv_px & 1) as i64));
+    let (uv_qty, n3) = read_sbi_u64(body, o); o += n3; if n3 == 0 { return; }
+    let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
     let mut maker_order_id = None;
     if pmap & 0x1 != 0 {
         let (oid, n4) = read_sbi_u64(body, o); o += n4; if n4 == 0 { return; }

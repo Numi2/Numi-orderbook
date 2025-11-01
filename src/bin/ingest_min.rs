@@ -59,8 +59,8 @@ fn main() -> anyhow::Result<()> {
     // Queues
     let a_workers = cfg.channels.a.workers.unwrap_or(1).max(1);
     let b_workers = cfg.channels.b.workers.unwrap_or(1).max(1);
-    let mut q_rx_a_list: Vec<Arc<SpscQueue<Pkt>>> = (0..a_workers).map(|_| Arc::new(SpscQueue::new(cfg.general.rx_queue_capacity))).collect();
-    let mut q_rx_b_list: Vec<Arc<SpscQueue<Pkt>>> = (0..b_workers).map(|_| Arc::new(SpscQueue::new(cfg.general.rx_queue_capacity))).collect();
+    let q_rx_a_list: Vec<Arc<SpscQueue<Pkt>>> = (0..a_workers).map(|_| Arc::new(SpscQueue::new(cfg.general.rx_queue_capacity))).collect();
+    let q_rx_b_list: Vec<Arc<SpscQueue<Pkt>>> = (0..b_workers).map(|_| Arc::new(SpscQueue::new(cfg.general.rx_queue_capacity))).collect();
     let q_merged = Arc::new(SpscQueue::new(cfg.general.merge_queue_capacity));
 
     // Parser (sequence only)
@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
     let t_merge = thread::Builder::new().name("merge".into()).spawn(move || {
         pin_to_core_if_set(cfg.cpu.merge_core);
         set_realtime_priority_if(cfg.cpu.rt_priority);
-        let _ = merge::merge_loop(q_rx_a_list, q_rx_b_list, q_merged_for_merge, merge_cfg, merge_shutdown, None);
+        let _ = merge::merge_loop(q_rx_a_list, q_rx_b_list, q_merged_for_merge, merge_cfg, merge_shutdown, None, None);
     })?;
 
     // Minimal decode/sink loop: update stage/e2e metrics and recycle packets

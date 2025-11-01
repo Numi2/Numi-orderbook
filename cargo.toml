@@ -8,6 +8,8 @@ license = "Apache-2.0"
 default = ["ws", "obo"]
 ws = []
 obo = []
+jemalloc = []
+mimalloc = []
 # Enable HTTP/3 stack only when feature "h3" is selected
 h3 = [
     "dep:h3",

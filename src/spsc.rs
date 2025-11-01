@@ -53,13 +53,5 @@ impl<T> SpscQueue<T> {
     }
 }
 
-impl<T> SpscQueue<T> {
-    #[inline]
-    pub fn pop_batch<const N: usize>(&self, out: &mut Vec<T>) {
-        for _ in 0..N {
-            if let Some(v) = self.pop() { out.push(v); } else { break; }
-        }
-    }
-}
 
 

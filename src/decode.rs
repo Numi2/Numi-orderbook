@@ -8,10 +8,11 @@ use crate::obo::{map_event_to_obo_parts, OboEventV1};
 use crate::codec_raw::msg_type;
 use crate::codec_raw::channel_id;
 use crate::pubsub::Publisher as OboPublisher;
+use zerocopy::AsBytes;
 use crate::spsc::SpscQueue;
 use crossbeam_channel::Sender;
 use crossbeam_channel::Receiver;
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,8 +36,7 @@ pub fn decode_loop(
 ) -> anyhow::Result<()> {
     let mut book = cfg.initial_book.unwrap_or_else(|| OrderBook::new(cfg.max_depth));
     book.set_consume_trades(cfg.consume_trades);
-    // Cache decoder and sizing to avoid per-packet Arc clone and re-evaluations
-    let dec = parser.decoder();
+    // Cache sizing to avoid per-packet re-evaluations
     let max_msgs = parser.max_messages_per_packet;
     let mut events = Vec::with_capacity(max_msgs);
     let mut last_snap = Instant::now();
@@ -56,7 +56,11 @@ pub fn decode_loop(
             let _ts_kind = pkt._ts_kind;
             let merge_emit_ns = pkt.merge_emit_ns;
             let payload = pkt.payload();
-            dec.decode_messages(payload, &mut events);
+            let cap_before = events.capacity();
+            parser.decode_into(payload, &mut events);
+            if events.capacity() > cap_before {
+                warn!("decode events vector reallocated: old_cap={} new_cap={} len={}", cap_before, events.capacity(), events.len());
+            }
             processed_msgs += events.len() as u64;
             metrics::inc_decode_msgs(events.len() as u64);
 

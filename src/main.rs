@@ -14,6 +14,7 @@ mod pool;
 mod recovery;
 mod rx;
 mod snapshot;
+mod spsc;
 mod util;
 mod alloc;
 mod codec_raw;
@@ -152,29 +153,31 @@ fn main() -> anyhow::Result<()> {
     } else { None };
 
     // Recovery manager: TCP injector if enabled, else logger-only
-    let (recovery_client, recovery_handle) = if let Some(rcfg) = &cfg.recovery {
+    let (recovery_client, recovery_handle, q_recovery_opt): (recovery::Client, recovery::RecoveryHandle, Option<Arc<crate::spsc::SpscQueue<crate::pool::Pkt>>>) = if let Some(rcfg) = &cfg.recovery {
         if rcfg.enable_injector {
-            recovery::spawn_tcp_injector(rcfg.endpoint.clone(), q_merged.clone(), pool.clone(), rcfg.backlog_path.clone())
+            let q_recovery = Arc::new(crate::spsc::SpscQueue::new(cfg.general.merge_queue_capacity));
+            let (cli, handle) = recovery::spawn_tcp_injector(rcfg.endpoint.clone(), q_recovery.clone(), pool.clone(), rcfg.backlog_path.clone());
+            (cli, handle, Some(q_recovery))
         } else {
-            recovery::spawn_logger()
+            let (cli, handle) = recovery::spawn_logger();
+            (cli, handle, None)
         }
     } else {
-        recovery::spawn_logger()
+        let (cli, handle) = recovery::spawn_logger();
+        (cli, handle, None)
     };
 
     // RX threads
-    let rx_a_shutdown = shutdown.clone();
-    let pool_a = pool.clone();
 
     let t_rx_a = if cfg.afxdp.as_ref().map(|c| c.enable).unwrap_or(false) {
         // Spawn one AF_PACKET/AF_XDP-like worker per requested queue
         let ifname = cfg.afxdp.as_ref().unwrap().ifname.clone();
         let queues = cfg.afxdp.as_ref().unwrap().queues.unwrap_or(1).max(1);
         let mut joins = Vec::with_capacity(queues);
-        for i in 0..queues {
+        for (i, q_ai) in q_rx_a_list.iter().take(queues).enumerate() {
             let rx_a_shutdown_i = shutdown.clone();
             let pool_ai = pool.clone();
-            let q_ai = q_rx_a_list[i].clone();
+            let q_ai = q_ai.clone();
             let parser_ai = parser.clone();
             let cfg = cfg.clone();
             let ifn = ifname.clone();
@@ -281,6 +284,7 @@ fn main() -> anyhow::Result<()> {
             },
             merge_shutdown,
             Some(recovery_cli),
+            q_recovery_opt,
         ) {
             error!("merge failed: {e:?}");
         }
