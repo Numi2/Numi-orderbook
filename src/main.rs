@@ -166,9 +166,11 @@ fn main() -> anyhow::Result<()> {
                     q_ai,
                     pool_ai,
                     rx_a_shutdown_i,
-                    cfg.general.spin_loops_per_yield,
-                    cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-                    cfg.channels.a.timestamping.clone(),
+                    crate::rx::RxConfig {
+                        spin_loops_per_yield: cfg.general.spin_loops_per_yield,
+                        rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
+                        ts_mode: cfg.channels.a.timestamping.clone(),
+                    },
                 ) {
                     error!("rx-A failed: {e:?}");
                 }
@@ -200,9 +202,11 @@ fn main() -> anyhow::Result<()> {
                     q_bi,
                     pool_bi,
                     rx_b_shutdown_i,
-                    cfg.general.spin_loops_per_yield,
-                    cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-                    cfg.channels.b.timestamping.clone(),
+                    crate::rx::RxConfig {
+                        spin_loops_per_yield: cfg.general.spin_loops_per_yield,
+                        rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
+                        ts_mode: cfg.channels.b.timestamping.clone(),
+                    },
                 ) {
                     error!("rx-B failed: {e:?}");
                 }
@@ -214,7 +218,6 @@ fn main() -> anyhow::Result<()> {
 
     // Merge thread
     let merge_shutdown = shutdown.clone();
-    let parser_m = parser.clone();
     let recovery_cli = recovery_client.clone();
     let q_merged_for_merge = q_merged.clone();
     let t_merge = thread::Builder::new().name("merge".into()).spawn(move || {
@@ -224,10 +227,11 @@ fn main() -> anyhow::Result<()> {
             q_rx_a,
             q_rx_b,
             q_merged_for_merge,
-            parser_m.seq_extractor(),
-            cfg.merge.initial_expected_seq,
-            cfg.merge.reorder_window,
-            cfg.merge.max_pending_packets,
+            crate::merge::MergeConfig {
+                next_seq: cfg.merge.initial_expected_seq,
+                reorder_window: cfg.merge.reorder_window,
+                max_pending: cfg.merge.max_pending_packets,
+            },
             merge_shutdown,
             Some(recovery_cli),
         ) {
@@ -244,13 +248,15 @@ fn main() -> anyhow::Result<()> {
             q_merged,
             pool,
             parser,
-            cfg.book.max_depth,
-            cfg.book.snapshot_interval_ms,
-            cfg.book.consume_trades,
             decode_shutdown,
-            snapshot_tx,
-            initial_book,
-            Some(snaptr_rx),
+            crate::decode::DecodeConfig {
+                max_depth: cfg.book.max_depth,
+                snapshot_interval_ms: cfg.book.snapshot_interval_ms,
+                consume_trades: cfg.book.consume_trades,
+                snapshot_tx,
+                initial_book,
+                snapshot_trigger_rx: Some(snaptr_rx),
+            },
         ) {
             error!("decode failed: {e:?}");
         }

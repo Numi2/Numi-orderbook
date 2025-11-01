@@ -19,6 +19,12 @@ use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
 use std::io::IoSliceMut;
 use nix::libc;
 
+pub struct RxConfig {
+    pub spin_loops_per_yield: u32,
+    pub rx_batch: usize,
+    pub ts_mode: Option<crate::config::TimestampingMode>,
+}
+
 // TODO: Group arguments into an RxConfig struct to reduce parameter count.
 pub fn rx_loop(
     chan_name: &str,
@@ -27,10 +33,9 @@ pub fn rx_loop(
     q_out: Arc<ArrayQueue<Pkt>>,
     pool: Arc<PacketPool>,
     shutdown: Arc<crate::util::BarrierFlag>,
-    spin_loops_per_yield: u32,
-    rx_batch: usize,
-    ts_mode: Option<crate::config::TimestampingMode>,
+    cfg: RxConfig,
 ) -> anyhow::Result<()> {
+    let RxConfig { spin_loops_per_yield, rx_batch, ts_mode } = cfg;
     let fd = sock.as_raw_fd();
     let mut dropped: u64 = 0;
     let chan_id = if chan_name == "A" { b'A' } else { b'B' };

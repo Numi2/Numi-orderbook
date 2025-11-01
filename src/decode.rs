@@ -11,27 +11,31 @@ use log::info;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub struct DecodeConfig {
+    pub max_depth: usize,
+    pub snapshot_interval_ms: u64,
+    pub consume_trades: bool,
+    pub snapshot_tx: Option<Sender<crate::orderbook::BookExport>>,
+    pub initial_book: Option<OrderBook>,
+    pub snapshot_trigger_rx: Option<Receiver<()>>,
+}
+
 // TODO: Group arguments into a DecodeConfig struct to reduce parameter count.
 pub fn decode_loop(
     q_in: Arc<ArrayQueue<Pkt>>,
     pool: Arc<PacketPool>,
     parser: Parser,
-    max_depth: usize,
-    snapshot_interval_ms: u64,
-    consume_trades: bool,
     shutdown: Arc<BarrierFlag>,
-    snapshot_tx: Option<Sender<crate::orderbook::BookExport>>,
-    mut initial_book: Option<OrderBook>,
-    snapshot_trigger_rx: Option<Receiver<()>>,
+    cfg: DecodeConfig,
 ) -> anyhow::Result<()> {
-    let mut book = initial_book.take().unwrap_or_else(|| OrderBook::new(max_depth));
-    book.set_consume_trades(consume_trades);
+    let mut book = cfg.initial_book.unwrap_or_else(|| OrderBook::new(cfg.max_depth));
+    book.set_consume_trades(cfg.consume_trades);
     // Cache decoder and sizing to avoid per-packet Arc clone and re-evaluations
     let dec = parser.decoder();
     let max_msgs = parser.max_messages_per_packet;
     let mut events = Vec::with_capacity(max_msgs);
     let mut last_snap = Instant::now();
-    let snap_every = Duration::from_millis(snapshot_interval_ms);
+    let snap_every = Duration::from_millis(cfg.snapshot_interval_ms);
 
     let mut processed_pkts: u64 = 0;
     let mut processed_msgs: u64 = 0;
@@ -70,13 +74,13 @@ pub fn decode_loop(
 
             let mut should_snapshot = last_snap.elapsed() >= snap_every;
             if !should_snapshot {
-                if let Some(ref rx) = snapshot_trigger_rx {
+                if let Some(ref rx) = cfg.snapshot_trigger_rx {
                     if rx.try_recv().is_ok() { should_snapshot = true; }
                 }
             }
             if should_snapshot {
                 metrics::set_live_orders(book.order_count());
-                if let Some(ref tx) = snapshot_tx {
+                if let Some(ref tx) = cfg.snapshot_tx {
                     let export = book.export();
                     let _ = tx.try_send(export);
                 }

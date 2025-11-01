@@ -8,18 +8,22 @@ use log::{warn};
 // Reorder buffer is implemented as a fixed-size ring to minimize allocations and compares
 use std::sync::Arc;
 
+pub struct MergeConfig {
+    pub next_seq: u64,
+    pub reorder_window: u64,
+    pub max_pending: usize,
+}
+
 // TODO: Group arguments into a MergeConfig struct to reduce parameter count.
 pub fn merge_loop(
     q_a: Arc<ArrayQueue<Pkt>>,
     q_b: Arc<ArrayQueue<Pkt>>,
     q_out: Arc<ArrayQueue<Pkt>>,
-    _seq: std::sync::Arc<dyn crate::parser::SeqExtractor>,
-    mut next_seq: u64,
-    reorder_window: u64,
-    max_pending: usize,
+    cfg: MergeConfig,
     shutdown: Arc<BarrierFlag>,
     recovery: Option<RecoveryClient>,
 ) -> anyhow::Result<()> {
+    let MergeConfig { mut next_seq, reorder_window, max_pending } = cfg;
     let cap: usize = (reorder_window as usize).saturating_add(1);
     let mut ring: Vec<Option<(u64, Pkt)>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;

@@ -26,14 +26,14 @@ fn main() -> anyhow::Result<()> {
     s.set_nonblocking(false)?;
 
     let mut f = File::create(out)?;
-    write_pcap_global_header(&mut f)?;
+    write_pcap_global_header(&f)?;
     let start = std::time::Instant::now();
     let mut buf = vec![0u8; 65535];
     loop {
         if start.elapsed().as_secs() >= seconds { break; }
         match s.recv(&mut buf) {
             Ok(n) => {
-                write_pcap_packet(&mut f, &buf[..n])?;
+                write_pcap_packet(&f, &buf[..n])?;
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::WouldBlock { continue; }
@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_pcap_global_header(f: &mut File) -> anyhow::Result<()> {
+fn write_pcap_global_header(mut f: &File) -> anyhow::Result<()> {
     // PCAP Global Header (little endian)
     let mut hdr = [0u8; 24];
     hdr[0..4].copy_from_slice(&0xA1B2C3D4u32.to_le_bytes());
@@ -59,7 +59,7 @@ fn write_pcap_global_header(f: &mut File) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_pcap_packet(f: &mut File, data: &[u8]) -> anyhow::Result<()> {
+fn write_pcap_packet(mut f: &File, data: &[u8]) -> anyhow::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();

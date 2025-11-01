@@ -7,6 +7,8 @@ use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
 type Handle = usize;
+type Bbo = (Option<(i64,i64)>, Option<(i64,i64)>);
+type Depth32 = SmallVec<[(i64,i64); 32]>;
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -130,14 +132,14 @@ impl InstrumentBook {
     }
 
     #[inline]
-    fn bbo(&self) -> (Option<(i64,i64)>, Option<(i64,i64)>) {
+    fn bbo(&self) -> Bbo {
         let bid = self.bids.iter().next_back().map(|(p,l)| (*p, l.total_qty));
         let ask = self.asks.iter().next().map(|(p,l)| (*p, l.total_qty));
         (bid, ask)
     }
 
     #[allow(dead_code)]
-    fn top_n(&self, n: usize) -> (SmallVec<[(i64,i64); 32]>, SmallVec<[(i64,i64); 32]>) {
+    fn top_n(&self, n: usize) -> (Depth32, Depth32) {
         let mut bids = SmallVec::<[(i64,i64); 32]>::new();
         let mut asks = SmallVec::<[(i64,i64); 32]>::new();
         for (p,l) in self.bids.iter().rev().take(n) { bids.push((*p, l.total_qty)); }
@@ -236,7 +238,7 @@ impl OrderBook {
         }
     }
 
-    pub fn bbo(&self) -> (Option<(i64,i64)>, Option<(i64,i64)>) {
+    pub fn bbo(&self) -> Bbo {
         if let Some(instr) = self.last_instr {
             if let Some(b) = self.books.get(&instr) {
                 return b.bbo();
@@ -246,7 +248,7 @@ impl OrderBook {
     }
 
     #[allow(dead_code)]
-    pub fn top_n_of(&self, instr: u32, n: usize) -> Option<(SmallVec<[(i64,i64); 32]>, SmallVec<[(i64,i64); 32]>)> {
+    pub fn top_n_of(&self, instr: u32, n: usize) -> Option<(Depth32, Depth32)> {
         self.books.get(&instr).map(|b| b.top_n(n))
     }
 
