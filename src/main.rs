@@ -66,9 +66,7 @@ fn main() -> anyhow::Result<()> {
 
     // Snapshot trigger channel (for HTTP /snapshot) and Metrics HTTP
     let (snaptr_tx, snaptr_rx): (Sender<()>, Receiver<()>) = bounded(8);
-    let metrics_handle = if let Some(m) = &cfg.metrics {
-        Some(metrics::spawn_http(m.bind.clone(), Some(snaptr_tx.clone())))
-    } else { None };
+    let metrics_handle = cfg.metrics.as_ref().map(|m| metrics::spawn_http(m.bind.clone(), Some(snaptr_tx.clone())));
 
     // Global packet pool
     let pool = Arc::new(PacketPool::new(

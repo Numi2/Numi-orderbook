@@ -1,5 +1,5 @@
 // src/decoder_itch.rs
-//
+// Numan Thabit - decoder_itch.rs: NASDAQ ITCH 5.0 style; big-endian [len][type][body]; stateful (keeps an order map) to emit absolute quantities and enrich trades.
 // Production‑quality, stateful decoder for a real‑world binary protocol: NASDAQ TotalView‑ITCH 5.0 style.
 // It parses a UDP payload containing concatenated ITCH messages:
 // [u16 big-endian length][u8 type][body bytes...], repeated.
@@ -15,18 +15,7 @@
 //  - 'P' Trade (non-cross) — treated as execution against a displayed order
 //  - 'R' Stock Directory (optional; we simply accept it to avoid warnings)
 // Unknown types are safely skipped.
-//
-// Assumptions / notes:
-//  - All integers are big‑endian (network order), prices are 1/10000 units.
-//  - "Instrument ID" in our engine is the ITCH Stock Locate (u16), widened to u32.
-//  - Decoder is stateful: it maintains an order map (order_id -> current qty/price/side/instr)
-//    to emit **absolute** quantities on Mod events, per our engine’s Event semantics.
-//  - This implementation is single‑writer (the decode thread). We still use a Mutex for safety.
-//    If you run multiple decode threads, shard by instrument or session.
-//
-// If your venue uses MOLDUDP64 / SoupBinTCP as a session wrapper, strip that envelope before
-// feeding `decode_messages` (our receiver already handles the per‑packet sequence externally).
-//
+
 use crate::parser::{Event, MessageDecoder, Side};
 use hashbrown::HashMap;
 use std::sync::Mutex;

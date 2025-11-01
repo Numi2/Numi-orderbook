@@ -28,7 +28,7 @@ fn main() -> anyhow::Result<()> {
     for i in 0..packets {
         // simple incrementing sequence at start of payload (big-endian u64)
         if payload_size >= 8 {
-            buf[0..8].copy_from_slice(&(i as u64).to_be_bytes());
+            buf[0..8].copy_from_slice(&i.to_be_bytes());
         }
         let _ = sock.send_to(&buf, &dest.into());
         if nanos_per_pkt > 0 {

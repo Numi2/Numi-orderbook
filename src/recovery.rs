@@ -138,7 +138,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     // Example payload framing: [u32 len][u64 seq][bytes...]
     let mut hdr = [0u8; 12];
     loop {
-        if let Err(_) = stream.read_exact(&mut hdr) { break; }
+        if stream.read_exact(&mut hdr).is_err() { break; }
         let len = u32::from_be_bytes([hdr[0],hdr[1],hdr[2],hdr[3]]) as usize;
         let seq = u64::from_be_bytes([hdr[4],hdr[5],hdr[6],hdr[7],hdr[8],hdr[9],hdr[10],hdr[11]]);
         if len == 0 { break; }
@@ -146,7 +146,7 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
         // Safety: buffer is at least pool's max packet size
         let dst = unsafe {
             let s = bufm.chunk_mut();
-            std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, s.len())
+            std::slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
         };
         if len > dst.len() { anyhow::bail!("replay packet too large: {}", len); }
         let mut read_so_far = 0usize;

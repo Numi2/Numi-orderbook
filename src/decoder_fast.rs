@@ -1,4 +1,5 @@
-//  decoder for EMDI-style messages. FAST-like 
+//  decoder for EMDI-style messages. FAST/EMDI-like; stop-bit varints with presence map and template IDs; mostly stateless.
+// Numiiii
 //  supports a compact varint framing
 // sufficient to drive the engine: Add/Mod/Del/Trade events.
 // Framing per message (repeated in UDP payload):
@@ -129,9 +130,8 @@ fn on_trade(body: &[u8], out: &mut Vec<Event>, pmap: u64) {
         maker_order_id = Some(oid);
     }
     let mut taker_side = None;
-    if pmap & 0x2 != 0 {
-        if o < body.len() { taker_side = Some(if body[o] == 0 { Side::Bid } else { Side::Ask }); }
-    }
+    if pmap & 0x2 != 0
+        && o < body.len() { taker_side = Some(if body[o] == 0 { Side::Bid } else { Side::Ask }); }
     out.push(Event::Trade { instr: instr as u32, px, qty, maker_order_id, taker_side });
 }
 

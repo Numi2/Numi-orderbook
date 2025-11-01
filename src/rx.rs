@@ -19,6 +19,7 @@ use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
 use std::io::IoSliceMut;
 use nix::libc;
 
+// TODO: Group arguments into an RxConfig struct to reduce parameter count.
 pub fn rx_loop(
     chan_name: &str,
     sock: &UdpSocket,
@@ -144,7 +145,7 @@ pub fn rx_loop(
                 let mut buf = pool.get();
                 let dst = unsafe {
                     let s = buf.chunk_mut();
-                    std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, s.len())
+                    std::slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
                 };
 
                 let res_len_ts = if !ts_off {
@@ -242,29 +243,4 @@ pub fn rx_loop(
     Ok(())
 }
 
-// Backward-compatible adapter preserving the older boolean timestamping API
-#[allow(dead_code)]
-pub fn rx_loop_compat(
-    chan_name: &str,
-    sock: &UdpSocket,
-    seq: Arc<dyn SeqExtractor>,
-    q_out: Arc<ArrayQueue<Pkt>>,
-    pool: Arc<PacketPool>,
-    shutdown: Arc<crate::util::BarrierFlag>,
-    spin_loops_per_yield: u32,
-    rx_batch: usize,
-    timestamping: bool,
-) -> anyhow::Result<()> {
-    let ts_mode = if timestamping { Some(crate::config::TimestampingMode::Software) } else { None };
-    rx_loop(
-        chan_name,
-        sock,
-        seq,
-        q_out,
-        pool,
-        shutdown,
-        spin_loops_per_yield,
-        rx_batch,
-        ts_mode,
-    )
-}
+// Removed unused legacy adapter `rx_loop_compat`. If needed, reintroduce via a small wrapper.

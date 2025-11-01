@@ -62,7 +62,7 @@ pub fn now_nanos() -> u64 {
 
 #[inline]
 pub fn lock_all_memory_if(cfg: bool) {
-    if !cfg { return; }
+    if !cfg {}
     #[cfg(target_os = "linux")]
     unsafe {
         // Best-effort raise RLIMIT_MEMLOCK

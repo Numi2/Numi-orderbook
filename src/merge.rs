@@ -8,6 +8,7 @@ use log::{warn};
 // Reorder buffer is implemented as a fixed-size ring to minimize allocations and compares
 use std::sync::Arc;
 
+// TODO: Group arguments into a MergeConfig struct to reduce parameter count.
 pub fn merge_loop(
     q_a: Arc<ArrayQueue<Pkt>>,
     q_b: Arc<ArrayQueue<Pkt>>,
@@ -79,27 +80,25 @@ pub fn merge_loop(
                     if is_preferred_src {
                         streak_preferred = streak_preferred.saturating_add(1);
                         streak_nonpreferred = 0;
-                        if !prefer_a && streak_preferred >= SWITCH_TO_A_AFTER {
-                            if crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
+                        if !prefer_a && streak_preferred >= SWITCH_TO_A_AFTER
+                            && crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
                             prefer_a = true;
                             streak_preferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(true);
                                 last_switch_ns = crate::util::now_nanos();
                             }
-                        }
                     } else {
                         streak_nonpreferred = streak_nonpreferred.saturating_add(1);
                         streak_preferred = 0;
-                        if prefer_a && streak_nonpreferred >= SWITCH_TO_B_AFTER {
-                            if crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
+                        if prefer_a && streak_nonpreferred >= SWITCH_TO_B_AFTER
+                            && crate::util::now_nanos().saturating_sub(last_switch_ns) >= MIN_DWELL_NS {
                             prefer_a = false;
                             streak_nonpreferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(false);
                                 last_switch_ns = crate::util::now_nanos();
                             }
-                        }
                     }
                 } else {
                     let distance = s.wrapping_sub(next_seq);

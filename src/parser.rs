@@ -1,4 +1,4 @@
-// src/parser.rs (patched: add serde derives for Side)
+// src/parser.rs 
 use crate::config::{Endian, ParserKind};
 use crate::decoder_itch::Itch50Decoder;
 use crate::decoder_eobi::EobiSbeDecoder;

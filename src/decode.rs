@@ -1,4 +1,4 @@
-// src/decode.rs Numan Thabit: experiment to work with the advanced order book + richer events)
+// src/decode.rs Numan Thabit: 
 use crate::metrics;
 use crate::orderbook::OrderBook;
 use crate::parser::Parser;
@@ -11,6 +11,7 @@ use log::info;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// TODO: Group arguments into a DecodeConfig struct to reduce parameter count.
 pub fn decode_loop(
     q_in: Arc<ArrayQueue<Pkt>>,
     pool: Arc<PacketPool>,

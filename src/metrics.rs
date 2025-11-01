@@ -128,7 +128,6 @@ static STAGE_MERGE_TO_DECODE: Lazy<Histogram> = Lazy::new(|| {
     h
 });
 
-// removed: decode stage histogram; e2e plus stage boundaries suffice
 
 static QUEUE_LEN: Lazy<IntGaugeVec> = Lazy::new(|| {
     let g = IntGaugeVec::new(Opts::new("queue_len", "Current length of internal queues"), &["queue"]).expect("queue_len");

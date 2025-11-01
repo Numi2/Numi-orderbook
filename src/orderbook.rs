@@ -65,6 +65,7 @@ struct InstrumentBook {
 }
 
 impl InstrumentBook {
+    #[cfg(test)]
     fn new() -> Self { Self { bids: BTreeMap::new(), asks: BTreeMap::new(), orders: Slab::with_capacity(1<<20) } }
 
     #[inline]
@@ -130,7 +131,7 @@ impl InstrumentBook {
 
     #[inline]
     fn bbo(&self) -> (Option<(i64,i64)>, Option<(i64,i64)>) {
-        let bid = self.bids.iter().rev().next().map(|(p,l)| (*p, l.total_qty));
+        let bid = self.bids.iter().next_back().map(|(p,l)| (*p, l.total_qty));
         let ask = self.asks.iter().next().map(|(p,l)| (*p, l.total_qty));
         (bid, ask)
     }
@@ -181,7 +182,7 @@ impl OrderBook {
 
     #[inline]
     fn book_mut(&mut self, instr: u32) -> &mut InstrumentBook {
-        self.books.entry(instr).or_insert_with(InstrumentBook::new)
+        self.books.entry(instr).or_default()
     }
 
     pub fn apply(&mut self, ev: &Event) {

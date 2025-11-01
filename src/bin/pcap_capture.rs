@@ -45,7 +45,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_pcap_global_header(mut f: &File) -> anyhow::Result<()> {
+fn write_pcap_global_header(f: &mut File) -> anyhow::Result<()> {
     // PCAP Global Header (little endian)
     let mut hdr = [0u8; 24];
     hdr[0..4].copy_from_slice(&0xA1B2C3D4u32.to_le_bytes());
@@ -59,13 +59,13 @@ fn write_pcap_global_header(mut f: &File) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_pcap_packet(mut f: &File, data: &[u8]) -> anyhow::Result<()> {
+fn write_pcap_packet(f: &mut File, data: &[u8]) -> anyhow::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     let mut ph = [0u8; 16];
     ph[0..4].copy_from_slice(&(ts.as_secs() as u32).to_le_bytes());
-    ph[4..8].copy_from_slice(&(ts.subsec_nanos() / 1000).to_le_bytes());
+    ph[4..8].copy_from_slice(&ts.subsec_micros().to_le_bytes());
     ph[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
     ph[12..16].copy_from_slice(&(data.len() as u32).to_le_bytes());
     f.write_all(&ph)?;

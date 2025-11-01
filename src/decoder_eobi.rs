@@ -1,22 +1,10 @@
 // src/decoder_eobi.rs
-//
-// Minimal, allocation-free EOBI/SBE-like decoder that maps venue messages
+// Numan - decoder_eobi.rs: EOBI/SBE-like (Eurex/Deutsche Börse style); little-endian SBE header [block_len, template_id, schema, version]; templates; stateless.
+//  maps venue messages
 // to the engine's Event model. This is not a full Eurex spec, but follows
 // SBE framing and common order-flow templates. Hot-path does zero heap allocs.
-//
-// Frame layout per message (little-endian):
-//   [block_len: u16][template_id: u16][schema_id: u16][version: u16][body...]
-//
-// Supported template_id values (example mapping):
-//   1001: Add Order
-//     body: order_id(u64) instr(u32) side(u8 0=bid,1=ask) price(i64) qty(i64)
-//   1002: Modify Order (absolute qty)
-//     body: order_id(u64) qty(i64)
-//   1003: Delete Order
-//     body: order_id(u64)
-//   1004: Trade
-//     body: instr(u32) price(i64) qty(i64) maker_order_id(u64) taker_side(u8 0/1, 255=unknown)
-// Unknown templates are skipped safely.
+
+
 //
 use crate::parser::{Event, MessageDecoder, Side};
 
@@ -53,48 +41,159 @@ impl MessageDecoder for EobiSbeDecoder {
 }
 
 #[inline] fn le_u16(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
-#[inline] fn le_u32(b: &[u8]) -> u32 { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) }
-#[inline] fn le_u64(b: &[u8]) -> u64 { u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
-#[inline] fn le_i64(b: &[u8]) -> i64 { i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
+
+// Fast unaligned little-endian loads for hot path (caller must pre-check length)
+#[inline(always)]
+unsafe fn read_le_u32_unchecked(b: &[u8], off: usize) -> u32 {
+    let p = b.as_ptr().add(off) as *const u32;
+    u32::from_le(p.read_unaligned())
+}
+
+#[inline(always)]
+unsafe fn read_le_u64_unchecked(b: &[u8], off: usize) -> u64 {
+    let p = b.as_ptr().add(off) as *const u64;
+    u64::from_le(p.read_unaligned())
+}
+
+#[inline(always)]
+unsafe fn read_le_i64_unchecked(b: &[u8], off: usize) -> i64 {
+    let p = b.as_ptr().add(off) as *const i64;
+    i64::from_le(p.read_unaligned())
+}
 
 #[inline]
 fn decode_add(body: &[u8], out: &mut Vec<Event>) {
-    if body.len() < 8 + 4 + 1 + 8 + 8 { return; }
-    let mut o = 0usize;
-    let order_id = le_u64(&body[o..o+8]); o += 8;
-    let instr    = le_u32(&body[o..o+4]); o += 4;
-    let side     = match body[o] { 0 => Side::Bid, _ => Side::Ask }; o += 1;
-    let px       = le_i64(&body[o..o+8]); o += 8;
-    let qty      = le_i64(&body[o..o+8]);
-    out.push(Event::Add { order_id, instr, px, qty, side });
+    const LEN: usize = 8 + 4 + 1 + 8 + 8;
+    if body.len() < LEN { return; }
+    // Fixed offsets
+    // 0..8: order_id, 8..12: instr, 12: side, 13..21: px, 21..29: qty
+    unsafe {
+        let order_id = read_le_u64_unchecked(body, 0);
+        let instr    = read_le_u32_unchecked(body, 8);
+        let side     = if *body.get_unchecked(12) == 0 { Side::Bid } else { Side::Ask };
+        let px       = read_le_i64_unchecked(body, 13);
+        let qty      = read_le_i64_unchecked(body, 21);
+        out.push(Event::Add { order_id, instr, px, qty, side });
+    }
 }
 
 #[inline]
 fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
-    if body.len() < 8 + 8 { return; }
-    let mut o = 0usize;
-    let order_id = le_u64(&body[o..o+8]); o += 8;
-    let qty      = le_i64(&body[o..o+8]);
-    out.push(Event::Mod { order_id, qty });
+    const LEN: usize = 8 + 8;
+    if body.len() < LEN { return; }
+    unsafe {
+        let order_id = read_le_u64_unchecked(body, 0);
+        let qty      = read_le_i64_unchecked(body, 8);
+        out.push(Event::Mod { order_id, qty });
+    }
 }
 
 #[inline]
 fn decode_del(body: &[u8], out: &mut Vec<Event>) {
     if body.len() < 8 { return; }
-    let order_id = le_u64(&body[0..8]);
-    out.push(Event::Del { order_id });
+    unsafe {
+        let order_id = read_le_u64_unchecked(body, 0);
+        out.push(Event::Del { order_id });
+    }
 }
 
 #[inline]
 fn decode_trade(body: &[u8], out: &mut Vec<Event>) {
-    if body.len() < 4 + 8 + 8 + 8 + 1 { return; }
-    let mut o = 0usize;
-    let instr = le_u32(&body[o..o+4]); o += 4;
-    let px    = le_i64(&body[o..o+8]); o += 8;
-    let qty   = le_i64(&body[o..o+8]); o += 8;
-    let maker_order_id = le_u64(&body[o..o+8]); o += 8;
-    let taker_side = match body[o] { 0 => Some(Side::Bid), 1 => Some(Side::Ask), _ => None };
-    out.push(Event::Trade { instr, px, qty, maker_order_id: Some(maker_order_id), taker_side });
+    const LEN: usize = 4 + 8 + 8 + 8 + 1;
+    if body.len() < LEN { return; }
+    unsafe {
+        let instr = read_le_u32_unchecked(body, 0);
+        let px    = read_le_i64_unchecked(body, 4);
+        let qty   = read_le_i64_unchecked(body, 12);
+        let maker_order_id = read_le_u64_unchecked(body, 20);
+        let b = *body.get_unchecked(28);
+        let taker_side = match b { 0 => Some(Side::Bid), 1 => Some(Side::Ask), _ => None };
+        out.push(Event::Trade { instr, px, qty, maker_order_id: Some(maker_order_id), taker_side });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hdr(block_len: u16, template: u16, schema: u16, version: u16) -> [u8; 8] {
+        let mut h = [0u8; 8];
+        h[0..2].copy_from_slice(&block_len.to_le_bytes());
+        h[2..4].copy_from_slice(&template.to_le_bytes());
+        h[4..6].copy_from_slice(&schema.to_le_bytes());
+        h[6..8].copy_from_slice(&version.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn decode_add_ok() {
+        let mut buf = Vec::new();
+        // body
+        let mut body = Vec::new();
+        body.extend_from_slice(&123u64.to_le_bytes()); // order_id
+        body.extend_from_slice(&(42u32).to_le_bytes()); // instr
+        body.push(0u8); // side bid
+        body.extend_from_slice(&(1000i64).to_le_bytes()); // px
+        body.extend_from_slice(&(10i64).to_le_bytes()); // qty
+        let h = hdr(body.len() as u16, 1001, 1, 1);
+        buf.extend_from_slice(&h);
+        buf.extend_from_slice(&body);
+
+        let dec = EobiSbeDecoder::new();
+        let mut out = Vec::new();
+        dec.decode_messages(&buf, &mut out);
+        match out.as_slice() {
+            [Event::Add { order_id, instr, px, qty, side }] => {
+                assert_eq!(*order_id, 123);
+                assert_eq!(*instr, 42);
+                assert_eq!(*px, 1000);
+                assert_eq!(*qty, 10);
+                assert!(matches!(side, Side::Bid));
+            }
+            _ => panic!("unexpected events: {:?}", out),
+        }
+    }
+
+    #[test]
+    fn decode_mod_del_trade_ok() {
+        let mut buf = Vec::new();
+        // MOD
+        let mut b1 = Vec::new();
+        b1.extend_from_slice(&123u64.to_le_bytes());
+        b1.extend_from_slice(&(5i64).to_le_bytes());
+        buf.extend_from_slice(&hdr(b1.len() as u16, 1002, 1, 1));
+        buf.extend_from_slice(&b1);
+        // DEL
+        let mut b2 = Vec::new();
+        b2.extend_from_slice(&123u64.to_le_bytes());
+        buf.extend_from_slice(&hdr(b2.len() as u16, 1003, 1, 1));
+        buf.extend_from_slice(&b2);
+        // TRADE
+        let mut b3 = Vec::new();
+        b3.extend_from_slice(&(7u32).to_le_bytes()); // instr
+        b3.extend_from_slice(&(111i64).to_le_bytes()); // px
+        b3.extend_from_slice(&(2i64).to_le_bytes()); // qty
+        b3.extend_from_slice(&(123u64).to_le_bytes()); // maker
+        b3.push(1u8); // taker ask
+        buf.extend_from_slice(&hdr(b3.len() as u16, 1004, 1, 1));
+        buf.extend_from_slice(&b3);
+
+        let dec = EobiSbeDecoder::new();
+        let mut out = Vec::new();
+        dec.decode_messages(&buf, &mut out);
+        assert!(matches!(out[0], Event::Mod { order_id: 123, qty: 5 }));
+        assert!(matches!(out[1], Event::Del { order_id: 123 }));
+        match out[2] {
+            Event::Trade { instr, px, qty, maker_order_id, taker_side } => {
+                assert_eq!(instr, 7);
+                assert_eq!(px, 111);
+                assert_eq!(qty, 2);
+                assert_eq!(maker_order_id, Some(123));
+                assert!(matches!(taker_side, Some(Side::Ask)));
+            }
+            _ => panic!("expected trade event"),
+        }
+    }
 }
 
 
