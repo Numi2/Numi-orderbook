@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub metrics: Option<Metrics>,
     pub snapshot: Option<SnapshotCfg>,
     pub recovery: Option<RecoveryCfg>,
+    pub afxdp: Option<AfxdpCfg>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,6 +76,8 @@ pub struct ChannelCfg {
     pub nonblocking: bool,          // true for busy-spin recv path
     #[serde(default)]
     pub timestamping: Option<TimestampingMode>, // default Off
+    #[serde(default)]
+    pub workers: Option<usize>,     // per-channel UDP RX sockets/threads (requires reuse_port)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -125,6 +128,18 @@ pub struct SnapshotCfg {
     /// Enable periodic snapshot writing
     pub enable_writer: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AfxdpCfg {
+    #[serde(default)]
+    pub enable: bool,
+    #[serde(default = "default_ifname")]
+    pub ifname: String,
+    #[serde(default)]
+    pub queue_id: u32,
+}
+
+fn default_ifname() -> String { "eth0".to_string() }
 
 impl AppConfig {
     pub fn from_file(p: &Path) -> anyhow::Result<Self> {

@@ -5,6 +5,8 @@ pool_size = 65536
 rx_queue_capacity = 65536
 merge_queue_capacity = 65536
 spin_loops_per_yield = 64
+rx_recvmmsg_batch = 32
+mlock_all = true
 
 [sequence]
 offset = 0
@@ -23,6 +25,7 @@ reuse_port = true
 recv_buffer_bytes = 67108864
 busy_poll_us = 50
 nonblocking = true
+timestamping = "hardware"
 
 [channels.b]
 group = "239.10.10.2"
@@ -32,6 +35,7 @@ reuse_port = true
 recv_buffer_bytes = 67108864
 busy_poll_us = 50
 nonblocking = true
+timestamping = "hardware"
 
 [merge]
 initial_expected_seq = 1
@@ -48,6 +52,7 @@ a_rx_core = 2
 b_rx_core = 4
 merge_core = 6
 decode_core = 8
+rt_priority = 80
 
 [metrics]
 bind = "0.0.0.0:9100"
@@ -60,3 +65,8 @@ enable_writer = true
 [recovery]
 enable_injector = false
 endpoint = "127.0.0.1:9000"
+
+[afxdp]
+enable = false
+ifname = "eth0"
+queue_id = 0

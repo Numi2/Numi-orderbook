@@ -7,6 +7,7 @@ mod net;
 mod orderbook;
 mod parser;
 mod decoder_itch;
+mod rx_afxdp;
 mod pool;
 mod recovery;
 mod rx;
@@ -25,6 +26,7 @@ use log::{error, info};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use crossbeam_channel::{bounded, Sender, Receiver};
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -48,9 +50,10 @@ fn main() -> anyhow::Result<()> {
     // Lock memory (optional) before spinning up threads
     lock_all_memory_if(cfg.general.mlock_all);
 
-    // Metrics HTTP
+    // Snapshot trigger channel (for HTTP /snapshot) and Metrics HTTP
+    let (snaptr_tx, snaptr_rx): (Sender<()>, Receiver<()>) = bounded(8);
     let _metrics_handle = if let Some(m) = &cfg.metrics {
-        Some(metrics::spawn_http(m.bind.clone()))
+        Some(metrics::spawn_http(m.bind.clone(), Some(snaptr_tx.clone())))
     } else { None };
 
     // Global packet pool
@@ -72,9 +75,13 @@ fn main() -> anyhow::Result<()> {
     };
     let parser = build_parser(cfg.parser.kind.clone(), seq_cfg, cfg.parser.max_messages_per_packet)?;
 
-    // Sockets
-    let sock_a = net::build_mcast_socket(&cfg.channels.a)?;
-    let sock_b = net::build_mcast_socket(&cfg.channels.b)?;
+    // Sockets (support multi-worker via SO_REUSEPORT)
+    let a_workers = cfg.channels.a.workers.unwrap_or(1).max(1);
+    let b_workers = cfg.channels.b.workers.unwrap_or(1).max(1);
+    let mut socks_a = Vec::with_capacity(a_workers);
+    let mut socks_b = Vec::with_capacity(b_workers);
+    for _ in 0..a_workers { socks_a.push(net::build_mcast_socket(&cfg.channels.a)?); }
+    for _ in 0..b_workers { socks_b.push(net::build_mcast_socket(&cfg.channels.b)?); }
 
     // Snapshot manager
     let (snapshot_tx, snapshot_handle) = if let Some(snap) = &cfg.snapshot {
@@ -100,8 +107,16 @@ fn main() -> anyhow::Result<()> {
         } else { None }
     } else { None };
 
-    // Recovery manager (logger mode)
-    let (recovery_client, recovery_handle) = recovery::spawn_logger();
+    // Recovery manager: TCP injector if enabled, else logger-only
+    let (recovery_client, recovery_handle) = if let Some(rcfg) = &cfg.recovery {
+        if rcfg.enable_injector {
+            recovery::spawn_tcp_injector(rcfg.endpoint.clone(), q_merged.clone(), pool.clone())
+        } else {
+            recovery::spawn_logger()
+        }
+    } else {
+        recovery::spawn_logger()
+    };
 
     // RX threads
     let rx_a_shutdown = shutdown.clone();
@@ -113,41 +128,79 @@ fn main() -> anyhow::Result<()> {
     let parser_a = parser.clone();
     let parser_b = parser.clone();
 
-    let t_rx_a = thread::Builder::new().name("rx-A".into()).spawn(move || {
-        pin_to_core_if_set(cfg.cpu.a_rx_core);
-        set_realtime_priority_if(cfg.cpu.rt_priority);
-        if let Err(e) = rx_loop(
-            "A",
-            &sock_a,
-            parser_a.seq_extractor(),
-            q_a,
-            pool_a,
-            rx_a_shutdown,
-            cfg.general.spin_loops_per_yield,
-            cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-            cfg.channels.a.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
-        ) {
-            error!("rx-A failed: {e:?}");
+    let t_rx_a = if cfg.afxdp.as_ref().map(|c| c.enable).unwrap_or(false) {
+        let ifname = cfg.afxdp.as_ref().unwrap().ifname.clone();
+        let qid = cfg.afxdp.as_ref().unwrap().queue_id;
+        thread::Builder::new().name("afxdp".into()).spawn(move || {
+            pin_to_core_if_set(cfg.cpu.a_rx_core);
+            set_realtime_priority_if(cfg.cpu.rt_priority);
+            if let Err(e) = rx_afxdp::afxdp_loop(&ifname, qid, q_a, pool_a, rx_a_shutdown) {
+                error!("afxdp failed: {e:?}");
+            }
+        })?
+    } else {
+        // Spawn N workers for A
+        let mut joins = Vec::with_capacity(a_workers);
+        for (i, sa) in socks_a.into_iter().enumerate() {
+            let rx_a_shutdown_i = shutdown.clone();
+            let pool_ai = pool.clone();
+            let q_ai = q_rx_a.clone();
+            let parser_ai = parser.clone();
+            let name = format!("rx-A-{i}");
+            let t = thread::Builder::new().name(name).spawn(move || {
+                pin_to_core_if_set(cfg.cpu.a_rx_core);
+                set_realtime_priority_if(cfg.cpu.rt_priority);
+                if let Err(e) = rx_loop(
+                    "A",
+                    &sa,
+                    parser_ai.seq_extractor(),
+                    q_ai,
+                    pool_ai,
+                    rx_a_shutdown_i,
+                    cfg.general.spin_loops_per_yield,
+                    cfg.general.rx_recvmmsg_batch.unwrap_or(0),
+                    cfg.channels.a.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
+                ) {
+                    error!("rx-A failed: {e:?}");
+                }
+            })?;
+            joins.push(t);
         }
-    })?;
+        // Join all A workers using a proxy handle
+        thread::Builder::new().name("rx-A-join".into()).spawn(move || {
+            for j in joins { let _ = j.join(); }
+        })?
+    };
 
-    let t_rx_b = thread::Builder::new().name("rx-B".into()).spawn(move || {
-        pin_to_core_if_set(cfg.cpu.b_rx_core);
-        set_realtime_priority_if(cfg.cpu.rt_priority);
-        if let Err(e) = rx_loop(
-            "B",
-            &sock_b,
-            parser_b.seq_extractor(),
-            q_b,
-            pool_b,
-            rx_b_shutdown,
-            cfg.general.spin_loops_per_yield,
-            cfg.general.rx_recvmmsg_batch.unwrap_or(0),
-            cfg.channels.b.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
-        ) {
-            error!("rx-B failed: {e:?}");
+    let t_rx_b = {
+        let mut joins = Vec::with_capacity(b_workers);
+        for (i, sb) in socks_b.into_iter().enumerate() {
+            let rx_b_shutdown_i = shutdown.clone();
+            let pool_bi = pool.clone();
+            let q_bi = q_rx_b.clone();
+            let parser_bi = parser.clone();
+            let name = format!("rx-B-{i}");
+            let t = thread::Builder::new().name(name).spawn(move || {
+                pin_to_core_if_set(cfg.cpu.b_rx_core);
+                set_realtime_priority_if(cfg.cpu.rt_priority);
+                if let Err(e) = rx_loop(
+                    "B",
+                    &sb,
+                    parser_bi.seq_extractor(),
+                    q_bi,
+                    pool_bi,
+                    rx_b_shutdown_i,
+                    cfg.general.spin_loops_per_yield,
+                    cfg.general.rx_recvmmsg_batch.unwrap_or(0),
+                    cfg.channels.b.timestamping.as_ref().map(|m| !matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(false),
+                ) {
+                    error!("rx-B failed: {e:?}");
+                }
+            })?;
+            joins.push(t);
         }
-    })?;
+        thread::Builder::new().name("rx-B-join".into()).spawn(move || { for j in joins { let _ = j.join(); } })?
+    };
 
     // Merge thread
     let merge_shutdown = shutdown.clone();
@@ -186,6 +239,7 @@ fn main() -> anyhow::Result<()> {
             decode_shutdown,
             snapshot_tx,
             initial_book,
+            Some(snaptr_rx),
         ) {
             error!("decode failed: {e:?}");
         }

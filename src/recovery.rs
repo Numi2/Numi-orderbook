@@ -132,11 +132,16 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
             read_so_far += n;
         }
         unsafe { bufm.advance_mut(len); }
-        let pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R' };
-        if let Err(_) = q_merged.push(pkt) {
-            log::warn!("replay injection dropped due to full queue (seq={seq})");
-        } else {
-            metrics::inc_decode_pkts();
+        let mut pkt = Pkt { buf: bufm, len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R' };
+        // Backpressure: do not drop; block in userspace until space frees
+        loop {
+            match q_merged.push(pkt) {
+                Ok(()) => { metrics::inc_decode_pkts(); break; }
+                Err(returned) => {
+                    pkt = returned;
+                    crate::util::spin_wait(128);
+                }
+            }
         }
     }
 

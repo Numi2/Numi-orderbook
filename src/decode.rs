@@ -6,6 +6,7 @@ use crate::pool::{PacketPool, Pkt};
 use crate::util::{now_nanos, BarrierFlag};
 use crossbeam::queue::ArrayQueue;
 use crossbeam_channel::Sender;
+use crossbeam_channel::Receiver;
 use log::info;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ pub fn decode_loop(
     shutdown: Arc<BarrierFlag>,
     snapshot_tx: Option<Sender<crate::orderbook::BookExport>>,
     mut initial_book: Option<OrderBook>,
+    snapshot_trigger_rx: Option<Receiver<()>>,
 ) -> anyhow::Result<()> {
     let mut book = initial_book.take().unwrap_or_else(|| OrderBook::new(max_depth));
     book.set_consume_trades(consume_trades);
@@ -57,7 +59,13 @@ pub fn decode_loop(
             // Return buffer to pool without creating a new BytesMut allocation
             pool.put(buf);
 
-            if last_snap.elapsed() >= snap_every {
+            let mut should_snapshot = last_snap.elapsed() >= snap_every;
+            if !should_snapshot {
+                if let Some(ref rx) = snapshot_trigger_rx {
+                    if rx.try_recv().is_ok() { should_snapshot = true; }
+                }
+            }
+            if should_snapshot {
                 metrics::set_live_orders(book.order_count());
                 if let Some(ref tx) = snapshot_tx {
                     let export = book.export();
