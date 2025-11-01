@@ -1,6 +1,92 @@
 // src/net.rs
 use crate::config::{ChannelCfg, TimestampingMode};
 use anyhow::Context;
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+
+pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
+    let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.port);
+    let sock = UdpSocket::bind(bind_addr).context("bind udp")?;
+
+    // Reuse options
+    set_reuse(&sock, cfg.reuse_port)?;
+
+    // Join multicast on the specified iface
+    sock.join_multicast_v4(&cfg.group, &cfg.iface_addr).context("join mcast")?;
+
+    // Buffer sizes
+    if cfg.recv_buffer_bytes > 0 {
+        sock.set_recv_buffer_size(cfg.recv_buffer_bytes as usize).ok();
+    }
+
+    // Busy poll (Linux only)
+    set_busy_poll(&sock, cfg.busy_poll_us);
+
+    // Timestamping (Linux only)
+    set_timestamping(&sock, cfg.timestamping.as_ref());
+
+    // Nonblocking
+    sock.set_nonblocking(cfg.nonblocking).ok();
+
+    Ok(sock)
+}
+
+fn set_reuse(sock: &UdpSocket, reuse_port: bool) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    unsafe {
+        let one: libc::c_int = 1;
+        // SO_REUSEADDR
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, &one as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+        // SO_REUSEPORT
+        if reuse_port {
+            let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_REUSEPORT, &one as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+        }
+    }
+    Ok(())
+}
+
+fn set_busy_poll(sock: &UdpSocket, busy_poll_us: Option<u32>) {
+    #[cfg(target_os = "linux")]
+    if let Some(us) = busy_poll_us { unsafe {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        let val: libc::c_int = us as libc::c_int;
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BUSY_POLL, &val as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+    }}
+}
+
+fn set_timestamping(sock: &UdpSocket, mode: Option<&TimestampingMode>) {
+    #[cfg(target_os = "linux")]
+    if let Some(m) = mode { unsafe {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        match m {
+            TimestampingMode::Off => {
+                let zero: libc::c_int = 0;
+                let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, &zero as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+            }
+            TimestampingMode::Software => {
+                let one: libc::c_int = 1;
+                let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPNS, &one as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+            }
+            TimestampingMode::Hardware | TimestampingMode::HardwareRaw => {
+                // SO_TIMESTAMPING flags
+                const SOF_TIMESTAMPING_RX_HARDWARE: libc::c_int = 1<<0;
+                const SOF_TIMESTAMPING_RAW_HARDWARE: libc::c_int = 1<<6;
+                const SOF_TIMESTAMPING_SOFTWARE: libc::c_int = 1<<4;
+                let mut flags = SOF_TIMESTAMPING_SOFTWARE | SOF_TIMESTAMPING_RX_HARDWARE;
+                if matches!(m, TimestampingMode::HardwareRaw) {
+                    flags |= SOF_TIMESTAMPING_RAW_HARDWARE;
+                }
+                let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_TIMESTAMPING, &flags as *const _ as *const _, std::mem::size_of::<libc::c_int>() as _);
+            }
+        }
+    }}
+}
+
+// src/net.rs
+use crate::config::{ChannelCfg, TimestampingMode};
+use anyhow::Context;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 

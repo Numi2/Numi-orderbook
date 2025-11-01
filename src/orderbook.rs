@@ -172,6 +172,10 @@ impl OrderBook {
         }
     }
 
+    pub fn set_consume_trades(&mut self, v: bool) {
+        self.consume_trades = v;
+    }
+
     pub fn set_consume_trades(&mut self, on: bool) {
         self.consume_trades = on;
     }

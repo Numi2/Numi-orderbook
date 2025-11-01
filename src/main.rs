@@ -7,7 +7,6 @@ mod net;
 mod orderbook;
 mod parser;
 mod decoder_itch;
-mod decoder_eobi;
 mod pool;
 mod recovery;
 mod rx;
@@ -101,19 +100,8 @@ fn main() -> anyhow::Result<()> {
         } else { None }
     } else { None };
 
-    // Recovery manager: either TCP injector or logger-only
-    let q_merged_for_recovery = q_merged.clone();
-    let pool_for_recovery = pool.clone();
-    let (recovery_client, recovery_handle) = if let Some(rc) = &cfg.recovery {
-        if rc.enable_injector {
-            info!("recovery injector enabled -> {}", rc.endpoint);
-            recovery::spawn_tcp_injector(rc.endpoint.clone(), q_merged_for_recovery, pool_for_recovery)
-        } else {
-            recovery::spawn_logger()
-        }
-    } else {
-        recovery::spawn_logger()
-    };
+    // Recovery manager (logger mode)
+    let (recovery_client, recovery_handle) = recovery::spawn_logger();
 
     // RX threads
     let rx_a_shutdown = shutdown.clone();
