@@ -18,7 +18,11 @@ use crate::parser::{Event, MessageDecoder, Side};
 #[derive(Default, Clone)]
 pub struct FastEmdiDecoder;
 
-impl FastEmdiDecoder { pub fn new() -> Self { Self } }
+impl FastEmdiDecoder {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 impl MessageDecoder for FastEmdiDecoder {
     #[inline]
@@ -26,15 +30,23 @@ impl MessageDecoder for FastEmdiDecoder {
         let mut off = 0usize;
         while off < payload.len() {
             let (pmap, n) = read_pmap(payload, off);
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             off += n;
             let (tmpl, n2) = read_sbi_u64(payload, off);
-            if n2 == 0 { break; }
+            if n2 == 0 {
+                break;
+            }
             off += n2;
             let (body_len, n3) = read_sbi_u64(payload, off);
-            if n3 == 0 { break; }
+            if n3 == 0 {
+                break;
+            }
             off += n3;
-            if off + (body_len as usize) > payload.len() { break; }
+            if off + (body_len as usize) > payload.len() {
+                break;
+            }
             let body = &payload[off..off + (body_len as usize)];
             off += body_len as usize;
 
@@ -60,9 +72,13 @@ fn read_pmap(b: &[u8], mut off: usize) -> (u64, usize) {
         off += 1;
         consumed += 1;
         v |= ((byte & 0x7F) as u64) << shift;
-        if (byte & 0x80) == 0 { break; }
+        if (byte & 0x80) == 0 {
+            break;
+        }
         shift += 7;
-        if shift > 56 { break; }
+        if shift > 56 {
+            break;
+        }
     }
     (v, consumed)
 }
@@ -78,9 +94,13 @@ fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
         off += 1;
         consumed += 1;
         v |= ((byte & 0x7F) as u64) << shift;
-        if (byte & 0x80) == 0 { break; }
+        if (byte & 0x80) == 0 {
+            break;
+        }
         shift += 7;
-        if shift > 63 { break; }
+        if shift > 63 {
+            break;
+        }
     }
     (v, consumed)
 }
@@ -89,23 +109,51 @@ fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
 #[allow(dead_code)] // Called from decode_messages
 fn on_add(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
-    let (order_id, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
-    let (instr, n2) = read_sbi_u64(body, o); o += n2; if n2 == 0 { return; }
-    if o >= body.len() { return; }
-    let side = if body[o] == 0 { Side::Bid } else { Side::Ask }; o += 1;
+    let (order_id, n1) = read_sbi_u64(body, o);
+    o += n1;
+    if n1 == 0 {
+        return;
+    }
+    let (instr, n2) = read_sbi_u64(body, o);
+    o += n2;
+    if n2 == 0 {
+        return;
+    }
+    if o >= body.len() {
+        return;
+    }
+    let side = if body[o] == 0 { Side::Bid } else { Side::Ask };
+    o += 1;
     // Inline zigzag decode
-    let (uv_px, n3) = read_sbi_u64(body, o); o += n3; if n3 == 0 { return; }
+    let (uv_px, n3) = read_sbi_u64(body, o);
+    o += n3;
+    if n3 == 0 {
+        return;
+    }
     let px = ((uv_px >> 1) as i64) ^ (-((uv_px & 1) as i64));
-    let (uv_qty, n4) = read_sbi_u64(body, o); if n4 == 0 { return; }
+    let (uv_qty, n4) = read_sbi_u64(body, o);
+    if n4 == 0 {
+        return;
+    }
     let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
-    out.push(Event::Add { order_id, instr: instr as u32, px, qty, side });
+    out.push(Event::Add {
+        order_id,
+        instr: instr as u32,
+        px,
+        qty,
+        side,
+    });
 }
 
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn on_mod(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
-    let (order_id, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
+    let (order_id, n1) = read_sbi_u64(body, o);
+    o += n1;
+    if n1 == 0 {
+        return;
+    }
     // Inline zigzag decode
     let (uv_qty, _n2) = read_sbi_u64(body, o);
     let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
@@ -123,21 +171,58 @@ fn on_del(body: &[u8], out: &mut Vec<Event>) {
 #[allow(dead_code)] // Called from decode_messages
 fn on_trade(body: &[u8], out: &mut Vec<Event>, pmap: u64) {
     let mut o = 0usize;
-    let (instr, n1) = read_sbi_u64(body, o); o += n1; if n1 == 0 { return; }
+    let (instr, n1) = read_sbi_u64(body, o);
+    o += n1;
+    if n1 == 0 {
+        return;
+    }
     // Inline zigzag decode
-    let (uv_px, n2) = read_sbi_u64(body, o); o += n2; if n2 == 0 { return; }
+    let (uv_px, n2) = read_sbi_u64(body, o);
+    o += n2;
+    if n2 == 0 {
+        return;
+    }
     let px = ((uv_px >> 1) as i64) ^ (-((uv_px & 1) as i64));
-    let (uv_qty, n3) = read_sbi_u64(body, o); o += n3; if n3 == 0 { return; }
+    let (uv_qty, n3) = read_sbi_u64(body, o);
+    o += n3;
+    if n3 == 0 {
+        return;
+    }
     let qty = ((uv_qty >> 1) as i64) ^ (-((uv_qty & 1) as i64));
     let mut maker_order_id = None;
     if pmap & 0x1 != 0 {
-        let (oid, n4) = read_sbi_u64(body, o); o += n4; if n4 == 0 { return; }
+        let (oid, n4) = read_sbi_u64(body, o);
+        o += n4;
+        if n4 == 0 {
+            return;
+        }
         maker_order_id = Some(oid);
     }
     let mut taker_side = None;
-    if pmap & 0x2 != 0
-        && o < body.len() { taker_side = Some(if body[o] == 0 { Side::Bid } else { Side::Ask }); }
-    out.push(Event::Trade { instr: instr as u32, px, qty, maker_order_id, taker_side });
+    if pmap & 0x2 != 0 && o < body.len() {
+        taker_side = Some(if body[o] == 0 { Side::Bid } else { Side::Ask });
+    }
+    out.push(Event::Trade {
+        instr: instr as u32,
+        px,
+        qty,
+        maker_order_id,
+        taker_side,
+    });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
 
+    proptest! {
+        #[test]
+        fn decode_random_input_does_not_panic(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let dec = FastEmdiDecoder::new();
+            let mut out = Vec::new();
+            dec.decode_messages(&payload, &mut out);
+            prop_assert!(out.len() <= payload.len());
+        }
+    }
+}

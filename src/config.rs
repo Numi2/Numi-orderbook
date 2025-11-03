@@ -1,8 +1,7 @@
-// src/config.rs 
+// src/config.rs
 use serde::Deserialize;
 use std::{fs, net::Ipv4Addr, path::Path};
 
- 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub general: General,
@@ -22,24 +21,24 @@ pub struct AppConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct General {
-    pub max_packet_size: u32,       // e.g., 2048
-    pub pool_size: usize,           // e.g., 65536
-    pub rx_queue_capacity: usize,   // e.g., 65536
-    pub merge_queue_capacity: usize,// e.g., 65536
-    pub spin_loops_per_yield: u32,  // e.g., 64
+    pub max_packet_size: u32,        // e.g., 2048
+    pub pool_size: usize,            // e.g., 65536
+    pub rx_queue_capacity: usize,    // e.g., 65536
+    pub merge_queue_capacity: usize, // e.g., 65536
+    pub spin_loops_per_yield: u32,   // e.g., 64
     #[serde(default)]
     pub rx_recvmmsg_batch: Option<usize>, // if Some(N>1), enable batched recvmmsg
     #[serde(default)]
-    pub mlock_all: bool,            // mlockall current+future (Linux; best-effort)
+    pub mlock_all: bool, // mlockall current+future (Linux; best-effort)
     #[serde(default)]
-    pub json_logs: bool,            // structured JSON logs to stdout
+    pub json_logs: bool, // structured JSON logs to stdout
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Sequence {
-    pub offset: u16,                // bytes into packet payload
-    pub length: u8,                 // 4 or 8 for u32/u64
-    pub endian: Endian,             // "be" or "le"
+    pub offset: u16,    // bytes into packet payload
+    pub length: u8,     // 4 or 8 for u32/u64
+    pub endian: Endian, // "be" or "le"
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,7 +60,10 @@ pub enum ParserKind {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Endian { Be, Le }
+pub enum Endian {
+    Be,
+    Le,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Channels {
@@ -71,18 +73,18 @@ pub struct Channels {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChannelCfg {
-    pub group: Ipv4Addr,            // e.g., 239.10.10.1
-    pub port: u16,                  // e.g., 5001
-    pub iface_addr: Ipv4Addr,       // local interface IPv4 of the NIC to join on
+    pub group: Ipv4Addr,      // e.g., 239.10.10.1
+    pub port: u16,            // e.g., 5001
+    pub iface_addr: Ipv4Addr, // local interface IPv4 of the NIC to join on
     pub reuse_port: bool,
-    pub recv_buffer_bytes: u32,     // e.g., 64<<20
+    pub recv_buffer_bytes: u32, // e.g., 64<<20
     #[allow(dead_code)]
-    pub busy_poll_us: Option<u32>,  // Linux SO_BUSY_POLL (optional)
-    pub nonblocking: bool,          // true for busy-spin recv path
+    pub busy_poll_us: Option<u32>, // Linux SO_BUSY_POLL (optional)
+    pub nonblocking: bool,      // true for busy-spin recv path
     #[serde(default)]
     pub timestamping: Option<TimestampingMode>, // default Off
     #[serde(default)]
-    pub workers: Option<usize>,     // per-channel UDP RX sockets/threads (requires reuse_port)
+    pub workers: Option<usize>, // per-channel UDP RX sockets/threads (requires reuse_port)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,19 +93,19 @@ pub struct Merge {
     pub reorder_window: u64,        // window for out-of-order buffering
     pub max_pending_packets: usize, // hard cap for pending map
     #[serde(default)]
-    pub dwell_ns: Option<u64>,      // preferred minimum dwell between A/B switches
+    pub dwell_ns: Option<u64>, // preferred minimum dwell between A/B switches
     #[serde(default)]
-    pub adaptive: bool,             // enable adaptive reorder window tuning
+    pub adaptive: bool, // enable adaptive reorder window tuning
     #[serde(default)]
     pub reorder_window_max: Option<u64>, // cap for adaptive window
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Book {
-    pub max_depth: usize,           // reporting depth (snapshots/logs)
-    pub snapshot_interval_ms: u64,  // periodic snapshot/logging cadence
+    pub max_depth: usize,          // reporting depth (snapshots/logs)
+    pub snapshot_interval_ms: u64, // periodic snapshot/logging cadence
     #[serde(default)]
-    pub consume_trades: bool,       // whether to reduce book on trades when feed omits mods/dels
+    pub consume_trades: bool, // whether to reduce book on trades when feed omits mods/dels
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,7 +126,7 @@ pub struct Cpu {
     pub merge_core: Option<usize>,
     pub decode_core: Option<usize>,
     #[serde(default)]
-    pub rt_priority: Option<i32>,   // SCHED_FIFO priority if set (Linux)
+    pub rt_priority: Option<i32>, // SCHED_FIFO priority if set (Linux)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,7 +156,9 @@ pub struct AfxdpCfg {
     pub queues: Option<usize>,
 }
 
-fn default_ifname() -> String { "eth0".to_string() }
+fn default_ifname() -> String {
+    "eth0".to_string()
+}
 
 impl AppConfig {
     pub fn from_file(p: &Path) -> anyhow::Result<Self> {
@@ -186,20 +190,32 @@ impl AppConfig {
             anyhow::bail!("channels.b.workers > 1 requires reuse_port = true");
         }
         // Book constraints
-        if self.book.max_depth == 0 { anyhow::bail!("book.max_depth must be > 0"); }
-        if self.book.snapshot_interval_ms == 0 { anyhow::bail!("book.snapshot_interval_ms must be > 0"); }
+        if self.book.max_depth == 0 {
+            anyhow::bail!("book.max_depth must be > 0");
+        }
+        if self.book.snapshot_interval_ms == 0 {
+            anyhow::bail!("book.snapshot_interval_ms must be > 0");
+        }
         let _ = self.book.consume_trades;
         if let Some(ref feeds) = self.feeds {
             for p in &feeds.pops {
-                if p.ws_endpoints.len() != 2 { anyhow::bail!("each pop.ws_endpoints must have 2 entries"); }
-                if p.h3_endpoints.len() != 2 { anyhow::bail!("each pop.h3_endpoints must have 2 entries"); }
+                if p.ws_endpoints.len() != 2 {
+                    anyhow::bail!("each pop.ws_endpoints must have 2 entries");
+                }
+                if p.h3_endpoints.len() != 2 {
+                    anyhow::bail!("each pop.h3_endpoints must have 2 entries");
+                }
             }
             // Basic feeds validation and field reads
             if feeds.enabled {
-                if feeds.pops.is_empty() { anyhow::bail!("feeds.enabled = true requires at least one POP"); }
+                if feeds.pops.is_empty() {
+                    anyhow::bail!("feeds.enabled = true requires at least one POP");
+                }
             }
             if let Some(ref tok) = feeds.auth_token {
-                if tok.trim().is_empty() { anyhow::bail!("feeds.auth_token, if set, must be non-empty"); }
+                if tok.trim().is_empty() {
+                    anyhow::bail!("feeds.auth_token, if set, must be non-empty");
+                }
             }
             if let Some(ref tls) = feeds.tls {
                 if tls.cert_path.trim().is_empty() || tls.key_path.trim().is_empty() {
@@ -208,14 +224,18 @@ impl AppConfig {
             }
             if let Some(ref obo) = feeds.obo {
                 if let Some(ref bufs) = obo.buffers {
-                    if bufs.pub_queue == 0 { anyhow::bail!("feeds.obo.buffers.pub_queue must be > 0"); }
+                    if bufs.pub_queue == 0 {
+                        anyhow::bail!("feeds.obo.buffers.pub_queue must be > 0");
+                    }
                 }
                 let _ = obo.enabled; // ensure field considered
             }
         }
         // Snapshot cfg
         if let Some(ref s) = self.snapshot {
-            if s.path.trim().is_empty() { anyhow::bail!("snapshot.path must be non-empty when snapshot is configured"); }
+            if s.path.trim().is_empty() {
+                anyhow::bail!("snapshot.path must be non-empty when snapshot is configured");
+            }
             let _ = s.load_on_start;
             let _ = s.enable_writer;
         }
@@ -223,7 +243,9 @@ impl AppConfig {
         if let Some(ref r) = self.recovery {
             if r.enable_injector {
                 if r.endpoint.trim().is_empty() || !r.endpoint.contains(':') {
-                    anyhow::bail!("recovery.endpoint must be host:port when enable_injector = true");
+                    anyhow::bail!(
+                        "recovery.endpoint must be host:port when enable_injector = true"
+                    );
                 }
             }
             let _ = r.backlog_path; // read to avoid unused warning in minimal builds
@@ -231,7 +253,9 @@ impl AppConfig {
         // AF_XDP cfg (if present)
         if let Some(ref a) = self.afxdp {
             let _ = a.enable;
-            if a.ifname.trim().is_empty() { anyhow::bail!("afxdp.ifname must be non-empty if afxdp is configured"); }
+            if a.ifname.trim().is_empty() {
+                anyhow::bail!("afxdp.ifname must be non-empty if afxdp is configured");
+            }
             let _ = a.queues; // optional; just touch
         }
         Ok(())
@@ -284,7 +308,10 @@ pub struct OboFeedCfg {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BuffersCfg {
-    #[serde(default = "default_pub_queue")] pub pub_queue: usize,
+    #[serde(default = "default_pub_queue")]
+    pub pub_queue: usize,
 }
 
-fn default_pub_queue() -> usize { 65536 }
+fn default_pub_queue() -> usize {
+    65536
+}

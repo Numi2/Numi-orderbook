@@ -1,10 +1,10 @@
-// src/parser.rs 
+// src/parser.rs
 use crate::config::{Endian, ParserKind};
-use crate::decoder_itch::Itch50Decoder;
 use crate::decoder_eobi::EobiSbeDecoder;
 use crate::decoder_fast::FastEmdiDecoder;
+use crate::decoder_itch::Itch50Decoder;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
 #[derive(Clone)]
 pub struct SeqCfg {
@@ -23,7 +23,10 @@ pub trait MessageDecoder: Send + Sync + 'static {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Side { Bid, Ask }
+pub enum Side {
+    Bid,
+    Ask,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -35,8 +38,13 @@ pub enum Event {
         qty: i64,
         side: Side,
     },
-    Mod { order_id: u64, qty: i64 },
-    Del { order_id: u64 },
+    Mod {
+        order_id: u64,
+        qty: i64,
+    },
+    Del {
+        order_id: u64,
+    },
     Trade {
         instr: u32,
         px: i64,
@@ -74,12 +82,20 @@ impl DecoderImpl {
 
 impl Parser {
     #[inline]
-    pub fn seq_extractor(&self) -> Arc<dyn SeqExtractor> { self.seq.clone() }
+    pub fn seq_extractor(&self) -> Arc<dyn SeqExtractor> {
+        self.seq.clone()
+    }
     #[inline]
-    pub fn decode_into(&self, payload: &[u8], out: &mut Vec<Event>) { self.dec.decode(payload, out) }
+    pub fn decode_into(&self, payload: &[u8], out: &mut Vec<Event>) {
+        self.dec.decode(payload, out)
+    }
 }
 
-pub fn build_parser(kind: ParserKind, seq: SeqCfg, max_per_packet: usize) -> anyhow::Result<Parser> {
+pub fn build_parser(
+    kind: ParserKind,
+    seq: SeqCfg,
+    max_per_packet: usize,
+) -> anyhow::Result<Parser> {
     let seq_impl: Arc<dyn SeqExtractor> = Arc::new(FixedSeq { cfg: seq.clone() });
 
     let dec_impl: DecoderImpl = match kind {
@@ -95,7 +111,9 @@ pub fn build_parser(kind: ParserKind, seq: SeqCfg, max_per_packet: usize) -> any
     })
 }
 
-struct FixedSeq { cfg: SeqCfg }
+struct FixedSeq {
+    cfg: SeqCfg,
+}
 
 impl SeqExtractor for FixedSeq {
     #[inline]
@@ -107,22 +125,22 @@ impl SeqExtractor for FixedSeq {
         match (self.cfg.length, &self.cfg.endian) {
             (8, Endian::Be) => {
                 let mut b = [0u8; 8];
-                b.copy_from_slice(&pkt[off..off+8]);
+                b.copy_from_slice(&pkt[off..off + 8]);
                 Some(u64::from_be_bytes(b))
             }
             (8, Endian::Le) => {
                 let mut b = [0u8; 8];
-                b.copy_from_slice(&pkt[off..off+8]);
+                b.copy_from_slice(&pkt[off..off + 8]);
                 Some(u64::from_le_bytes(b))
             }
             (4, Endian::Be) => {
                 let mut b = [0u8; 4];
-                b.copy_from_slice(&pkt[off..off+4]);
+                b.copy_from_slice(&pkt[off..off + 4]);
                 Some(u32::from_be_bytes(b) as u64)
             }
             (4, Endian::Le) => {
                 let mut b = [0u8; 4];
-                b.copy_from_slice(&pkt[off..off+4]);
+                b.copy_from_slice(&pkt[off..off + 4]);
                 Some(u32::from_le_bytes(b) as u64)
             }
             _ => None,

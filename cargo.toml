@@ -57,3 +57,6 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 panic = "abort"
+
+[dev-dependencies]
+proptest = "1"

@@ -1,11 +1,11 @@
 // src/recovery.rs
-use crossbeam_channel::{Receiver, Sender};
 use crate::metrics;
-use std::sync::Arc;
-use std::thread;
 use bytes::BufMut;
+use crossbeam_channel::{Receiver, Sender};
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
+use std::sync::Arc;
+use std::thread;
 
 #[derive(Debug, Clone)]
 pub enum RecoveryRequest {
@@ -13,7 +13,6 @@ pub enum RecoveryRequest {
     Gap { from: u64, to: u64 },
 }
 
-#[derive(Clone)]
 pub struct Client {
     tx: Sender<RecoveryRequest>,
 }
@@ -21,6 +20,20 @@ pub struct Client {
 impl Client {
     pub fn notify_gap(&self, from: u64, to: u64) {
         let _ = self.tx.try_send(RecoveryRequest::Gap { from, to });
+    }
+}
+
+/// Trait for pluggable replayers to unify gap notifications across components.
+pub trait Replayer: Send + Sync {
+    fn notify_gap(&self, from: u64, to: u64);
+}
+
+pub type RecoveryClient = Arc<dyn Replayer>;
+
+impl Replayer for Client {
+    #[inline]
+    fn notify_gap(&self, from: u64, to: u64) {
+        self.notify_gap(from, to);
     }
 }
 
@@ -37,22 +50,27 @@ impl RecoveryHandle {
 
 /// Spawn a basic recovery manager that logs requests.
 /// Replace internals with exchange-specific replay logic.
-pub fn spawn_logger() -> (Client, RecoveryHandle) {
+pub fn spawn_logger() -> (RecoveryClient, RecoveryHandle) {
     let (tx, rx) = crossbeam_channel::bounded::<RecoveryRequest>(1024);
     let join = std::thread::Builder::new()
         .name("recovery".into())
         .spawn(move || run(rx))
         .expect("spawn recovery");
-    (Client { tx }, RecoveryHandle { _join: join })
+    let client: RecoveryClient = Arc::new(Client { tx });
+    (client, RecoveryHandle { _join: join })
 }
 
 fn run(rx: Receiver<RecoveryRequest>) {
     log::info!("recovery manager running (logger mode)");
+    let mut last_log_ns: u64 = 0;
     while let Ok(req) = rx.recv() {
         match req {
             RecoveryRequest::Gap { from, to } => {
-                let _ = (from, to); // Use fields to avoid warning
-                log::warn!("GAP detected; recommend out-of-band recovery for [{from}..{to}]");
+                let now = crate::util::now_nanos();
+                if now.saturating_sub(last_log_ns) >= 100_000_000 {
+                    last_log_ns = now;
+                    log::warn!("GAP detected; recommend out-of-band recovery for [{from}..{to}]");
+                }
                 // TODO: integrate TCP/unicast replay client here.
             }
         }
@@ -72,13 +90,14 @@ pub fn spawn_tcp_injector<A: std::net::ToSocketAddrs + Send + 'static>(
     q_recovery: Arc<SpscQueue<Pkt>>, // dedicated recovery->merge SPSC queue
     pool: Arc<PacketPool>,
     backlog_path: Option<String>,
-) -> (Client, RecoveryHandle) {
+) -> (RecoveryClient, RecoveryHandle) {
     let (tx, rx) = crossbeam_channel::bounded::<RecoveryRequest>(1024);
     let join = std::thread::Builder::new()
         .name("recovery-tcp".into())
         .spawn(move || run_injector(addr, q_recovery, pool, rx, backlog_path))
         .expect("spawn recovery injector");
-    (Client { tx }, RecoveryHandle { _join: join })
+    let client: RecoveryClient = Arc::new(Client { tx });
+    (client, RecoveryHandle { _join: join })
 }
 
 fn run_injector<A: std::net::ToSocketAddrs>(
@@ -88,20 +107,34 @@ fn run_injector<A: std::net::ToSocketAddrs>(
     rx: Receiver<RecoveryRequest>,
     backlog_path: Option<String>,
 ) {
-    log::info!("recovery injector running (tcp={:?})", addr.to_socket_addrs().ok().and_then(|mut it| it.next()));
-    let mut backlog = backlog_path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
+    log::info!(
+        "recovery injector running (tcp={:?})",
+        addr.to_socket_addrs().ok().and_then(|mut it| it.next())
+    );
+    let mut backlog =
+        backlog_path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
     // Simple coalescing of pending gaps: on each received gap, drain additional
     // requests non-blockingly and merge overlapping/adjacent ranges before fetch.
     while let Ok(first) = rx.recv() {
-        let (mut lo, mut hi) = match first { RecoveryRequest::Gap { from, to } => (from, to) };
-        if lo > hi { continue; }
+        let (mut lo, mut hi) = match first {
+            RecoveryRequest::Gap { from, to } => (from, to),
+        };
+        if lo > hi {
+            continue;
+        }
         // Drain more and coalesce
         while let Ok(next) = rx.try_recv() {
-            let (from, to) = match next { RecoveryRequest::Gap { from, to } => (from, to) };
+            let (from, to) = match next {
+                RecoveryRequest::Gap { from, to } => (from, to),
+            };
             if from <= hi.saturating_add(1) && to >= lo.saturating_sub(1) {
                 // overlap or adjacent
-                if from < lo { lo = from; }
-                if to > hi { hi = to; }
+                if from < lo {
+                    lo = from;
+                }
+                if to > hi {
+                    hi = to;
+                }
             } else {
                 // Non-overlapping; log individually
                 if let Some(f) = backlog.as_mut() {
@@ -140,35 +173,47 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     // Example payload framing: [u32 len][u64 seq][bytes...]
     let mut hdr = [0u8; 12];
     loop {
-        if stream.read_exact(&mut hdr).is_err() { break; }
-        let len = u32::from_be_bytes([hdr[0],hdr[1],hdr[2],hdr[3]]) as usize;
-        let seq = u64::from_be_bytes([hdr[4],hdr[5],hdr[6],hdr[7],hdr[8],hdr[9],hdr[10],hdr[11]]);
-        if len == 0 { break; }
+        if stream.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+        let seq = u64::from_be_bytes([
+            hdr[4], hdr[5], hdr[6], hdr[7], hdr[8], hdr[9], hdr[10], hdr[11],
+        ]);
+        if len == 0 {
+            break;
+        }
         let mut bufm = pool.get();
         // Safety: buffer is at least pool's max packet size
         let dst = unsafe {
             let s = bufm.chunk_mut();
             std::slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
         };
-        if len > dst.len() { anyhow::bail!("replay packet too large: {}", len); }
+        if len > dst.len() {
+            anyhow::bail!("replay packet too large: {}", len);
+        }
         let mut read_so_far = 0usize;
         while read_so_far < len {
             let n = stream.read(&mut dst[read_so_far..len])?;
-            if n == 0 { anyhow::bail!("unexpected EOF from replay server"); }
+            if n == 0 {
+                anyhow::bail!("unexpected EOF from replay server");
+            }
             read_so_far += n;
         }
-        unsafe { bufm.advance_mut(len); }
-        let mut pkt = Pkt { buf: PktBuf::Bytes(bufm), len, seq, ts_nanos: crate::util::now_nanos(), chan: b'R', _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
-        // Backpressure: do not drop; block in userspace until space frees
-        loop {
-            match q_recovery.push(pkt) {
-                Ok(()) => { metrics::inc_decode_pkts(); break; }
-                Err(returned) => {
-                    pkt = returned;
-                    crate::util::spin_wait(128);
-                }
-            }
+        unsafe {
+            bufm.advance_mut(len);
         }
+        let pkt = Pkt {
+            buf: PktBuf::Bytes(bufm),
+            len,
+            seq,
+            ts_nanos: crate::util::now_nanos(),
+            chan: b'R',
+            _ts_kind: TsKind::Sw,
+            merge_emit_ns: 0,
+        };
+        q_recovery.push_blocking(pkt);
+        metrics::inc_decode_pkts();
     }
 
     Ok(())

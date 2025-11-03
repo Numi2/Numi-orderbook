@@ -1,10 +1,10 @@
 // src/merge.rs (updated: metrics + recovery)
 use crate::metrics;
 use crate::pool::Pkt;
-use crate::recovery::Client as RecoveryClient;
-use crate::util::BarrierFlag;
+use crate::recovery::RecoveryClient;
 use crate::spsc::SpscQueue;
-use log::{warn};
+use crate::util::BarrierFlag;
+use log::warn;
 // Reorder buffer is implemented as a fixed-size ring to minimize allocations and compares
 use std::sync::Arc;
 
@@ -27,7 +27,14 @@ pub fn merge_loop(
     recovery: Option<RecoveryClient>,
     q_recovery_in: Option<Arc<SpscQueue<Pkt>>>, // optional recovery->merge SPSC queue
 ) -> anyhow::Result<()> {
-    let MergeConfig { mut next_seq, mut reorder_window, max_pending, dwell_ns, adaptive, reorder_window_max } = cfg;
+    let MergeConfig {
+        mut next_seq,
+        mut reorder_window,
+        max_pending,
+        dwell_ns,
+        adaptive,
+        reorder_window_max,
+    } = cfg;
     let cap: usize = (reorder_window as usize).saturating_add(1);
     let mut ring: Vec<Option<(u64, Pkt)>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;
@@ -80,12 +87,20 @@ pub fn merge_loop(
                                 }
                                 pending_count = pending_count.saturating_sub(1);
                                 metrics::inc_merge_ooo();
-                                let c = if node.chan == b'A' { "A" } else if node.chan == b'B' { "B" } else { "R" };
+                                let c = if node.chan == b'A' {
+                                    "A"
+                                } else if node.chan == b'B' {
+                                    "B"
+                                } else {
+                                    "R"
+                                };
                                 forward(&q_out, node);
                                 metrics::inc_merge_forward_chan(c);
                                 next_seq = next_seq.wrapping_add(1);
                                 forwarded_since_check = forwarded_since_check.saturating_add(1);
-                            } else { break; }
+                            } else {
+                                break;
+                            }
                         }
                     } else {
                         let distance = s.wrapping_sub(next_seq);
@@ -93,20 +108,34 @@ pub fn merge_loop(
                             let idx = (s % (cap as u64)) as usize;
                             match &ring[idx] {
                                 Some((seq_in_slot, _)) => {
-                                    if *seq_in_slot == s { metrics::inc_merge_dup(); }
-                                    else if *seq_in_slot < next_seq { ring[idx] = Some((s, pkt)); pending_count += 1; }
-                                    else { metrics::inc_merge_dup(); }
+                                    if *seq_in_slot == s {
+                                        metrics::inc_merge_dup();
+                                    } else if *seq_in_slot < next_seq {
+                                        ring[idx] = Some((s, pkt));
+                                        pending_count += 1;
+                                    } else {
+                                        metrics::inc_merge_dup();
+                                    }
                                 }
-                                None => { ring[idx] = Some((s, pkt)); pending_count += 1; }
+                                None => {
+                                    ring[idx] = Some((s, pkt));
+                                    pending_count += 1;
+                                }
                             }
                         } else {
                             metrics::inc_merge_gap();
                             recent_gaps = recent_gaps.saturating_add(1);
                             metrics::inc_merge_gap_chan("R");
-                            if let Some(ref cli) = recovery { if s > next_seq { cli.notify_gap(next_seq, s - 1); } }
+                            if let Some(ref cli) = recovery {
+                                if s > next_seq {
+                                    cli.notify_gap(next_seq, s - 1);
+                                }
+                            }
                         }
                     }
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         }
 
@@ -162,27 +191,33 @@ pub fn merge_loop(
                     if is_preferred_src {
                         streak_preferred = streak_preferred.saturating_add(1);
                         streak_nonpreferred = 0;
-                        if !prefer_a && streak_preferred >= SWITCH_TO_A_AFTER
-                            && crate::util::now_nanos().saturating_sub(last_switch_ns) >= min_dwell_ns {
+                        if !prefer_a
+                            && streak_preferred >= SWITCH_TO_A_AFTER
+                            && crate::util::now_nanos().saturating_sub(last_switch_ns)
+                                >= min_dwell_ns
+                        {
                             prefer_a = true;
                             streak_preferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(true);
-                                last_switch_ns = crate::util::now_nanos();
-                                switches_in_window = switches_in_window.saturating_add(1);
-                            }
+                            last_switch_ns = crate::util::now_nanos();
+                            switches_in_window = switches_in_window.saturating_add(1);
+                        }
                     } else {
                         streak_nonpreferred = streak_nonpreferred.saturating_add(1);
                         streak_preferred = 0;
-                        if prefer_a && streak_nonpreferred >= SWITCH_TO_B_AFTER
-                            && crate::util::now_nanos().saturating_sub(last_switch_ns) >= min_dwell_ns {
+                        if prefer_a
+                            && streak_nonpreferred >= SWITCH_TO_B_AFTER
+                            && crate::util::now_nanos().saturating_sub(last_switch_ns)
+                                >= min_dwell_ns
+                        {
                             prefer_a = false;
                             streak_nonpreferred = 0;
                             metrics::inc_merge_failover();
                             metrics::set_merge_preferred_is_a(false);
-                                last_switch_ns = crate::util::now_nanos();
-                                switches_in_window = switches_in_window.saturating_add(1);
-                            }
+                            last_switch_ns = crate::util::now_nanos();
+                            switches_in_window = switches_in_window.saturating_add(1);
+                        }
                     }
                 } else {
                     let distance = s.wrapping_sub(next_seq);
@@ -236,8 +271,10 @@ pub fn merge_loop(
             }
             // Adapt dwell if we ping-pong too often
             if switches_in_window >= 4 {
-                min_dwell_ns = (min_dwell_ns.saturating_mul(2)).min(50_000_000); // cap at 50ms
-            } else if switches_in_window == 0 && min_dwell_ns > dwell_ns { // decay
+                min_dwell_ns = (min_dwell_ns.saturating_mul(2)).min(50_000_000);
+            // cap at 50ms
+            } else if switches_in_window == 0 && min_dwell_ns > dwell_ns {
+                // decay
                 min_dwell_ns = (min_dwell_ns.saturating_sub(min_dwell_ns / 4)).max(dwell_ns);
             }
             forwarded_since_check = 0;
@@ -262,19 +299,84 @@ fn forward(q_out: &Arc<SpscQueue<Pkt>>, mut pkt: Pkt) {
         metrics::observe_stage_rx_to_merge_ns(now - pkt.ts_nanos);
     }
     pkt.merge_emit_ns = now;
-    let mut spins: u32 = 0;
+    let mut retries: u32 = 0;
     loop {
-        match q_out.push(pkt) {
+        match q_out.push_with_backoff(pkt, 1024) {
             Ok(()) => break,
-            Err(ret) => {
-                pkt = ret;
-                spins = spins.wrapping_add(1);
-                if (spins & 0x0fff) == 0 {
-                    // Warn periodically if we're consistently back-pressured
-                    warn!("merge->decode backpressure: spins={} q_len~{}", spins, q_out.len());
+            Err(returned) => {
+                pkt = returned;
+                retries = retries.wrapping_add(1);
+                if (retries & 0x3f) == 0 {
+                    warn!(
+                        "merge->decode backpressure: retries={} q_len~{}",
+                        retries,
+                        q_out.len()
+                    );
                 }
-                crate::util::spin_wait(32);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    fn pkt(seq: u64, chan: u8) -> Pkt {
+        Pkt {
+            buf: crate::pool::PktBuf::Bytes(BytesMut::new()),
+            len: 0,
+            seq,
+            ts_nanos: 0,
+            chan,
+            _ts_kind: crate::pool::TsKind::Sw,
+            merge_emit_ns: 0,
+        }
+    }
+
+    #[test]
+    fn merge_reorders_in_window_and_drops_dupes() {
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+
+        let qa = q_a.clone();
+        let qb = q_b.clone();
+        let qo = q_out.clone();
+        let sd = shutdown.clone();
+        let t = std::thread::spawn(move || {
+            let cfg = MergeConfig {
+                next_seq: 1,
+                reorder_window: 4,
+                max_pending: 64,
+                dwell_ns: 0,
+                adaptive: false,
+                reorder_window_max: 8,
+            };
+            let _ = merge_loop(vec![qa], vec![qb], qo, cfg, sd, None, None);
+        });
+
+        // Feed out-of-order within window and duplicates across channels
+        let _ = q_a.push(pkt(1, b'A'));
+        let _ = q_b.push(pkt(3, b'B'));
+        let _ = q_a.push(pkt(2, b'A'));
+        let _ = q_b.push(pkt(2, b'B')); // duplicate
+        let _ = q_a.push(pkt(4, b'A'));
+
+        // wait until we see at least 4 outputs or timeout
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while q_out.len() < 4 && std::time::Instant::now() < deadline {
+            crate::util::spin_wait(1000);
+        }
+        shutdown.raise();
+        let _ = t.join();
+
+        let mut seqs = Vec::new();
+        while let Some(p) = q_out.pop() {
+            seqs.push(p.seq);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
     }
 }

@@ -11,7 +11,11 @@ fn main() {
     }
     let url_a = args[1].clone();
     let url_b = args[2].clone();
-    let auth = if args.len() > 3 { Some(args[3].clone()) } else { None };
+    let auth = if args.len() > 3 {
+        Some(args[3].clone())
+    } else {
+        None
+    };
 
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
 
@@ -25,12 +29,16 @@ fn main() {
     let mut last_seq_by_instr: HashMap<u64, u64> = HashMap::new();
     loop {
         if let Ok(frame) = rx.recv() {
-            if frame.len() < 40 { continue; }
+            if frame.len() < 40 {
+                continue;
+            }
             let instr = le_u64(&frame[16..24]);
             let seq = le_u64(&frame[24..32]);
             let mtype = le_u16(&frame[6..8]);
             let e = last_seq_by_instr.entry(instr).or_insert(0);
-            if seq <= *e { continue; } // drop duplicate/old
+            if seq <= *e {
+                continue;
+            } // drop duplicate/old
             *e = seq;
             println!("instr={} seq={} type={}", instr, seq, mtype);
         }
@@ -39,17 +47,23 @@ fn main() {
 
 fn connect_and_forward(url: &str, auth: Option<&str>, tx: crossbeam_channel::Sender<Vec<u8>>) {
     let mut req = tungstenite::http::Request::builder().uri(url);
-    if let Some(tok) = auth { req = req.header("Authorization", format!("Bearer {}", tok)); }
+    if let Some(tok) = auth {
+        req = req.header("Authorization", format!("Bearer {}", tok));
+    }
     let req = req.body(()).unwrap();
     let (mut ws, _) = tungstenite::connect(req).expect("ws connect");
     while let Ok(msg) = ws.read() {
-        if let Message::Binary(b) = msg { let _ = tx.send(b); }
+        if let Message::Binary(b) = msg {
+            let _ = tx.send(b);
+        }
     }
 }
 
 #[inline]
-fn le_u16(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
 #[inline]
-fn le_u64(b: &[u8]) -> u64 { u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) }
-
-
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}

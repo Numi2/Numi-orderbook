@@ -17,7 +17,7 @@ fn main() -> anyhow::Result<()> {
 
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_reuse_address(true).ok();
-    #[cfg(any(target_os="linux", target_os="android", target_os="freebsd"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     sock.set_reuse_port(true).ok();
     let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&bind_addr.into())?;
@@ -30,13 +30,17 @@ fn main() -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut buf = vec![0u8; 65535];
     loop {
-        if start.elapsed().as_secs() >= seconds { break; }
+        if start.elapsed().as_secs() >= seconds {
+            break;
+        }
         match s.recv(&mut buf) {
             Ok(n) => {
                 write_pcap_packet(&f, &buf[..n])?;
             }
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock { continue; }
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
                 return Err(e.into());
             }
         }
@@ -72,5 +76,3 @@ fn write_pcap_packet(mut f: &File, data: &[u8]) -> anyhow::Result<()> {
     f.write_all(data)?;
     Ok(())
 }
-
-

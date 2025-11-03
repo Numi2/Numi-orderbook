@@ -1,8 +1,8 @@
 // src/pool.rs
 use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
-use std::sync::Arc;
 use std::slice;
+use std::sync::Arc;
 
 pub struct PacketPool {
     inner: Arc<ArrayQueue<BytesMut>>,
@@ -17,7 +17,10 @@ impl PacketPool {
         for _ in 0..prealloc {
             let _ = q.push(BytesMut::with_capacity(max_packet_size));
         }
-        Ok(Self { inner: q, max_packet_size })
+        Ok(Self {
+            inner: q,
+            max_packet_size,
+        })
     }
 
     #[inline]
@@ -40,13 +43,22 @@ impl PacketPool {
 #[repr(u8)]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TsKind { None = 0, Sw = 1, HwSys = 2, HwRaw = 3 }
+pub enum TsKind {
+    None = 0,
+    Sw = 1,
+    HwSys = 2,
+    HwRaw = 3,
+}
 
 #[derive(Debug)]
 pub enum PktBuf {
     Bytes(BytesMut),
     #[allow(dead_code)]
-    Umem { ptr: *mut u8, len: usize, frame_idx: u32 },
+    Umem {
+        ptr: *mut u8,
+        len: usize,
+        frame_idx: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -71,7 +83,9 @@ impl Pkt {
     pub fn payload(&self) -> &[u8] {
         match &self.buf {
             PktBuf::Bytes(b) => &b[..self.len],
-            PktBuf::Umem { ptr, len, .. } => unsafe { slice::from_raw_parts(*ptr as *const u8, *len) },
+            PktBuf::Umem { ptr, len, .. } => unsafe {
+                slice::from_raw_parts(*ptr as *const u8, *len)
+            },
         }
     }
 
@@ -83,5 +97,3 @@ impl Pkt {
         }
     }
 }
-
-

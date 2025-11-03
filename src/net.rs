@@ -5,8 +5,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 
 pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("socket")?;
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).context("socket")?;
 
     sock.set_reuse_address(true).ok();
     if cfg.reuse_port {
@@ -26,7 +25,8 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
     // Join multicast group on specified interface
     let group = cfg.group;
     let iface = cfg.iface_addr;
-    sock.join_multicast_v4(&group, &iface).context("join_multicast_v4")?;
+    sock.join_multicast_v4(&group, &iface)
+        .context("join_multicast_v4")?;
 
     // Optional busy-poll hint (Linux only)
     #[cfg(target_os = "linux")]
@@ -64,7 +64,8 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
                         std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                     );
                 }
-                crate::config::TimestampingMode::Hardware | crate::config::TimestampingMode::HardwareRaw => {
+                crate::config::TimestampingMode::Hardware
+                | crate::config::TimestampingMode::HardwareRaw => {
                     // Use SO_TIMESTAMPING and return SCM_TIMESTAMPING (timespec[3])
                     // Choose RAW_HARDWARE when requested, otherwise SYSTEM_HARDWARE.
                     #[allow(non_upper_case_globals)]
@@ -101,5 +102,3 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
     }
     Ok(s)
 }
-
-

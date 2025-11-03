@@ -2,20 +2,19 @@
 // Optional AF_XDP receiver. Integrate by spawning this loop instead of `rx::rx_loop`. Keeps the same Pkt
 // contract and queueing model.
 
-
 #[cfg(target_os = "linux")]
 use crate::metrics;
-use crate::pool::{PacketPool, Pkt};
-use crate::util::BarrierFlag;
 use crate::parser::SeqExtractor;
-use crate::spsc::SpscQueue;
-use std::sync::Arc;
-#[cfg(target_os = "linux")]
-use crate::pool::TsKind;
 #[cfg(target_os = "linux")]
 use crate::pool::PktBuf;
 #[cfg(target_os = "linux")]
+use crate::pool::TsKind;
+use crate::pool::{PacketPool, Pkt};
+use crate::spsc::SpscQueue;
+use crate::util::BarrierFlag;
+#[cfg(target_os = "linux")]
 use bytes::BufMut;
+use std::sync::Arc;
 
 /// Receive loop using a high-performance packet ring on Linux (TPACKET_V2 fallback if AF_XDP is unavailable).
 #[cfg(not(target_os = "linux"))]
@@ -48,8 +47,19 @@ pub fn afxdp_loop(
     use std::ptr::null_mut;
 
     // Open AF_PACKET raw socket (fallback path)
-    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32) };
-    if fd < 0 { return Err(anyhow::anyhow!("AF_PACKET socket failed: {}", std::io::Error::last_os_error())); }
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW,
+            (libc::ETH_P_ALL as u16).to_be() as i32,
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow::anyhow!(
+            "AF_PACKET socket failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 
     // Set TPACKET_V2
     const TPACKET_V2: libc::c_int = 1;
@@ -63,7 +73,12 @@ pub fn afxdp_loop(
             size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
-    if rc != 0 { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("PACKET_VERSION set failed")); }
+    if rc != 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow::anyhow!("PACKET_VERSION set failed"));
+    }
 
     // Ring parameters
     let frame_size: u32 = 2048; // typical MTU + headers; aligned
@@ -72,8 +87,18 @@ pub fn afxdp_loop(
     let frame_nr: u32 = (block_size / frame_size) * block_nr;
 
     #[repr(C)]
-    struct TpacketReq { tp_block_size: u32, tp_block_nr: u32, tp_frame_size: u32, tp_frame_nr: u32 }
-    let req = TpacketReq { tp_block_size: block_size, tp_block_nr: block_nr, tp_frame_size: frame_size, tp_frame_nr: frame_nr };
+    struct TpacketReq {
+        tp_block_size: u32,
+        tp_block_nr: u32,
+        tp_frame_size: u32,
+        tp_frame_nr: u32,
+    }
+    let req = TpacketReq {
+        tp_block_size: block_size,
+        tp_block_nr: block_nr,
+        tp_frame_size: frame_size,
+        tp_frame_nr: frame_nr,
+    };
     let rc = unsafe {
         libc::setsockopt(
             fd,
@@ -83,11 +108,24 @@ pub fn afxdp_loop(
             size_of::<TpacketReq>() as libc::socklen_t,
         )
     };
-    if rc != 0 { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("PACKET_RX_RING set failed: {}", std::io::Error::last_os_error())); }
+    if rc != 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow::anyhow!(
+            "PACKET_RX_RING set failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 
     // Bind to interface
     let if_index = unsafe { libc::if_nametoindex(CString::new(ifname).unwrap().as_ptr()) };
-    if if_index == 0 { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("if_nametoindex failed for {}", ifname)); }
+    if if_index == 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow::anyhow!("if_nametoindex failed for {}", ifname));
+    }
     let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     sll.sll_family = libc::AF_PACKET as u16;
     sll.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
@@ -99,7 +137,12 @@ pub fn afxdp_loop(
             size_of::<libc::sockaddr_ll>() as libc::socklen_t,
         )
     };
-    if rc != 0 { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("bind AF_PACKET failed")); }
+    if rc != 0 {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow::anyhow!("bind AF_PACKET failed"));
+    }
 
     // Enable PACKET_FANOUT to distribute frames across multiple sockets/threads
     // when spawning multiple workers. Use HASH policy for even distribution.
@@ -131,7 +174,12 @@ pub fn afxdp_loop(
             0,
         )
     };
-    if ring == libc::MAP_FAILED { unsafe { libc::close(fd); } return Err(anyhow::anyhow!("mmap RX_RING failed")); }
+    if ring == libc::MAP_FAILED {
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(anyhow::anyhow!("mmap RX_RING failed"));
+    }
 
     // Structures for TPACKET_V2 frames
     #[repr(C)]
@@ -185,7 +233,15 @@ pub fn afxdp_loop(
                     buf.advance_mut(nbytes);
                     let seqv = seq.extract_seq(&buf);
                     if let Some(sv) = seqv {
-                        let pkt = Pkt { buf: PktBuf::Bytes(buf), len: nbytes, seq: sv, ts_nanos, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                        let pkt = Pkt {
+                            buf: PktBuf::Bytes(buf),
+                            len: nbytes,
+                            seq: sv,
+                            ts_nanos,
+                            chan: chan_id,
+                            _ts_kind: TsKind::Sw,
+                            merge_emit_ns: 0,
+                        };
                         if let Err(_full) = q_out.push(pkt) {
                             dropped += 1;
                             metrics::inc_rx_drop(chan_name);
@@ -202,37 +258,54 @@ pub fn afxdp_loop(
         }
 
         // Release frame back to kernel
-        unsafe { (*hdr_ptr).tp_status = 0; }
+        unsafe {
+            (*hdr_ptr).tp_status = 0;
+        }
         frame_idx = (frame_idx + 1) % frame_nr;
     }
 
-    unsafe { libc::munmap(ring, ring_len); libc::close(fd); }
+    unsafe {
+        libc::munmap(ring, ring_len);
+        libc::close(fd);
+    }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 fn parse_udp_payload(frame: &[u8]) -> Option<&[u8]> {
-    if frame.len() < 14 { return None; }
+    if frame.len() < 14 {
+        return None;
+    }
     let mut off = 0usize;
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
     off += 14;
     let mut et = ethertype;
     if et == 0x8100 || et == 0x88A8 {
-        if frame.len() < off + 4 { return None; }
+        if frame.len() < off + 4 {
+            return None;
+        }
         et = u16::from_be_bytes([frame[off + 2], frame[off + 3]]);
         off += 4;
     }
-    if et != 0x0800 { return None; } // IPv4
-    if frame.len() < off + 20 { return None; }
+    if et != 0x0800 {
+        return None;
+    } // IPv4
+    if frame.len() < off + 20 {
+        return None;
+    }
     let ihl = (frame[off] & 0x0F) as usize * 4;
-    if frame.len() < off + ihl + 8 { return None; }
+    if frame.len() < off + ihl + 8 {
+        return None;
+    }
     let proto = frame[off + 9];
-    if proto != 17 { return None; } // UDP
+    if proto != 17 {
+        return None;
+    } // UDP
     off += ihl;
     // UDP header 8 bytes
     off += 8;
-    if frame.len() < off { return None; }
+    if frame.len() < off {
+        return None;
+    }
     Some(&frame[off..])
 }
-
-

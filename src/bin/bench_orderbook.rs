@@ -9,14 +9,32 @@ mod parser {
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum Side { Bid, Ask }
+    pub enum Side {
+        Bid,
+        Ask,
+    }
 
     #[derive(Debug, Clone)]
     pub enum Event {
-        Add { order_id: u64, instr: u32, px: i64, qty: i64, side: Side },
-        Mod { order_id: u64, qty: i64 },
-        Del { order_id: u64 },
-        Trade { instr: u32, qty: i64, maker_order_id: Option<u64> },
+        Add {
+            order_id: u64,
+            instr: u32,
+            px: i64,
+            qty: i64,
+            side: Side,
+        },
+        Mod {
+            order_id: u64,
+            qty: i64,
+        },
+        Del {
+            order_id: u64,
+        },
+        Trade {
+            instr: u32,
+            qty: i64,
+            maker_order_id: Option<u64>,
+        },
         Heartbeat,
     }
 }
@@ -25,7 +43,9 @@ use crate::orderbook::OrderBook;
 use crate::parser::{Event, Side};
 
 fn parse_arg_usize(args: &[String], idx: usize, default: usize) -> usize {
-    args.get(idx).and_then(|s| s.parse::<usize>().ok()).unwrap_or(default)
+    args.get(idx)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 fn main() {
@@ -49,10 +69,23 @@ fn main() {
             let price = 1_000_000i64 + ((i % 200) as i64);
             let qty = 100 + ((i % 50) as i64);
             let side = if (i & 1) == 0 { Side::Bid } else { Side::Ask };
-            buf.push(Event::Add { order_id: oid, instr, px: price, qty, side });
-            if buf.len() == batch_size { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); buf.clear(); }
+            buf.push(Event::Add {
+                order_id: oid,
+                instr,
+                px: price,
+                qty,
+                side,
+            });
+            if buf.len() == batch_size {
+                book.apply_many_for_instr(instr, &buf);
+                total_events += buf.len();
+                buf.clear();
+            }
         }
-        if !buf.is_empty() { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); }
+        if !buf.is_empty() {
+            book.apply_many_for_instr(instr, &buf);
+            total_events += buf.len();
+        }
     }
     let adds_dur = t0.elapsed();
 
@@ -64,15 +97,28 @@ fn main() {
         let mods = orders_per_instr / 2;
         for _ in 0..mods {
             // xorshift64* to pick an order index uniformly
-            x ^= x >> 12; x ^= x << 25; x ^= x >> 27; x = x.wrapping_mul(0x2545F4914F6CDD1D);
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            x = x.wrapping_mul(0x2545F4914F6CDD1D);
             let i = (x as usize) % orders_per_instr;
             let oid: u64 = ((instr as u64) << 32) | (i as u64);
             // New qty in [1, 200]
-            let new_qty = 1 + (((x as i64) & 0x7F)) + 72;
-            buf.push(Event::Mod { order_id: oid, qty: new_qty });
-            if buf.len() == batch_size { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); buf.clear(); }
+            let new_qty = 1 + ((x as i64) & 0x7F) + 72;
+            buf.push(Event::Mod {
+                order_id: oid,
+                qty: new_qty,
+            });
+            if buf.len() == batch_size {
+                book.apply_many_for_instr(instr, &buf);
+                total_events += buf.len();
+                buf.clear();
+            }
         }
-        if !buf.is_empty() { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); }
+        if !buf.is_empty() {
+            book.apply_many_for_instr(instr, &buf);
+            total_events += buf.len();
+        }
     }
     let mods_dur = t1.elapsed();
 
@@ -83,9 +129,16 @@ fn main() {
         for i in (0..orders_per_instr).step_by(3) {
             let oid: u64 = ((instr as u64) << 32) | (i as u64);
             buf.push(Event::Del { order_id: oid });
-            if buf.len() == batch_size { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); buf.clear(); }
+            if buf.len() == batch_size {
+                book.apply_many_for_instr(instr, &buf);
+                total_events += buf.len();
+                buf.clear();
+            }
         }
-        if !buf.is_empty() { book.apply_many_for_instr(instr, &buf); total_events += buf.len(); }
+        if !buf.is_empty() {
+            book.apply_many_for_instr(instr, &buf);
+            total_events += buf.len();
+        }
     }
     let dels_dur = t2.elapsed();
 
@@ -95,7 +148,11 @@ fn main() {
     // Exercise rarely-used variants once to ensure full enum coverage in this bench
     // without impacting the measured hot path.
     book.apply(&Event::Heartbeat);
-    let _ = book.apply(&Event::Trade { instr: 0, qty: 1, maker_order_id: None });
+    let _ = book.apply(&Event::Trade {
+        instr: 0,
+        qty: 1,
+        maker_order_id: None,
+    });
 
     // Touch additional OrderBook APIs to avoid dead code in this bin
     book.set_consume_trades(false);
@@ -119,5 +176,3 @@ fn main() {
         (total_events as f64) / 1_000_000.0 / total_dur.as_secs_f64(),
     );
 }
-
-

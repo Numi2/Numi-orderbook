@@ -8,13 +8,17 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 type Handle = usize;
-type Bbo = (Option<(i64,i64)>, Option<(i64,i64)>);
-type Depth32 = SmallVec<[(i64,i64); 32]>;
+type Bbo = (Option<(i64, i64)>, Option<(i64, i64)>);
+type Depth32 = SmallVec<[(i64, i64); 32]>;
 
 #[inline(always)]
-fn to_nz(h: Handle) -> NonZeroUsize { NonZeroUsize::new(h + 1).unwrap() }
+fn to_nz(h: Handle) -> NonZeroUsize {
+    NonZeroUsize::new(h + 1).unwrap()
+}
 #[inline(always)]
-fn from_nz(nz: NonZeroUsize) -> Handle { nz.get() - 1 }
+fn from_nz(nz: NonZeroUsize) -> Handle {
+    nz.get() - 1
+}
 
 #[derive(Clone, Debug)]
 struct Node {
@@ -26,8 +30,15 @@ struct Node {
 }
 
 impl Node {
-    #[inline] fn new(price: i64, qty: i64, side: Side) -> Self {
-        Self { price, qty, side, prev: None, next: None }
+    #[inline]
+    fn new(price: i64, qty: i64, side: Side) -> Self {
+        Self {
+            price,
+            qty,
+            side,
+            prev: None,
+            next: None,
+        }
     }
 }
 
@@ -40,14 +51,20 @@ struct Level {
 }
 
 impl Level {
-    #[inline] fn is_empty(&self) -> bool { self.count == 0 }
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 
     // Methods operating purely on Level are kept minimal; order-node mutation is handled in InstrumentBook
 
     /// Iterate handles FIFO from head to tail
     #[allow(dead_code)] // Used in export
     fn iter_fifo<'a>(&self, orders: &'a Slab<Node>) -> LevelIter<'a> {
-        LevelIter { orders, cur: self.head }
+        LevelIter {
+            orders,
+            cur: self.head,
+        }
     }
 }
 
@@ -63,7 +80,9 @@ impl<'a> Iterator for LevelIter<'a> {
             let h = from_nz(nz);
             self.cur = self.orders[h].next;
             Some(h)
-        } else { None }
+        } else {
+            None
+        }
     }
 }
 
@@ -79,8 +98,15 @@ impl PriceGrid {
     #[inline]
     fn new(tick: i64, span: usize) -> Self {
         let mut v = Vec::with_capacity(span);
-        for _ in 0..span { v.push(None); }
-        Self { initialized: false, start_price: 0, tick, slots: v }
+        for _ in 0..span {
+            v.push(None);
+        }
+        Self {
+            initialized: false,
+            start_price: 0,
+            tick,
+            slots: v,
+        }
     }
 
     #[inline]
@@ -94,12 +120,22 @@ impl PriceGrid {
 
     #[inline]
     fn price_to_idx(&self, price: i64) -> Option<usize> {
-        if !self.initialized { return None; }
+        if !self.initialized {
+            return None;
+        }
         let d = price - self.start_price;
-        if d < 0 { return None; }
-        if d % self.tick != 0 { return None; }
+        if d < 0 {
+            return None;
+        }
+        if d % self.tick != 0 {
+            return None;
+        }
         let idx = (d / self.tick) as usize;
-        if idx < self.slots.len() { Some(idx) } else { None }
+        if idx < self.slots.len() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -107,30 +143,48 @@ impl PriceGrid {
     fn get(&self, price: i64) -> Option<&Level> {
         if let Some(i) = self.price_to_idx(price) {
             self.slots[i].as_ref()
-        } else { None }
+        } else {
+            None
+        }
     }
 
     #[inline]
     fn get_mut(&mut self, price: i64) -> Option<&mut Level> {
         if let Some(i) = self.price_to_idx(price) {
             // Safety: exclusive borrow of self allows mutable ref
-            if self.slots[i].is_some() { self.slots[i].as_mut() } else { None }
-        } else { None }
+            if self.slots[i].is_some() {
+                self.slots[i].as_mut()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     #[inline]
     fn get_mut_or_create(&mut self, price: i64) -> Option<&mut Level> {
-        if !self.initialized { self.init_around(price); }
+        if !self.initialized {
+            self.init_around(price);
+        }
         if let Some(i) = self.price_to_idx(price) {
-            if self.slots[i].is_none() { self.slots[i] = Some(Level::default()); }
+            if self.slots[i].is_none() {
+                self.slots[i] = Some(Level::default());
+            }
             self.slots[i].as_mut()
-        } else { None }
+        } else {
+            None
+        }
     }
 
     #[inline]
     fn remove(&mut self, price: i64) -> bool {
         if let Some(i) = self.price_to_idx(price) {
-            if self.slots[i].as_ref().map(|l| l.is_empty()).unwrap_or(false) {
+            if self.slots[i]
+                .as_ref()
+                .map(|l| l.is_empty())
+                .unwrap_or(false)
+            {
                 self.slots[i] = None;
                 return true;
             }
@@ -182,13 +236,25 @@ struct InstrumentBook {
 
 impl InstrumentBook {
     #[cfg(test)]
-    fn new() -> Self { Self { bids_grid: PriceGrid::new(1, 16384), asks_grid: PriceGrid::new(1, 16384), bids_overflow: BTreeMap::new(), asks_overflow: BTreeMap::new(), orders: Slab::with_capacity(1<<20), best_bid: None, best_ask: None, best_bid_qty: 0, best_ask_qty: 0 } }
-
-    #[inline]
-    fn with_capacity(order_slab_capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
             bids_grid: PriceGrid::new(1, 16384),
             asks_grid: PriceGrid::new(1, 16384),
+            bids_overflow: BTreeMap::new(),
+            asks_overflow: BTreeMap::new(),
+            orders: Slab::with_capacity(1 << 20),
+            best_bid: None,
+            best_ask: None,
+            best_bid_qty: 0,
+            best_ask_qty: 0,
+        }
+    }
+
+    #[inline]
+    fn with_params(order_slab_capacity: usize, tick: i64, span: usize) -> Self {
+        Self {
+            bids_grid: PriceGrid::new(tick, span),
+            asks_grid: PriceGrid::new(tick, span),
             bids_overflow: BTreeMap::new(),
             asks_overflow: BTreeMap::new(),
             orders: Slab::with_capacity(order_slab_capacity),
@@ -201,27 +267,54 @@ impl InstrumentBook {
 
     #[inline]
     fn ensure_level_mut(&mut self, side: Side, price: i64) -> &mut Level {
-        match side {
-            Side::Bid => {
-                if let Some(l) = self.bids_grid.get_mut_or_create(price) { return l; }
-                self.bids_overflow.entry(price).or_default()
-            }
-            Side::Ask => {
-                if let Some(l) = self.asks_grid.get_mut_or_create(price) { return l; }
-                self.asks_overflow.entry(price).or_default()
-            }
+        let (grid, overflow) = match side {
+            Side::Bid => (&mut self.bids_grid, &mut self.bids_overflow),
+            Side::Ask => (&mut self.asks_grid, &mut self.asks_overflow),
+        };
+        Self::ensure_level_mut_in_grid(grid, overflow, price)
+    }
+
+    #[inline]
+    fn ensure_level_mut_in_grid<'a>(
+        grid: &'a mut PriceGrid,
+        overflow: &'a mut BTreeMap<i64, Level>,
+        price: i64,
+    ) -> &'a mut Level {
+        if grid.price_to_idx(price).is_some() {
+            return grid
+                .get_mut_or_create(price)
+                .expect("price_to_idx succeeded but slot missing");
         }
+
+        let tick = grid.tick;
+        if tick == 0 || price.rem_euclid(tick) != 0 {
+            return overflow.entry(price).or_default();
+        }
+
+        Self::recenter_grid(grid, overflow, price);
+
+        if grid.price_to_idx(price).is_some() {
+            return grid
+                .get_mut_or_create(price)
+                .expect("recentered grid should hold price");
+        }
+
+        overflow.entry(price).or_default()
     }
 
     #[inline]
     fn get_level_mut(&mut self, side: Side, price: i64) -> Option<&mut Level> {
         match side {
             Side::Bid => {
-                if let Some(l) = self.bids_grid.get_mut(price) { return Some(l); }
+                if let Some(l) = self.bids_grid.get_mut(price) {
+                    return Some(l);
+                }
                 self.bids_overflow.get_mut(&price)
             }
             Side::Ask => {
-                if let Some(l) = self.asks_grid.get_mut(price) { return Some(l); }
+                if let Some(l) = self.asks_grid.get_mut(price) {
+                    return Some(l);
+                }
                 self.asks_overflow.get_mut(&price)
             }
         }
@@ -232,11 +325,15 @@ impl InstrumentBook {
     fn get_level(&self, side: Side, price: i64) -> Option<&Level> {
         match side {
             Side::Bid => {
-                if let Some(l) = self.bids_grid.get(price) { return Some(l); }
+                if let Some(l) = self.bids_grid.get(price) {
+                    return Some(l);
+                }
                 self.bids_overflow.get(&price)
             }
             Side::Ask => {
-                if let Some(l) = self.asks_grid.get(price) { return Some(l); }
+                if let Some(l) = self.asks_grid.get(price) {
+                    return Some(l);
+                }
                 self.asks_overflow.get(&price)
             }
         }
@@ -246,16 +343,46 @@ impl InstrumentBook {
     fn remove_level_if_empty(&mut self, side: Side, price: i64) -> bool {
         match side {
             Side::Bid => {
-                if self.bids_grid.remove(price) { return true; }
-                if let Some(l) = self.bids_overflow.get(&price) { if l.is_empty() { self.bids_overflow.remove(&price); return true; } }
+                if self.bids_grid.remove(price) {
+                    return true;
+                }
+                if let Some(l) = self.bids_overflow.get(&price) {
+                    if l.is_empty() {
+                        self.bids_overflow.remove(&price);
+                        return true;
+                    }
+                }
                 false
             }
             Side::Ask => {
-                if self.asks_grid.remove(price) { return true; }
-                if let Some(l) = self.asks_overflow.get(&price) { if l.is_empty() { self.asks_overflow.remove(&price); return true; } }
+                if self.asks_grid.remove(price) {
+                    return true;
+                }
+                if let Some(l) = self.asks_overflow.get(&price) {
+                    if l.is_empty() {
+                        self.asks_overflow.remove(&price);
+                        return true;
+                    }
+                }
                 false
             }
         }
+    }
+
+    /// Recenters a grid around the given price and moves existing non-empty
+    /// grid levels into the overflow map to preserve state.
+    fn recenter_grid(grid: &mut PriceGrid, overflow: &mut BTreeMap<i64, Level>, around_price: i64) {
+        let start = grid.start_price;
+        let tick = grid.tick;
+        for i in 0..grid.slots.len() {
+            if let Some(lvl) = grid.slots[i].take() {
+                if !lvl.is_empty() {
+                    let p = start + (i as i64) * tick;
+                    overflow.entry(p).or_insert(lvl);
+                }
+            }
+        }
+        grid.init_around(around_price);
     }
 
     #[inline]
@@ -263,25 +390,57 @@ impl InstrumentBook {
         match side {
             Side::Bid => {
                 let grid_cand = self.bids_grid.best_bid_candidate();
-                let of_cand = self.bids_overflow.iter().next_back().map(|(p,l)| (*p, l.total_qty));
+                let of_cand = self
+                    .bids_overflow
+                    .iter()
+                    .next_back()
+                    .map(|(p, l)| (*p, l.total_qty));
                 let pick = match (grid_cand, of_cand) {
-                    (Some(g), Some(o)) => if g.0 >= o.0 { Some(g) } else { Some(o) },
+                    (Some(g), Some(o)) => {
+                        if g.0 >= o.0 {
+                            Some(g)
+                        } else {
+                            Some(o)
+                        }
+                    }
                     (Some(g), None) => Some(g),
                     (None, Some(o)) => Some(o),
                     (None, None) => None,
                 };
-                if let Some((p, q)) = pick { self.best_bid = Some(p); self.best_bid_qty = q; } else { self.best_bid = None; self.best_bid_qty = 0; }
+                if let Some((p, q)) = pick {
+                    self.best_bid = Some(p);
+                    self.best_bid_qty = q;
+                } else {
+                    self.best_bid = None;
+                    self.best_bid_qty = 0;
+                }
             }
             Side::Ask => {
                 let grid_cand = self.asks_grid.best_ask_candidate();
-                let of_cand = self.asks_overflow.iter().next().map(|(p,l)| (*p, l.total_qty));
+                let of_cand = self
+                    .asks_overflow
+                    .iter()
+                    .next()
+                    .map(|(p, l)| (*p, l.total_qty));
                 let pick = match (grid_cand, of_cand) {
-                    (Some(g), Some(o)) => if g.0 <= o.0 { Some(g) } else { Some(o) },
+                    (Some(g), Some(o)) => {
+                        if g.0 <= o.0 {
+                            Some(g)
+                        } else {
+                            Some(o)
+                        }
+                    }
                     (Some(g), None) => Some(g),
                     (None, Some(o)) => Some(o),
                     (None, None) => None,
                 };
-                if let Some((p, q)) = pick { self.best_ask = Some(p); self.best_ask_qty = q; } else { self.best_ask = None; self.best_ask_qty = 0; }
+                if let Some((p, q)) = pick {
+                    self.best_ask = Some(p);
+                    self.best_ask_qty = q;
+                } else {
+                    self.best_ask = None;
+                    self.best_ask_qty = 0;
+                }
             }
         }
     }
@@ -290,9 +449,14 @@ impl InstrumentBook {
     fn add(&mut self, price: i64, qty: i64, side: Side) -> Handle {
         let h = self.orders.insert(Node::new(price, qty, side));
         // Obtain previous tail without holding the level borrow across order mutations
-        let prev_tail: Option<NonZeroUsize> = { let lvl = self.ensure_level_mut(side, price); lvl.tail };
+        let prev_tail: Option<NonZeroUsize> = {
+            let lvl = self.ensure_level_mut(side, price);
+            lvl.tail
+        };
         let h_nz = to_nz(h);
-        if let Some(t) = prev_tail { self.orders[from_nz(t)].next = Some(h_nz); }
+        if let Some(t) = prev_tail {
+            self.orders[from_nz(t)].next = Some(h_nz);
+        }
         {
             let n = &mut self.orders[h];
             n.prev = prev_tail;
@@ -301,7 +465,9 @@ impl InstrumentBook {
         let new_total_opt: Option<i64>;
         {
             let lvl = self.ensure_level_mut(side, price);
-            if prev_tail.is_none() { lvl.head = Some(h_nz); }
+            if prev_tail.is_none() {
+                lvl.head = Some(h_nz);
+            }
             lvl.tail = Some(h_nz);
             lvl.count += 1;
             lvl.total_qty += qty;
@@ -341,11 +507,22 @@ impl InstrumentBook {
             n.qty = new_qty;
         }
         let mut new_total_opt: Option<i64> = None;
-        if let Some(lvl) = self.get_level_mut(side, price) { lvl.total_qty += new_qty - old_qty; new_total_opt = Some(lvl.total_qty); }
+        if let Some(lvl) = self.get_level_mut(side, price) {
+            lvl.total_qty += new_qty - old_qty;
+            new_total_opt = Some(lvl.total_qty);
+        }
         if let Some(new_total) = new_total_opt {
             match side {
-                Side::Bid => if self.best_bid == Some(price) { self.best_bid_qty = new_total; },
-                Side::Ask => if self.best_ask == Some(price) { self.best_ask_qty = new_total; },
+                Side::Bid => {
+                    if self.best_bid == Some(price) {
+                        self.best_bid_qty = new_total;
+                    }
+                }
+                Side::Ask => {
+                    if self.best_ask == Some(price) {
+                        self.best_ask_qty = new_total;
+                    }
+                }
             }
         }
     }
@@ -356,27 +533,50 @@ impl InstrumentBook {
             let n = &self.orders[h];
             (n.price, n.side, n.prev, n.next, n.qty)
         };
-        if let Some(p) = prev { self.orders[from_nz(p)].next = next; }
-        if let Some(nh) = next { self.orders[from_nz(nh)].prev = prev; }
+        if let Some(p) = prev {
+            self.orders[from_nz(p)].next = next;
+        }
+        if let Some(nh) = next {
+            self.orders[from_nz(nh)].prev = prev;
+        }
         let mut remove_level = false;
-        let is_best = match side { Side::Bid => self.best_bid == Some(price), Side::Ask => self.best_ask == Some(price) };
+        let is_best = match side {
+            Side::Bid => self.best_bid == Some(price),
+            Side::Ask => self.best_ask == Some(price),
+        };
         let mut new_best_qty: Option<i64> = None;
         if let Some(lvl) = self.get_level_mut(side, price) {
-            if prev.is_none() { lvl.head = next; }
-            if next.is_none() { lvl.tail = prev; }
+            if prev.is_none() {
+                lvl.head = next;
+            }
+            if next.is_none() {
+                lvl.tail = prev;
+            }
             lvl.count = lvl.count.saturating_sub(1);
             lvl.total_qty -= qty;
             remove_level = lvl.is_empty();
-            if is_best && !remove_level { new_best_qty = Some(lvl.total_qty); }
+            if is_best && !remove_level {
+                new_best_qty = Some(lvl.total_qty);
+            }
         }
         {
             if remove_level {
                 let _removed = self.remove_level_if_empty(side, price);
-                if is_best { self.recompute_best_after_removal(side); }
+                if is_best {
+                    self.recompute_best_after_removal(side);
+                }
             } else if let Some(q) = new_best_qty {
                 match side {
-                    Side::Bid => if is_best { self.best_bid_qty = q; },
-                    Side::Ask => if is_best { self.best_ask_qty = q; },
+                    Side::Bid => {
+                        if is_best {
+                            self.best_bid_qty = q;
+                        }
+                    }
+                    Side::Ask => {
+                        if is_best {
+                            self.best_ask_qty = q;
+                        }
+                    }
                 }
             }
         }
@@ -392,24 +592,48 @@ impl InstrumentBook {
 
     #[allow(dead_code)]
     fn top_n(&self, n: usize) -> (Depth32, Depth32) {
-        let mut bids = SmallVec::<[(i64,i64); 32]>::new();
-        let mut asks = SmallVec::<[(i64,i64); 32]>::new();
+        let mut bids = SmallVec::<[(i64, i64); 32]>::new();
+        let mut asks = SmallVec::<[(i64, i64); 32]>::new();
         // Bids: grid high->low, then overflow high->low
         for i in (0..self.bids_grid.slots.len()).rev() {
-            if let Some(l) = &self.bids_grid.slots[i] { if !l.is_empty() {
-                let p = self.bids_grid.start_price + (i as i64)*self.bids_grid.tick;
-                bids.push((p, l.total_qty)); if bids.len() >= n { break; }
-            }}
+            if let Some(l) = &self.bids_grid.slots[i] {
+                if !l.is_empty() {
+                    let p = self.bids_grid.start_price + (i as i64) * self.bids_grid.tick;
+                    bids.push((p, l.total_qty));
+                    if bids.len() >= n {
+                        break;
+                    }
+                }
+            }
         }
-        if bids.len() < n { for (p,l) in self.bids_overflow.iter().rev() { bids.push((*p, l.total_qty)); if bids.len() >= n { break; } } }
+        if bids.len() < n {
+            for (p, l) in self.bids_overflow.iter().rev() {
+                bids.push((*p, l.total_qty));
+                if bids.len() >= n {
+                    break;
+                }
+            }
+        }
         // Asks: grid low->high, then overflow low->high
         for i in 0..self.asks_grid.slots.len() {
-            if let Some(l) = &self.asks_grid.slots[i] { if !l.is_empty() {
-                let p = self.asks_grid.start_price + (i as i64)*self.asks_grid.tick;
-                asks.push((p, l.total_qty)); if asks.len() >= n { break; }
-            }}
+            if let Some(l) = &self.asks_grid.slots[i] {
+                if !l.is_empty() {
+                    let p = self.asks_grid.start_price + (i as i64) * self.asks_grid.tick;
+                    asks.push((p, l.total_qty));
+                    if asks.len() >= n {
+                        break;
+                    }
+                }
+            }
         }
-        if asks.len() < n { for (p,l) in self.asks_overflow.iter() { asks.push((*p, l.total_qty)); if asks.len() >= n { break; } } }
+        if asks.len() < n {
+            for (p, l) in self.asks_overflow.iter() {
+                asks.push((*p, l.total_qty));
+                if asks.len() >= n {
+                    break;
+                }
+            }
+        }
         (bids, asks)
     }
 }
@@ -421,6 +645,8 @@ pub struct OrderBook {
     last_instr: Option<u32>,
     consume_trades: bool,
     default_slab_capacity: usize,
+    grid_tick: i64,
+    grid_span: usize,
 }
 
 impl OrderBook {
@@ -431,7 +657,9 @@ impl OrderBook {
             index: HashMap::new(),
             last_instr: None,
             consume_trades: false,
-            default_slab_capacity: 1<<20,
+            default_slab_capacity: 1 << 20,
+            grid_tick: 1,
+            grid_span: 16384,
         }
     }
 
@@ -443,12 +671,18 @@ impl OrderBook {
             index: HashMap::new(),
             last_instr: None,
             consume_trades,
-            default_slab_capacity: 1<<20,
+            default_slab_capacity: 1 << 20,
+            grid_tick: 1,
+            grid_span: 16384,
         }
     }
 
     #[allow(dead_code)]
-    pub fn new_with_options_and_capacity(depth_for_reporting: usize, consume_trades: bool, default_slab_capacity: usize) -> Self {
+    pub fn new_with_options_and_capacity(
+        depth_for_reporting: usize,
+        consume_trades: bool,
+        default_slab_capacity: usize,
+    ) -> Self {
         Self {
             _depth_for_reporting: depth_for_reporting,
             books: HashMap::new(),
@@ -456,6 +690,28 @@ impl OrderBook {
             last_instr: None,
             consume_trades,
             default_slab_capacity,
+            grid_tick: 1,
+            grid_span: 16384,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn new_with_grid(
+        depth_for_reporting: usize,
+        consume_trades: bool,
+        default_slab_capacity: usize,
+        grid_tick: i64,
+        grid_span: usize,
+    ) -> Self {
+        Self {
+            _depth_for_reporting: depth_for_reporting,
+            books: HashMap::new(),
+            index: HashMap::new(),
+            last_instr: None,
+            consume_trades,
+            default_slab_capacity,
+            grid_tick,
+            grid_span,
         }
     }
 
@@ -465,13 +721,24 @@ impl OrderBook {
 
     #[inline]
     fn book_mut(&mut self, instr: u32) -> &mut InstrumentBook {
-        self.books.entry(instr).or_insert_with(|| InstrumentBook::with_capacity(self.default_slab_capacity))
+        let tick = self.grid_tick;
+        let span = self.grid_span;
+        let cap = self.default_slab_capacity;
+        self.books
+            .entry(instr)
+            .or_insert_with(|| InstrumentBook::with_params(cap, tick, span))
     }
 
     #[inline]
     pub fn apply(&mut self, ev: &Event) {
         match *ev {
-            Event::Add { order_id, instr, px, qty, side } => {
+            Event::Add {
+                order_id,
+                instr,
+                px,
+                qty,
+                side,
+            } => {
                 let book = self.book_mut(instr);
                 let h = book.add(px, qty, side);
                 self.index.insert(order_id, (instr, h));
@@ -496,7 +763,12 @@ impl OrderBook {
                     self.last_instr = Some(instr);
                 }
             }
-            Event::Trade { instr, qty, maker_order_id, .. } => {
+            Event::Trade {
+                instr,
+                qty,
+                maker_order_id,
+                ..
+            } => {
                 self.last_instr = Some(instr);
                 if self.consume_trades {
                     if let Some(oid) = maker_order_id {
@@ -527,16 +799,31 @@ impl OrderBook {
         let consume_trades = self.consume_trades;
         for e in events {
             match *e {
-                Event::Add { order_id, instr: ev_instr, px, qty, side } if ev_instr == instr => {
-                    let h = { let b = self.book_mut(instr); b.add(px, qty, side) };
+                Event::Add {
+                    order_id,
+                    instr: ev_instr,
+                    px,
+                    qty,
+                    side,
+                } if ev_instr == instr => {
+                    let h = {
+                        let b = self.book_mut(instr);
+                        b.add(px, qty, side)
+                    };
                     self.index.insert(order_id, (instr, h));
                     self.last_instr = Some(instr);
                 }
                 Event::Mod { order_id, qty } => {
                     if let Some((mi, h)) = self.index.get(&order_id).copied() {
                         if mi == instr {
-                            if qty > 0 { let b = self.book_mut(instr); b.set_qty(h, qty); }
-                            else { let b = self.book_mut(instr); b.cancel(h); self.index.remove(&order_id); }
+                            if qty > 0 {
+                                let b = self.book_mut(instr);
+                                b.set_qty(h, qty);
+                            } else {
+                                let b = self.book_mut(instr);
+                                b.cancel(h);
+                                self.index.remove(&order_id);
+                            }
                             self.last_instr = Some(instr);
                         } else {
                             self.apply(e);
@@ -555,18 +842,32 @@ impl OrderBook {
                         }
                     }
                 }
-                Event::Trade { instr: ev_instr, qty, maker_order_id, .. } if ev_instr == instr => {
+                Event::Trade {
+                    instr: ev_instr,
+                    qty,
+                    maker_order_id,
+                    ..
+                } if ev_instr == instr => {
                     self.last_instr = Some(instr);
                     if consume_trades {
                         if let Some(oid) = maker_order_id {
                             if let Some((mi, h)) = self.index.get(&oid).copied() {
                                 if mi == instr {
                                     let new_qty = {
-                                        let qty0 = { let b = self.book_mut(instr); b.orders[h].qty };
+                                        let qty0 = {
+                                            let b = self.book_mut(instr);
+                                            b.orders[h].qty
+                                        };
                                         (qty0 - qty).max(0)
                                     };
-                                    if new_qty > 0 { let b = self.book_mut(instr); b.set_qty(h, new_qty); }
-                                    else { let b = self.book_mut(instr); b.cancel(h); self.index.remove(&oid); }
+                                    if new_qty > 0 {
+                                        let b = self.book_mut(instr);
+                                        b.set_qty(h, new_qty);
+                                    } else {
+                                        let b = self.book_mut(instr);
+                                        b.cancel(h);
+                                        self.index.remove(&oid);
+                                    }
                                 } else {
                                     self.apply(e);
                                 }
@@ -575,7 +876,9 @@ impl OrderBook {
                     }
                 }
                 Event::Heartbeat => {}
-                _ => { self.apply(e); }
+                _ => {
+                    self.apply(e);
+                }
             }
         }
     }
@@ -594,7 +897,9 @@ impl OrderBook {
         self.books.get(&instr).map(|b| b.top_n(n))
     }
 
-    pub fn order_count(&self) -> usize { self.index.len() }
+    pub fn order_count(&self) -> usize {
+        self.index.len()
+    }
 
     #[inline]
     pub fn instrument_for_order(&self, order_id: u64) -> Option<u32> {
@@ -607,7 +912,8 @@ impl OrderBook {
         let mut instruments = Vec::with_capacity(self.books.len());
         // Build a fast reverse map from (instr, handle) -> order_id for snapshot assembly.
         // This preserves FIFO per price level while avoiding storing order_id in Node.
-        let mut handle_to_id: HashMap<(u32, Handle), u64> = HashMap::with_capacity(self.index.len());
+        let mut handle_to_id: HashMap<(u32, Handle), u64> =
+            HashMap::with_capacity(self.index.len());
         for (oid, (ins, h)) in self.index.iter() {
             handle_to_id.insert((*ins, *h), *oid);
         }
@@ -617,11 +923,16 @@ impl OrderBook {
             for i in (0..book.bids_grid.slots.len()).rev() {
                 if let Some(lvl) = &book.bids_grid.slots[i] {
                     if !lvl.is_empty() {
-                        let price = book.bids_grid.start_price + (i as i64)*book.bids_grid.tick;
+                        let price = book.bids_grid.start_price + (i as i64) * book.bids_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
                             if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                                orders.push(OrderExport { order_id: oid, price, qty: n.qty, side: Side::Bid });
+                                orders.push(OrderExport {
+                                    order_id: oid,
+                                    price,
+                                    qty: n.qty,
+                                    side: Side::Bid,
+                                });
                             }
                         }
                     }
@@ -631,7 +942,12 @@ impl OrderBook {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
                     if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                        orders.push(OrderExport { order_id: oid, price: *price, qty: n.qty, side: Side::Bid });
+                        orders.push(OrderExport {
+                            order_id: oid,
+                            price: *price,
+                            qty: n.qty,
+                            side: Side::Bid,
+                        });
                     }
                 }
             }
@@ -639,11 +955,16 @@ impl OrderBook {
             for i in 0..book.asks_grid.slots.len() {
                 if let Some(lvl) = &book.asks_grid.slots[i] {
                     if !lvl.is_empty() {
-                        let price = book.asks_grid.start_price + (i as i64)*book.asks_grid.tick;
+                        let price = book.asks_grid.start_price + (i as i64) * book.asks_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
                             if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                                orders.push(OrderExport { order_id: oid, price, qty: n.qty, side: Side::Ask });
+                                orders.push(OrderExport {
+                                    order_id: oid,
+                                    price,
+                                    qty: n.qty,
+                                    side: Side::Ask,
+                                });
                             }
                         }
                     }
@@ -653,13 +974,24 @@ impl OrderBook {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
                     if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                        orders.push(OrderExport { order_id: oid, price: *price, qty: n.qty, side: Side::Ask });
+                        orders.push(OrderExport {
+                            order_id: oid,
+                            price: *price,
+                            qty: n.qty,
+                            side: Side::Ask,
+                        });
                     }
                 }
             }
-            instruments.push(InstrumentExport { instr: *instr, orders });
+            instruments.push(InstrumentExport {
+                instr: *instr,
+                orders,
+            });
         }
-        BookExport { version: 1, instruments }
+        BookExport {
+            version: 1,
+            instruments,
+        }
     }
 
     pub fn from_export(exp: BookExport) -> Self {
@@ -673,6 +1005,24 @@ impl OrderBook {
             ob.last_instr = Some(ie.instr);
         }
         ob
+    }
+
+    /// Export aggregated depth snapshots (top N) per instrument (not per-order).
+    #[allow(dead_code)]
+    pub fn export_depth(&self, depth: usize) -> DepthSnapshotExport {
+        let mut instruments = Vec::with_capacity(self.books.len());
+        for (instr, book) in self.books.iter() {
+            let (bids, asks) = book.top_n(depth);
+            instruments.push(InstrumentDepthExport {
+                instr: *instr,
+                bids: bids.into_iter().collect(),
+                asks: asks.into_iter().collect(),
+            });
+        }
+        DepthSnapshotExport {
+            version: 1,
+            instruments,
+        }
     }
 }
 
@@ -729,4 +1079,17 @@ pub struct OrderExport {
     pub price: i64,
     pub qty: i64,
     pub side: Side,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepthSnapshotExport {
+    pub version: u32,
+    pub instruments: Vec<InstrumentDepthExport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstrumentDepthExport {
+    pub instr: u32,
+    pub bids: Vec<(i64, i64)>,
+    pub asks: Vec<(i64, i64)>,
 }

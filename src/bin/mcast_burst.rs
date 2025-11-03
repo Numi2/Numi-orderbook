@@ -4,7 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 7 {
-        eprintln!("usage: mcast_burst <group> <port> <iface_ipv4> <payload_size> <packets> <rate_pps>");
+        eprintln!(
+            "usage: mcast_burst <group> <port> <iface_ipv4> <payload_size> <packets> <rate_pps>"
+        );
         std::process::exit(2);
     }
     let group: Ipv4Addr = args[1].parse()?;
@@ -23,7 +25,11 @@ fn main() -> anyhow::Result<()> {
 
     let dest = SocketAddr::new(IpAddr::V4(group), port);
     let mut buf = vec![0u8; payload_size];
-    let nanos_per_pkt = if rate_pps == 0 { 0 } else { 1_000_000_000u64 / rate_pps };
+    let nanos_per_pkt = if rate_pps == 0 {
+        0
+    } else {
+        1_000_000_000u64 / rate_pps
+    };
     let start = std::time::Instant::now();
     for i in 0..packets {
         // simple incrementing sequence at start of payload (big-endian u64)
@@ -43,9 +49,9 @@ fn main() -> anyhow::Result<()> {
 fn busy_sleep_nanos(ns: u64) {
     let start = std::time::Instant::now();
     loop {
-        if start.elapsed().as_nanos() as u64 >= ns { break; }
+        if start.elapsed().as_nanos() as u64 >= ns {
+            break;
+        }
         std::hint::spin_loop();
     }
 }
-
-

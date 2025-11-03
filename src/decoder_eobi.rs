@@ -1,9 +1,7 @@
-
 // Numan - decoder_eobi.rs: EOBI/SBE-like (Eurex/Deutsche Börse style); little-endian SBE header [block_len, template_id, schema, version]; templates; stateless.
 //  maps venue messages
 // to the engine's Event model. This is not a full Eurex spec, but follows
 // SBE framing and common order-flow templates. Hot-path does zero heap allocs.
-
 
 //
 use crate::parser::{Event, MessageDecoder, Side};
@@ -12,7 +10,9 @@ use crate::parser::{Event, MessageDecoder, Side};
 pub struct EobiSbeDecoder;
 
 impl EobiSbeDecoder {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl MessageDecoder for EobiSbeDecoder {
@@ -20,12 +20,18 @@ impl MessageDecoder for EobiSbeDecoder {
     fn decode_messages(&self, payload: &[u8], out: &mut Vec<Event>) {
         let mut off = 0usize;
         while off + 8 <= payload.len() {
-            let block_len = le_u16(&payload[off..off + 2]) as usize; off += 2;
-            let template_id = le_u16(&payload[off..off + 2]); off += 2;
-            let _schema_id  = le_u16(&payload[off..off + 2]); off += 2;
-            let _version    = le_u16(&payload[off..off + 2]); off += 2;
+            let block_len = le_u16(&payload[off..off + 2]) as usize;
+            off += 2;
+            let template_id = le_u16(&payload[off..off + 2]);
+            off += 2;
+            let _schema_id = le_u16(&payload[off..off + 2]);
+            off += 2;
+            let _version = le_u16(&payload[off..off + 2]);
+            off += 2;
 
-            if off + block_len > payload.len() { break; }
+            if off + block_len > payload.len() {
+                break;
+            }
             let body = &payload[off..off + block_len];
             off += block_len;
 
@@ -42,65 +48,111 @@ impl MessageDecoder for EobiSbeDecoder {
 
 #[inline]
 #[allow(dead_code)] // Used in decode_messages
-fn le_u16(b: &[u8]) -> u16 { u16::from_le_bytes([b[0], b[1]]) }
+fn le_u16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
 
-// Fast unaligned little-endian loads for hot path (caller must pre-check length)
+// Localized unsafe: checked unaligned loads that return None on OOB
 #[inline(always)]
-#[allow(dead_code)] // Used in decode_* functions
-unsafe fn read_le_u32_unchecked(b: &[u8], off: usize) -> u32 {
-    let p = b.as_ptr().add(off) as *const u32;
-    u32::from_le(p.read_unaligned())
+fn read_le_u32_checked(b: &[u8], off: usize) -> Option<u32> {
+    if off + 4 <= b.len() {
+        unsafe {
+            let p = b.as_ptr().add(off) as *const u32;
+            Some(u32::from_le(p.read_unaligned()))
+        }
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
-#[allow(dead_code)] // Used in decode_* functions
-unsafe fn read_le_u64_unchecked(b: &[u8], off: usize) -> u64 {
-    let p = b.as_ptr().add(off) as *const u64;
-    u64::from_le(p.read_unaligned())
+fn read_le_u64_checked(b: &[u8], off: usize) -> Option<u64> {
+    if off + 8 <= b.len() {
+        unsafe {
+            let p = b.as_ptr().add(off) as *const u64;
+            Some(u64::from_le(p.read_unaligned()))
+        }
+    } else {
+        None
+    }
 }
 
 #[inline(always)]
-#[allow(dead_code)] // Used in decode_* functions
-unsafe fn read_le_i64_unchecked(b: &[u8], off: usize) -> i64 {
-    let p = b.as_ptr().add(off) as *const i64;
-    i64::from_le(p.read_unaligned())
+fn read_le_i64_checked(b: &[u8], off: usize) -> Option<i64> {
+    if off + 8 <= b.len() {
+        unsafe {
+            let p = b.as_ptr().add(off) as *const i64;
+            Some(i64::from_le(p.read_unaligned()))
+        }
+    } else {
+        None
+    }
 }
 
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_add(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 8 + 4 + 1 + 8 + 8;
-    if body.len() < LEN { return; }
+    if body.len() < LEN {
+        return;
+    }
     // Fixed offsets
     // 0..8: order_id, 8..12: instr, 12: side, 13..21: px, 21..29: qty
-    unsafe {
-        let order_id = read_le_u64_unchecked(body, 0);
-        let instr    = read_le_u32_unchecked(body, 8);
-        let side     = if *body.get_unchecked(12) == 0 { Side::Bid } else { Side::Ask };
-        let px       = read_le_i64_unchecked(body, 13);
-        let qty      = read_le_i64_unchecked(body, 21);
-        out.push(Event::Add { order_id, instr, px, qty, side });
-    }
+    let order_id = match read_le_u64_checked(body, 0) {
+        Some(v) => v,
+        None => return,
+    };
+    let instr = match read_le_u32_checked(body, 8) {
+        Some(v) => v,
+        None => return,
+    };
+    let side = if body.get(12).copied().unwrap_or(0) == 0 {
+        Side::Bid
+    } else {
+        Side::Ask
+    };
+    let px = match read_le_i64_checked(body, 13) {
+        Some(v) => v,
+        None => return,
+    };
+    let qty = match read_le_i64_checked(body, 21) {
+        Some(v) => v,
+        None => return,
+    };
+    out.push(Event::Add {
+        order_id,
+        instr,
+        px,
+        qty,
+        side,
+    });
 }
 
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 8 + 8;
-    if body.len() < LEN { return; }
-    unsafe {
-        let order_id = read_le_u64_unchecked(body, 0);
-        let qty      = read_le_i64_unchecked(body, 8);
-        out.push(Event::Mod { order_id, qty });
+    if body.len() < LEN {
+        return;
     }
+    let order_id = match read_le_u64_checked(body, 0) {
+        Some(v) => v,
+        None => return,
+    };
+    let qty = match read_le_i64_checked(body, 8) {
+        Some(v) => v,
+        None => return,
+    };
+    out.push(Event::Mod { order_id, qty });
 }
 
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_del(body: &[u8], out: &mut Vec<Event>) {
-    if body.len() < 8 { return; }
-    unsafe {
-        let order_id = read_le_u64_unchecked(body, 0);
+    if body.len() < 8 {
+        return;
+    }
+    if let Some(order_id) = read_le_u64_checked(body, 0) {
         out.push(Event::Del { order_id });
     }
 }
@@ -109,21 +161,44 @@ fn decode_del(body: &[u8], out: &mut Vec<Event>) {
 #[allow(dead_code)] // Called from decode_messages
 fn decode_trade(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 4 + 8 + 8 + 8 + 1;
-    if body.len() < LEN { return; }
-    unsafe {
-        let instr = read_le_u32_unchecked(body, 0);
-        let px    = read_le_i64_unchecked(body, 4);
-        let qty   = read_le_i64_unchecked(body, 12);
-        let maker_order_id = read_le_u64_unchecked(body, 20);
-        let b = *body.get_unchecked(28);
-        let taker_side = match b { 0 => Some(Side::Bid), 1 => Some(Side::Ask), _ => None };
-        out.push(Event::Trade { instr, px, qty, maker_order_id: Some(maker_order_id), taker_side });
+    if body.len() < LEN {
+        return;
     }
+    let instr = match read_le_u32_checked(body, 0) {
+        Some(v) => v,
+        None => return,
+    };
+    let px = match read_le_i64_checked(body, 4) {
+        Some(v) => v,
+        None => return,
+    };
+    let qty = match read_le_i64_checked(body, 12) {
+        Some(v) => v,
+        None => return,
+    };
+    let maker_order_id = match read_le_u64_checked(body, 20) {
+        Some(v) => v,
+        None => return,
+    };
+    let b = body.get(28).copied().unwrap_or(2);
+    let taker_side = match b {
+        0 => Some(Side::Bid),
+        1 => Some(Side::Ask),
+        _ => None,
+    };
+    out.push(Event::Trade {
+        instr,
+        px,
+        qty,
+        maker_order_id: Some(maker_order_id),
+        taker_side,
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn hdr(block_len: u16, template: u16, schema: u16, version: u16) -> [u8; 8] {
         let mut h = [0u8; 8];
@@ -152,7 +227,13 @@ mod tests {
         let mut out = Vec::new();
         dec.decode_messages(&buf, &mut out);
         match out.as_slice() {
-            [Event::Add { order_id, instr, px, qty, side }] => {
+            [Event::Add {
+                order_id,
+                instr,
+                px,
+                qty,
+                side,
+            }] => {
                 assert_eq!(*order_id, 123);
                 assert_eq!(*instr, 42);
                 assert_eq!(*px, 1000);
@@ -190,10 +271,22 @@ mod tests {
         let dec = EobiSbeDecoder::new();
         let mut out = Vec::new();
         dec.decode_messages(&buf, &mut out);
-        assert!(matches!(out[0], Event::Mod { order_id: 123, qty: 5 }));
+        assert!(matches!(
+            out[0],
+            Event::Mod {
+                order_id: 123,
+                qty: 5
+            }
+        ));
         assert!(matches!(out[1], Event::Del { order_id: 123 }));
         match out[2] {
-            Event::Trade { instr, px, qty, maker_order_id, taker_side } => {
+            Event::Trade {
+                instr,
+                px,
+                qty,
+                maker_order_id,
+                taker_side,
+            } => {
                 assert_eq!(instr, 7);
                 assert_eq!(px, 111);
                 assert_eq!(qty, 2);
@@ -203,6 +296,15 @@ mod tests {
             _ => panic!("expected trade event"),
         }
     }
+
+    proptest! {
+        #[test]
+        fn decode_random_input_does_not_panic(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+            let dec = EobiSbeDecoder::new();
+            let mut out = Vec::new();
+            dec.decode_messages(&payload, &mut out);
+            // basic sanity: events len should be bounded by payload size in worst case
+            prop_assert!(out.len() <= payload.len());
+        }
+    }
 }
-
-

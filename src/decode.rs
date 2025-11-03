@@ -1,20 +1,20 @@
-// src/decode.rs Numan Thabit: 
+// src/decode.rs Numan Thabit:
+use crate::codec_raw::channel_id;
+use crate::codec_raw::msg_type;
 use crate::metrics;
+use crate::obo::{map_event_to_obo_parts, OboEventV1};
 use crate::orderbook::OrderBook;
 use crate::parser::Parser;
 use crate::pool::{PacketPool, Pkt};
-use crate::util::{now_nanos, BarrierFlag};
-use crate::obo::{map_event_to_obo_parts, OboEventV1};
-use crate::codec_raw::msg_type;
-use crate::codec_raw::channel_id;
 use crate::pubsub::Publisher as OboPublisher;
-use zerocopy::AsBytes;
 use crate::spsc::SpscQueue;
-use crossbeam_channel::Sender;
+use crate::util::{now_nanos, BarrierFlag};
 use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 use log::{info, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zerocopy::AsBytes;
 
 pub struct DecodeConfig {
     pub max_depth: usize,
@@ -34,7 +34,9 @@ pub fn decode_loop(
     shutdown: Arc<BarrierFlag>,
     cfg: DecodeConfig,
 ) -> anyhow::Result<()> {
-    let mut book = cfg.initial_book.unwrap_or_else(|| OrderBook::new(cfg.max_depth));
+    let mut book = cfg
+        .initial_book
+        .unwrap_or_else(|| OrderBook::new(cfg.max_depth));
     book.set_consume_trades(cfg.consume_trades);
     // Cache sizing to avoid per-packet re-evaluations
     let max_msgs = parser.max_messages_per_packet;
@@ -59,7 +61,12 @@ pub fn decode_loop(
             let cap_before = events.capacity();
             parser.decode_into(payload, &mut events);
             if events.capacity() > cap_before {
-                warn!("decode events vector reallocated: old_cap={} new_cap={} len={}", cap_before, events.capacity(), events.len());
+                warn!(
+                    "decode events vector reallocated: old_cap={} new_cap={} len={}",
+                    cap_before,
+                    events.capacity(),
+                    events.len()
+                );
             }
             processed_msgs += events.len() as u64;
             metrics::inc_decode_msgs(events.len() as u64);
@@ -67,8 +74,12 @@ pub fn decode_loop(
             // Stage latency (merge -> decode)
             if merge_emit_ns > 0 {
                 let now_ns = now_nanos();
-                if now_ns > merge_emit_ns { metrics::observe_stage_merge_to_decode_ns(now_ns - merge_emit_ns); }
-                if merge_emit_ns > ts_nanos { metrics::observe_stage_rx_to_merge_ns(merge_emit_ns - ts_nanos); }
+                if now_ns > merge_emit_ns {
+                    metrics::observe_stage_merge_to_decode_ns(now_ns - merge_emit_ns);
+                }
+                if merge_emit_ns > ts_nanos {
+                    metrics::observe_stage_rx_to_merge_ns(merge_emit_ns - ts_nanos);
+                }
             }
 
             for ev in &events {
@@ -77,10 +88,16 @@ pub fn decode_loop(
                     let (maybe_instr, maybe_obo) = map_event_to_obo_parts(ev);
                     if let Some(obo_ev) = maybe_obo {
                         // Determine instrument id for this event
-                        let instr_opt: Option<u32> = if let Some(i) = maybe_instr { Some(i) } else {
+                        let instr_opt: Option<u32> = if let Some(i) = maybe_instr {
+                            Some(i)
+                        } else {
                             match *ev {
-                                crate::parser::Event::Mod { order_id, .. } => book.instrument_for_order(order_id),
-                                crate::parser::Event::Del { order_id } => book.instrument_for_order(order_id),
+                                crate::parser::Event::Mod { order_id, .. } => {
+                                    book.instrument_for_order(order_id)
+                                }
+                                crate::parser::Event::Del { order_id } => {
+                                    book.instrument_for_order(order_id)
+                                }
                                 crate::parser::Event::Trade { instr, .. } => Some(instr),
                                 _ => None,
                             }
@@ -90,7 +107,9 @@ pub fn decode_loop(
                             OboEventV1::Add(p) => (msg_type::OBO_ADD, p.as_bytes().to_vec()),
                             OboEventV1::Modify(p) => (msg_type::OBO_MODIFY, p.as_bytes().to_vec()),
                             OboEventV1::Cancel(p) => (msg_type::OBO_CANCEL, p.as_bytes().to_vec()),
-                            OboEventV1::Execute(p) => (msg_type::OBO_EXECUTE, p.as_bytes().to_vec()),
+                            OboEventV1::Execute(p) => {
+                                (msg_type::OBO_EXECUTE, p.as_bytes().to_vec())
+                            }
                         };
                         let seq = pubh.next_seq_for_instrument(instr);
                         pubh.publish_raw(msg_ty, channel_id::OBO_L3, instr, seq, &payload_bytes);
@@ -111,7 +130,9 @@ pub fn decode_loop(
             let mut should_snapshot = last_snap.elapsed() >= snap_every;
             if !should_snapshot {
                 if let Some(ref rx) = cfg.snapshot_trigger_rx {
-                    if rx.try_recv().is_ok() { should_snapshot = true; }
+                    if rx.try_recv().is_ok() {
+                        should_snapshot = true;
+                    }
                 }
             }
             if should_snapshot {
@@ -126,7 +147,8 @@ pub fn decode_loop(
                     processed_pkts,
                     processed_msgs,
                     book.order_count(),
-                    bbo_bid, bbo_ask
+                    bbo_bid,
+                    bbo_ask
                 );
                 last_snap = Instant::now();
             }

@@ -14,5 +14,3 @@ mod mimalloc_global {
     #[global_allocator]
     static GLOBAL: MiMalloc = MiMalloc;
 }
-
-

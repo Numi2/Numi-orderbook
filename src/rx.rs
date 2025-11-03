@@ -2,22 +2,22 @@
 use crate::metrics;
 use crate::parser::SeqExtractor;
 use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
-use crate::util::{now_nanos};
-use anyhow::Context;
 use crate::spsc::SpscQueue;
-use log::debug;
-use nix::errno::Errno;
-use std::net::UdpSocket;
-use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use crate::util::now_nanos;
+use anyhow::Context;
 use bytes::BufMut;
 #[cfg(target_os = "linux")]
 use bytes::BytesMut;
+use log::debug;
+use nix::errno::Errno;
+use nix::libc;
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{recvmsg, MsgFlags, ControlMessageOwned};
+use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
-use nix::libc;
+use std::net::UdpSocket;
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 pub struct RxConfig {
     pub spin_loops_per_yield: u32,
@@ -35,7 +35,11 @@ pub fn rx_loop(
     shutdown: Arc<crate::util::BarrierFlag>,
     cfg: RxConfig,
 ) -> anyhow::Result<()> {
-    let RxConfig { spin_loops_per_yield, rx_batch, ts_mode } = cfg;
+    let RxConfig {
+        spin_loops_per_yield,
+        rx_batch,
+        ts_mode,
+    } = cfg;
     let fd = sock.as_raw_fd();
     let mut dropped: u64 = 0;
     let chan_id = if chan_name == "A" { b'A' } else { b'B' };
@@ -43,7 +47,10 @@ pub fn rx_loop(
     sock.set_nonblocking(true).context("set nonblocking")?;
 
     let batch = rx_batch.max(1);
-    let ts_off = ts_mode.as_ref().map(|m| matches!(m, crate::config::TimestampingMode::Off)).unwrap_or(true);
+    let ts_off = ts_mode
+        .as_ref()
+        .map(|m| matches!(m, crate::config::TimestampingMode::Off))
+        .unwrap_or(true);
     #[cfg(target_os = "linux")]
     let use_recvmmsg: bool = ts_off && batch > 1;
     #[cfg(not(target_os = "linux"))]
@@ -51,9 +58,22 @@ pub fn rx_loop(
 
     // Preallocate vectors for recvmmsg path to avoid per-iteration allocations
     #[cfg(target_os = "linux")]
-    let mut bufs: Vec<BytesMut> = if use_recvmmsg { (0..batch).map(|_| BytesMut::new()).collect() } else { Vec::new() };
+    let mut bufs: Vec<BytesMut> = if use_recvmmsg {
+        (0..batch).map(|_| BytesMut::new()).collect()
+    } else {
+        Vec::new()
+    };
     #[cfg(target_os = "linux")]
-    let mut iovecs: Vec<libc::iovec> = if use_recvmmsg { (0..batch).map(|_| libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }).collect() } else { Vec::new() };
+    let mut iovecs: Vec<libc::iovec> = if use_recvmmsg {
+        (0..batch)
+            .map(|_| libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     #[cfg(target_os = "linux")]
     let mut hdrs: Vec<libc::mmsghdr> = if use_recvmmsg {
         let mut v = Vec::with_capacity(batch);
@@ -66,22 +86,31 @@ pub fn rx_loop(
             mh.msg_control = std::ptr::null_mut();
             mh.msg_controllen = 0;
             mh.msg_flags = 0;
-            v.push(libc::mmsghdr { msg_hdr: mh, msg_len: 0 });
+            v.push(libc::mmsghdr {
+                msg_hdr: mh,
+                msg_len: 0,
+            });
         }
         v
-    } else { Vec::new() };
+    } else {
+        Vec::new()
+    };
 
     let queue_label: &'static str = if chan_name == "A" { "rx_a" } else { "rx_b" };
     let mut iter: u64 = 0;
     let mut idle_iters: u32 = 0;
     loop {
-        if shutdown.is_raised() { break; }
+        if shutdown.is_raised() {
+            break;
+        }
 
         let mut progressed = false;
 
         // Cache a single now_nanos() per loop when timestamping is off
         let mut loop_now_cache: Option<u64> = None;
-        if ts_off { loop_now_cache = Some(now_nanos()); }
+        if ts_off {
+            loop_now_cache = Some(now_nanos());
+        }
 
         if use_recvmmsg {
             #[cfg(target_os = "linux")]
@@ -108,7 +137,10 @@ pub fn rx_loop(
                     if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK || err == Errno::EINTR {
                         // no progress
                     } else {
-                        return Err(anyhow::anyhow!("recvmmsg error: {}", std::io::Error::from(err)));
+                        return Err(anyhow::anyhow!(
+                            "recvmmsg error: {}",
+                            std::io::Error::from(err)
+                        ));
                     }
                 } else if ret > 0 {
                     progressed = true;
@@ -120,7 +152,15 @@ pub fn rx_loop(
                         buf.advance_mut(n);
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf: PktBuf::Bytes(buf), len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: TsKind::Sw, merge_emit_ns: 0 };
+                            let pkt = Pkt {
+                                buf: PktBuf::Bytes(buf),
+                                len: n,
+                                seq: sv,
+                                ts_nanos: ts,
+                                chan: chan_id,
+                                _ts_kind: TsKind::Sw,
+                                merge_emit_ns: 0,
+                            };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);
@@ -137,7 +177,9 @@ pub fn rx_loop(
                     // Return unused buffers to pool
                     for j in count..batch {
                         let b = std::mem::take(&mut bufs[j]);
-                        if b.capacity() > 0 { pool.put(b); }
+                        if b.capacity() > 0 {
+                            pool.put(b);
+                        }
                     }
                 } else {
                     // ret == 0 unlikely for DONTWAIT but handle conservatively
@@ -146,7 +188,9 @@ pub fn rx_loop(
         } else {
             // Per-packet path (recv/recvmsg)
             for _ in 0..batch {
-                if shutdown.is_raised() { break; }
+                if shutdown.is_raised() {
+                    break;
+                }
                 let mut buf = pool.get();
                 let dst = unsafe {
                     let s = buf.chunk_mut();
@@ -165,13 +209,19 @@ pub fn rx_loop(
                                 for c in msg.cmsgs() {
                                     match c {
                                         ControlMessageOwned::ScmTimestampns(ts) => {
-                                            ts_nanos = (ts.tv_sec() as u64) * 1_000_000_000 + (ts.tv_nsec() as u64);
+                                            ts_nanos = (ts.tv_sec() as u64) * 1_000_000_000
+                                                + (ts.tv_nsec() as u64);
                                             kind = TsKind::Sw;
                                         }
                                         ControlMessageOwned::ScmTimestamping(tss) => {
-                                            let pick = tss.iter().rev().find(|t| t.tv_sec() != 0 || t.tv_nsec() != 0).copied();
+                                            let pick = tss
+                                                .iter()
+                                                .rev()
+                                                .find(|t| t.tv_sec() != 0 || t.tv_nsec() != 0)
+                                                .copied();
                                             if let Some(tv) = pick {
-                                                ts_nanos = (tv.tv_sec() as u64) * 1_000_000_000 + (tv.tv_nsec() as u64);
+                                                ts_nanos = (tv.tv_sec() as u64) * 1_000_000_000
+                                                    + (tv.tv_nsec() as u64);
                                                 kind = match ts_mode.as_ref() {
                                                     Some(crate::config::TimestampingMode::HardwareRaw) => TsKind::HwRaw,
                                                     Some(crate::config::TimestampingMode::Hardware) => TsKind::HwSys,
@@ -184,10 +234,24 @@ pub fn rx_loop(
                                 }
                                 if ts_nanos == 0 {
                                     // Fallback only if timestamp not present; cache once per loop
-                                    let fallback = if let Some(v) = loop_now_cache { v } else { let v = now_nanos(); loop_now_cache = Some(v); v };
-                                    if msg.bytes > 0 { Ok((msg.bytes, fallback, TsKind::Sw)) } else { Err(Errno::EAGAIN) }
+                                    let fallback = if let Some(v) = loop_now_cache {
+                                        v
+                                    } else {
+                                        let v = now_nanos();
+                                        loop_now_cache = Some(v);
+                                        v
+                                    };
+                                    if msg.bytes > 0 {
+                                        Ok((msg.bytes, fallback, TsKind::Sw))
+                                    } else {
+                                        Err(Errno::EAGAIN)
+                                    }
                                 } else {
-                                    if msg.bytes > 0 { Ok((msg.bytes, ts_nanos, kind)) } else { Err(Errno::EAGAIN) }
+                                    if msg.bytes > 0 {
+                                        Ok((msg.bytes, ts_nanos, kind))
+                                    } else {
+                                        Err(Errno::EAGAIN)
+                                    }
                                 }
                             }
                             Err(nix::Error::Sys(e)) => Err(e),
@@ -197,23 +261,51 @@ pub fn rx_loop(
                     #[cfg(not(target_os = "linux"))]
                     {
                         unsafe {
-                            let n = libc::recv(fd, dst.as_ptr() as *mut libc::c_void, dst.len(), libc::MSG_DONTWAIT);
-                            if n >= 0 { Ok((n as usize, now_nanos(), TsKind::Sw)) } else { Err(Errno::last()) }
+                            let n = libc::recv(
+                                fd,
+                                dst.as_ptr() as *mut libc::c_void,
+                                dst.len(),
+                                libc::MSG_DONTWAIT,
+                            );
+                            if n >= 0 {
+                                Ok((n as usize, now_nanos(), TsKind::Sw))
+                            } else {
+                                Err(Errno::last())
+                            }
                         }
                     }
                 } else {
                     unsafe {
-                        let n = libc::recv(fd, dst.as_ptr() as *mut libc::c_void, dst.len(), libc::MSG_DONTWAIT);
-                        if n >= 0 { Ok((n as usize, loop_now_cache.unwrap(), TsKind::Sw)) } else { Err(Errno::last()) }
+                        let n = libc::recv(
+                            fd,
+                            dst.as_ptr() as *mut libc::c_void,
+                            dst.len(),
+                            libc::MSG_DONTWAIT,
+                        );
+                        if n >= 0 {
+                            Ok((n as usize, loop_now_cache.unwrap(), TsKind::Sw))
+                        } else {
+                            Err(Errno::last())
+                        }
                     }
                 };
 
                 match res_len_ts {
                     Ok((n, ts, kind)) => {
-                        unsafe { buf.advance_mut(n); }
+                        unsafe {
+                            buf.advance_mut(n);
+                        }
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
-                            let pkt = Pkt { buf: PktBuf::Bytes(buf), len: n, seq: sv, ts_nanos: ts, chan: chan_id, _ts_kind: kind, merge_emit_ns: 0 };
+                            let pkt = Pkt {
+                                buf: PktBuf::Bytes(buf),
+                                len: n,
+                                seq: sv,
+                                ts_nanos: ts,
+                                chan: chan_id,
+                                _ts_kind: kind,
+                                merge_emit_ns: 0,
+                            };
                             if let Err(_full) = q_out.push(pkt) {
                                 dropped += 1;
                                 metrics::inc_rx_drop(chan_name);
@@ -229,20 +321,30 @@ pub fn rx_loop(
                         progressed = true;
                     }
                     Err(err) => {
-                        if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK || err == Errno::EINTR {
+                        if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK || err == Errno::EINTR
+                        {
                             break;
                         } else {
-                            return Err(anyhow::anyhow!("recv error: {}", std::io::Error::from(err)));
+                            return Err(anyhow::anyhow!(
+                                "recv error: {}",
+                                std::io::Error::from(err)
+                            ));
                         }
                     }
                 }
             }
         }
 
-        if !progressed { crate::util::adaptive_wait(&mut idle_iters, spin_loops_per_yield); } else { idle_iters = 0; }
+        if !progressed {
+            crate::util::adaptive_wait(&mut idle_iters, spin_loops_per_yield);
+        } else {
+            idle_iters = 0;
+        }
 
         iter = iter.wrapping_add(1);
-        if (iter & 0x3fff) == 0 { metrics::set_queue_len(queue_label, q_out.len()); }
+        if (iter & 0x3fff) == 0 {
+            metrics::set_queue_len(queue_label, q_out.len());
+        }
     }
 
     Ok(())

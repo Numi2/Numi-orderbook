@@ -4,14 +4,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct BarrierFlag(AtomicBool);
 
 impl Default for BarrierFlag {
-    fn default() -> Self { Self(AtomicBool::new(false)) }
+    fn default() -> Self {
+        Self(AtomicBool::new(false))
+    }
 }
 
 impl BarrierFlag {
     #[inline]
-    pub fn raise(&self) { self.0.store(true, Ordering::SeqCst); }
+    pub fn raise(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
     #[inline]
-    pub fn is_raised(&self) -> bool { self.0.load(Ordering::Relaxed) }
+    pub fn is_raised(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 #[inline]
@@ -66,7 +72,10 @@ pub fn lock_all_memory_if(cfg: bool) {
     #[cfg(target_os = "linux")]
     unsafe {
         // Best-effort raise RLIMIT_MEMLOCK
-        let mut lim = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
+        let mut lim = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
         let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
         let flags = libc::MCL_CURRENT | libc::MCL_FUTURE;
         let _ = libc::mlockall(flags);
@@ -78,12 +87,14 @@ pub fn set_realtime_priority_if(_priority: Option<i32>) {
     #[cfg(target_os = "linux")]
     if let Some(pri) = _priority {
         unsafe {
-            let param = libc::sched_param { sched_priority: pri as i32 };
+            let param = libc::sched_param {
+                sched_priority: pri as i32,
+            };
             let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
         }
     }
 }
- 
+
 // Adaptive idle: escalate from spin -> yield -> short sleep to reduce CPU when idle
 #[inline]
 pub fn adaptive_wait(idle_iters: &mut u32, base_spins: u32) {
@@ -103,25 +114,37 @@ pub fn adaptive_wait(idle_iters: &mut u32, base_spins: u32) {
 // -------- NUMA helpers (best-effort without extra deps) --------
 pub fn iface_numa_node(ifname: &str) -> Option<i32> {
     let path = format!("/sys/class/net/{}/device/numa_node", ifname);
-    std::fs::read_to_string(path).ok()?.trim().parse::<i32>().ok()
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
 }
 
 pub fn node_cpulist(node: i32) -> Option<String> {
     let path = format!("/sys/devices/system/node/node{}/cpulist", node);
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 pub fn cpulist_contains(cpulist: &str, cpu_id: usize) -> bool {
     // Parse cpulist format like "0-3,8,10-11"
     for part in cpulist.split(',') {
         let part = part.trim();
-        if part.is_empty() { continue; }
-        if let Some((a,b)) = part.split_once('-') {
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = part.split_once('-') {
             if let (Ok(lo), Ok(hi)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                if cpu_id >= lo && cpu_id <= hi { return true; }
+                if cpu_id >= lo && cpu_id <= hi {
+                    return true;
+                }
             }
         } else if let Ok(v) = part.parse::<usize>() {
-            if v == cpu_id { return true; }
+            if v == cpu_id {
+                return true;
+            }
         }
     }
     false

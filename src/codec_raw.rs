@@ -10,7 +10,7 @@ pub const VERSION_V1: u8 = 1;
 // Codec identifiers
 pub mod codec {
     pub const RAW_V1: u8 = 0; // 0 = raw structs (v1)
-    // Future: 1 = SBE
+                              // Future: 1 = SBE
 }
 
 // Channel identifiers
@@ -101,5 +101,3 @@ pub struct FullBookSnapshotHdrV1 {
     pub level_count: u32,
     pub total_orders: u32,
 }
-
-

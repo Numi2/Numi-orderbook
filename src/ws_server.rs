@@ -1,18 +1,18 @@
 use std::net::TcpListener;
-use std::thread;
+use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tungstenite::handshake::server::{Request, Response};
+use std::thread;
 use tungstenite::accept_hdr;
+use tungstenite::handshake::server::{Request, Response};
 use tungstenite::{Message, WebSocket};
-use std::net::TcpStream;
 use url::Url;
 
-use crate::pubsub::{Bus, Subscription, RecvError};
-use crate::codec_raw::{self, FrameHeaderV1, GapV1};
-use crate::codec_raw::msg_type;
 use crate::codec_raw::channel_id;
+use crate::codec_raw::msg_type;
+use crate::codec_raw::{self, FrameHeaderV1, GapV1};
 use crate::metrics;
+use crate::pubsub::{Bus, RecvError, Subscription};
 use zerocopy::AsBytes;
 
 fn parse_query(uri: &str) -> (Option<u64>, bool) {
@@ -21,8 +21,14 @@ fn parse_query(uri: &str) -> (Option<u64>, bool) {
         let mut snapshot = false;
         for (k, v) in url.query_pairs() {
             match &*k {
-                "from_seq" => { if let Ok(n) = v.parse::<u64>() { from_seq = Some(n); } },
-                "snapshot" => { snapshot = v == "1" || v == "true"; },
+                "from_seq" => {
+                    if let Ok(n) = v.parse::<u64>() {
+                        from_seq = Some(n);
+                    }
+                }
+                "snapshot" => {
+                    snapshot = v == "1" || v == "true";
+                }
                 _ => {}
             }
         }
@@ -31,22 +37,34 @@ fn parse_query(uri: &str) -> (Option<u64>, bool) {
     (None, false)
 }
 
-pub fn spawn_pair(bus: Bus, addr_a: String, addr_b: String, snapshot_path: Option<String>, auth_token: Option<String>) -> (thread::JoinHandle<()>, thread::JoinHandle<()>) {
+pub fn spawn_pair(
+    bus: Bus,
+    addr_a: String,
+    addr_b: String,
+    snapshot_path: Option<String>,
+    auth_token: Option<String>,
+) -> (thread::JoinHandle<()>, thread::JoinHandle<()>) {
     let b1 = bus.clone();
     let a1 = addr_a.clone();
     let snap1 = snapshot_path.clone();
     let tok1 = auth_token.clone();
-    let t1 = thread::Builder::new().name("ws-A".into()).spawn(move || {
-        run_ws_listener(&b1, &a1, snap1.as_deref(), tok1.as_deref());
-    }).expect("spawn ws A");
+    let t1 = thread::Builder::new()
+        .name("ws-A".into())
+        .spawn(move || {
+            run_ws_listener(&b1, &a1, snap1.as_deref(), tok1.as_deref());
+        })
+        .expect("spawn ws A");
 
     let b2 = bus;
     let a2 = addr_b.clone();
     let snap2 = snapshot_path;
     let tok2 = auth_token;
-    let t2 = thread::Builder::new().name("ws-B".into()).spawn(move || {
-        run_ws_listener(&b2, &a2, snap2.as_deref(), tok2.as_deref());
-    }).expect("spawn ws B");
+    let t2 = thread::Builder::new()
+        .name("ws-B".into())
+        .spawn(move || {
+            run_ws_listener(&b2, &a2, snap2.as_deref(), tok2.as_deref());
+        })
+        .expect("spawn ws B");
 
     (t1, t2)
 }
@@ -69,7 +87,12 @@ fn run_ws_listener(bus: &Bus, addr: &str, snapshot_path: Option<&str>, auth_toke
     }
 }
 
-fn handle_client(bus: Bus, stream: TcpStream, snapshot_path: Option<String>, auth_token: Option<String>) -> anyhow::Result<()> {
+fn handle_client(
+    bus: Bus,
+    stream: TcpStream,
+    snapshot_path: Option<String>,
+    auth_token: Option<String>,
+) -> anyhow::Result<()> {
     let req_uri = Arc::new(Mutex::new(String::new()));
     let auth_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let req_uri_clone = req_uri.clone();
@@ -86,7 +109,12 @@ fn handle_client(bus: Bus, stream: TcpStream, snapshot_path: Option<String>, aut
     let mut ws: WebSocket<TcpStream> = accept_hdr(stream, callback)?;
 
     if let Some(token) = auth_token {
-        let ok = auth_header.lock().unwrap().as_deref().map(|v| v == format!("Bearer {}", token)).unwrap_or(false);
+        let ok = auth_header
+            .lock()
+            .unwrap()
+            .as_deref()
+            .map(|v| v == format!("Bearer {}", token))
+            .unwrap_or(false);
         if !ok {
             let _ = ws.close(None);
             anyhow::bail!("unauthorized");
@@ -101,12 +129,25 @@ fn handle_client(bus: Bus, stream: TcpStream, snapshot_path: Option<String>, aut
                 // SNAPSHOT_START
                 send_control(&mut ws, msg_type::SNAPSHOT_START, &[])?;
                 for ie in export.instruments {
-                    let hdr = crate::codec_raw::FullBookSnapshotHdrV1 { level_count: 0, total_orders: ie.orders.len() as u32 };
+                    let hdr = crate::codec_raw::FullBookSnapshotHdrV1 {
+                        level_count: 0,
+                        total_orders: ie.orders.len() as u32,
+                    };
                     send_control(&mut ws, msg_type::SNAPSHOT_HDR, hdr.as_bytes())?;
                     for o in ie.orders {
-                        let side = match o.side { crate::parser::Side::Bid => 0, crate::parser::Side::Ask => 1 };
-                        let add = crate::codec_raw::OboAddV1 { order_id: o.order_id, price_e8: o.price, qty: o.qty as u64, side, flags: 0 };
-                        let frame = build_frame(msg_type::OBO_ADD, add.as_bytes(), ie.instr as u64, 0);
+                        let side = match o.side {
+                            crate::parser::Side::Bid => 0,
+                            crate::parser::Side::Ask => 1,
+                        };
+                        let add = crate::codec_raw::OboAddV1 {
+                            order_id: o.order_id,
+                            price_e8: o.price,
+                            qty: o.qty as u64,
+                            side,
+                            flags: 0,
+                        };
+                        let frame =
+                            build_frame(msg_type::OBO_ADD, add.as_bytes(), ie.instr as u64, 0);
                         ws.send(Message::Binary(frame))?;
                     }
                 }
@@ -117,7 +158,12 @@ fn handle_client(bus: Bus, stream: TcpStream, snapshot_path: Option<String>, aut
     }
 
     let mut sub: Subscription = bus.subscribe();
-    if let Some(g) = from_seq { sub.set_cursor(g); } else { sub.set_cursor_to_tail(); }
+    let mut frames_since_lag_sample: u32 = 0;
+    if let Some(g) = from_seq {
+        sub.set_cursor(g);
+    } else {
+        sub.set_cursor_to_tail();
+    }
 
     loop {
         match sub.recv_next_blocking() {
@@ -125,10 +171,17 @@ fn handle_client(bus: Bus, stream: TcpStream, snapshot_path: Option<String>, aut
                 metrics::inc_out_frames();
                 metrics::inc_out_bytes(bytes.len());
                 ws.send(Message::Binary(bytes.to_vec()))?;
+                frames_since_lag_sample = frames_since_lag_sample.wrapping_add(1);
+                if (frames_since_lag_sample & 0x1ff) == 0 {
+                    metrics::set_queue_len("pubsub_lag", sub.lag() as usize);
+                }
             }
             Err(RecvError::Gap { from, to }) => {
                 // send GAP control and terminate
-                let gap = GapV1 { from_inclusive: from, to_inclusive: to };
+                let gap = GapV1 {
+                    from_inclusive: from,
+                    to_inclusive: to,
+                };
                 send_control(&mut ws, msg_type::GAP, gap.as_bytes())?;
                 metrics::inc_dropped_clients();
                 let _ = ws.close(None);
@@ -162,5 +215,3 @@ fn build_frame(msg_ty: u16, payload: &[u8], instrument_id: u64, sequence: u64) -
     v.extend_from_slice(payload);
     v
 }
-
-
