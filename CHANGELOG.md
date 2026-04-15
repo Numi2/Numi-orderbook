@@ -26,6 +26,17 @@ This project loosely follows the Keep a Changelog format.
   resolution, and a reduced build context.
 - The README has been rewritten around scope, architecture, platform support,
   validation, configuration, operations, and repository layout.
+- Replaced the placeholder EOBI decoder with generated Deutsche Boerse T7 14.1
+  layout descriptors from the official XML representation. The decoder now uses
+  EOBI `BodyLen`/`TemplateID`/`MsgSeqNum` framing, PacketHeader sequence state,
+  Snapshot Order instrument context, venue state messages, Mass Delete, Same
+  Priority Modify, and Full/Partial Execution events.
+- Added a macOS local-performance UDP receive path that uses Darwin
+  `recvmsg_x` batching, `SO_TIMESTAMP_MONOTONIC`, and Mach absolute tick
+  conversion instead of pretending AF_XDP-style primitives exist on Darwin.
+- Added a shared UDP receive dispatcher and `rx_probe` loopback integrity probe
+  so the main binary, `ingest_min`, and local smoke tests exercise the correct
+  platform receive path.
 
 ### Fixed
 - RX queue-full drops recycle rejected packet buffers instead of leaking pooled
@@ -136,7 +147,7 @@ Snapshot and depth exports now traverse instruments in sorted order, and `OrderB
 The order book can now be constructed with a per-instrument tick table, and config exposes `book.default_tick`, `book.grid_span`, `book.order_slab_capacity`, and `book.instrument_ticks`.
 Framed journal records now capture packet sequence, per-packet event index, event payload, and optional post-event state hash; replay verification rebuilds an `OrderBook`, compares the final `state_hash()`, and flags non-monotonic sequence records. Config can enable append-only live journal writing from the decode thread, with flushing at snapshot cadence and on shutdown, and framed replay can stream from a reader without loading the full session into memory. Restart verification can now anchor a loaded snapshot to a recorded journal hash and replay only the continuation records.
 Venue reference-data tick tables can now be loaded from CSV via `book.instrument_ticks_path`, with aliases for common instrument-id and tick-size column names. Inline `book.instrument_ticks` entries are applied after file loading so operators can override individual instruments.
-The EOBI/SBE-style decoder now dispatches through static schema descriptors that define supported template ids, minimum block lengths, and expected schema/version. Wrong schema/version and undersized blocks are rejected before field decoding.
+The earlier EOBI/SBE-style decoder dispatched through static schema descriptors for supported synthetic templates. This has since been superseded by generated Deutsche Boerse T7 14.1 EOBI layout descriptors.
 
 ### AF_XDP Guardrail
 

@@ -335,7 +335,7 @@ pub fn rx_loop(
 }
 
 #[inline]
-fn stage_or_flush_rx_packet(
+pub(crate) fn stage_or_flush_rx_packet(
     chan_name: &str,
     q_out: &SpscQueue<Pkt>,
     pool: &PacketPool,
@@ -351,7 +351,7 @@ fn stage_or_flush_rx_packet(
 }
 
 #[inline]
-fn flush_rx_packet_batch(
+pub(crate) fn flush_rx_packet_batch(
     chan_name: &str,
     q_out: &SpscQueue<Pkt>,
     pool: &PacketPool,

@@ -155,7 +155,8 @@ pub fn decode_loop(
                 let instr_before_apply = if obo_publisher.is_some() {
                     match *ev {
                         crate::parser::Event::Mod { order_id, .. }
-                        | crate::parser::Event::Del { order_id } => {
+                        | crate::parser::Event::Del { order_id }
+                        | crate::parser::Event::Execute { order_id, .. } => {
                             book.instrument_for_order(order_id)
                         }
                         _ => None,
@@ -192,6 +193,8 @@ pub fn decode_loop(
                                     .or_else(|| book.instrument_for_order(order_id)),
                                 crate::parser::Event::Del { order_id } => instr_before_apply
                                     .or_else(|| book.instrument_for_order(order_id)),
+                                crate::parser::Event::MassDel { instr } => Some(instr),
+                                crate::parser::Event::Execute { instr, .. } => Some(instr),
                                 crate::parser::Event::Trade { instr, .. } => Some(instr),
                                 _ => None,
                             });

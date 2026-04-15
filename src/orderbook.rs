@@ -1375,6 +1375,18 @@ impl OrderBook {
     }
 
     #[inline]
+    fn remove_orders_for_instr(&mut self, instr: u32) {
+        if let Some(book) = self.books.remove(&instr) {
+            for order_id in book.order_index.keys() {
+                self.index.remove(order_id);
+            }
+        }
+        if self.last_instr == Some(instr) {
+            self.last_instr = None;
+        }
+    }
+
+    #[inline]
     fn add_order(&mut self, order_id: u64, instr: u32, px: i64, qty: i64, side: Side) {
         // Venue reconnects, replay, or synthetic tests can deliver a repeated
         // order id. Replace atomically from the public book's point of view so
@@ -1449,6 +1461,38 @@ impl OrderBook {
                     self.remove_order_by_id(order_id);
                 }
             }
+            Event::MassDel { instr } => {
+                self.remove_orders_for_instr(instr);
+            }
+            Event::Execute {
+                instr,
+                qty,
+                order_id,
+                full,
+                ..
+            } => {
+                self.last_instr = Some(instr);
+                let known = self
+                    .local_order_handle(instr, order_id)
+                    .map(|h| (instr, h))
+                    .or_else(|| self.index.get(&order_id).copied());
+                if let Some((mi, h)) = known {
+                    if full {
+                        self.cancel_known_order(mi, order_id, h);
+                    } else if let Some(current_qty) = self
+                        .books
+                        .get(&mi)
+                        .and_then(|book| book.orders.get(h).map(|node| node.qty))
+                    {
+                        let new_qty = (current_qty - qty).max(0);
+                        if new_qty > 0 {
+                            self.set_known_order_qty(mi, h, new_qty);
+                        } else {
+                            self.cancel_known_order(mi, order_id, h);
+                        }
+                    }
+                }
+            }
             Event::Trade {
                 instr,
                 qty,
@@ -1479,7 +1523,7 @@ impl OrderBook {
                     }
                 }
             }
-            Event::Heartbeat => {}
+            Event::State { .. } | Event::SequenceGap { .. } | Event::Heartbeat => {}
         }
     }
 
@@ -1524,6 +1568,14 @@ impl OrderBook {
                         self.apply(e);
                     }
                 }
+                Event::MassDel { instr: ev_instr } if ev_instr == instr => {
+                    self.remove_orders_for_instr(instr);
+                }
+                Event::Execute {
+                    instr: ev_instr, ..
+                } if ev_instr == instr => {
+                    self.apply(e);
+                }
                 Event::Trade {
                     instr: ev_instr,
                     qty,
@@ -1556,7 +1608,7 @@ impl OrderBook {
                         }
                     }
                 }
-                Event::Heartbeat => {}
+                Event::State { .. } | Event::SequenceGap { .. } | Event::Heartbeat => {}
                 _ => {
                     self.apply(e);
                 }

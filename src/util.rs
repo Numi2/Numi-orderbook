@@ -60,10 +60,52 @@ pub fn now_nanos() -> u64 {
             return (ts.tv_sec() as u64) * 1_000_000_000 + (ts.tv_nsec() as u64);
         }
     }
-    // Fallback portable monotonic
-    use std::time::Instant;
-    static START: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
-    START.elapsed().as_nanos() as u64
+    #[cfg(target_os = "macos")]
+    {
+        mach_absolute_to_nanos(mach_absolute_time_ticks())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Fallback portable monotonic
+        use std::time::Instant;
+        static START: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
+        START.elapsed().as_nanos() as u64
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn mach_absolute_time_ticks() -> u64 {
+    unsafe { mach_absolute_time() }
+}
+
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn mach_absolute_to_nanos(ticks: u64) -> u64 {
+    static TIMEBASE: once_cell::sync::Lazy<(u64, u64)> = once_cell::sync::Lazy::new(|| unsafe {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        let rc = mach_timebase_info(&mut info);
+        if rc != 0 || info.denom == 0 {
+            (1, 1)
+        } else {
+            (info.numer as u64, info.denom as u64)
+        }
+    });
+    let (numer, denom) = *TIMEBASE;
+    ((ticks as u128).saturating_mul(numer as u128) / denom as u128).min(u64::MAX as u128) as u64
 }
 
 #[inline]

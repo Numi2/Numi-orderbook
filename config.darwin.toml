@@ -1,0 +1,70 @@
+# macOS local-performance profile.
+# Uses the Darwin recvmsg_x UDP batch path and SO_TIMESTAMP_MONOTONIC software
+# receive timestamps. Linux-only production options such as SO_BUSY_POLL,
+# mlockall, realtime scheduling, PACKET_MMAP, and AF_XDP are intentionally absent.
+
+[general]
+max_packet_size = 2048
+pool_size = 65536
+rx_queue_capacity = 65536
+merge_queue_capacity = 65536
+spin_loops_per_yield = 64
+rx_recvmmsg_batch = 32
+mlock_all = false
+
+[sequence]
+# T7 EOBI PacketHeader.ApplSeqNum
+offset = 8
+length = 4
+endian = "le"
+
+[parser]
+kind = "eobi"
+max_messages_per_packet = 128
+
+[channels.a]
+group = "239.10.10.1"
+port = 5001
+iface_addr = "0.0.0.0"
+reuse_port = true
+recv_buffer_bytes = 4194304
+nonblocking = true
+timestamping = "software"
+workers = 1
+
+[channels.b]
+group = "239.10.10.2"
+port = 5001
+iface_addr = "0.0.0.0"
+reuse_port = true
+recv_buffer_bytes = 4194304
+nonblocking = true
+timestamping = "software"
+workers = 1
+
+[merge]
+initial_expected_seq = 1
+reorder_window = 512
+max_pending_packets = 131072
+
+[book]
+max_depth = 50
+snapshot_interval_ms = 1000
+consume_trades = false
+default_tick = 1
+grid_span = 16384
+order_slab_capacity = 1048576
+order_index_capacity = 1048576
+per_instrument_order_index_capacity = 1048576
+preallocate_instrument_books = false
+instrument_ticks = []
+
+[cpu]
+
+[metrics]
+bind = "127.0.0.1:9100"
+
+[snapshot]
+path = "/tmp/numi-orderbook-darwin/book.snap"
+load_on_start = false
+enable_writer = false

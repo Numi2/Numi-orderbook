@@ -10,10 +10,20 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
     sock.set_reuse_address(true)
         .context("set SO_REUSEADDR on multicast socket")?;
     if cfg.reuse_port {
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "macos"
+        ))]
         sock.set_reuse_port(true)
             .context("set SO_REUSEPORT on multicast socket")?;
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "macos"
+        )))]
         anyhow::bail!("reuse_port is requested but is not supported on this target");
     }
 
@@ -69,7 +79,7 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
         anyhow::bail!("busy_poll_us is configured but SO_BUSY_POLL is only supported on Linux");
     }
 
-    // Optional RX timestamping (Linux only)
+    // Optional RX timestamping.
     #[cfg(target_os = "linux")]
     if let Some(mode) = &cfg.timestamping {
         use std::os::fd::AsRawFd;
@@ -127,11 +137,41 @@ pub fn build_mcast_socket(cfg: &ChannelCfg) -> anyhow::Result<UdpSocket> {
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    if let Some(mode) = &cfg.timestamping {
+        use std::os::fd::AsRawFd;
+        let fd = sock.as_raw_fd();
+        unsafe {
+            match mode {
+                crate::config::TimestampingMode::Off => {}
+                crate::config::TimestampingMode::Software => {
+                    let on: libc::c_int = 1;
+                    let rc = libc::setsockopt(
+                        fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_TIMESTAMP_MONOTONIC,
+                        &on as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                    if rc != 0 {
+                        return Err(std::io::Error::last_os_error())
+                            .context("set SO_TIMESTAMP_MONOTONIC on multicast socket");
+                    }
+                }
+                crate::config::TimestampingMode::Hardware
+                | crate::config::TimestampingMode::HardwareRaw => {
+                    anyhow::bail!(
+                        "timestamping={mode:?} is configured but macOS only supports software RX timestamps via SO_TIMESTAMP_MONOTONIC"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     if let Some(mode) = &cfg.timestamping {
         if !matches!(mode, crate::config::TimestampingMode::Off) {
             anyhow::bail!(
-                "timestamping={mode:?} is configured but RX timestamping is only implemented on Linux"
+                "timestamping={mode:?} is configured but RX timestamping is only implemented on Linux and macOS"
             );
         }
     }

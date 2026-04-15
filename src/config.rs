@@ -54,8 +54,8 @@ pub struct Parser {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParserKind {
-    #[serde(rename = "fixed_binary")]
-    FixedBinary,
+    #[serde(rename = "eobi", alias = "fixed_binary")]
+    Eobi,
     #[serde(rename = "fast_like")]
     FastLike,
     #[serde(rename = "itch50")]
@@ -478,6 +478,18 @@ pub struct OboFeedCfg {
     pub client_max_connections: usize,
     #[serde(default = "default_client_nodelay")]
     pub client_nodelay: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn darwin_profile_config_validates() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.darwin.toml");
+        AppConfig::from_file(&path).unwrap();
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

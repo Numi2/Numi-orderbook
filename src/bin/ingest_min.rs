@@ -7,7 +7,7 @@ use orderbook::metrics;
 use orderbook::net;
 use orderbook::parser::{build_parser, SeqCfg};
 use orderbook::pool::{PacketPool, Pkt};
-use orderbook::rx;
+use orderbook::rx_udp;
 use orderbook::spsc::SpscQueue;
 use orderbook::util::{
     lock_all_memory_if, now_nanos, pin_to_core_if_set, set_realtime_priority_if, BarrierFlag,
@@ -93,14 +93,14 @@ fn main() -> anyhow::Result<()> {
             .spawn(move || {
                 util::pin_to_core_with_offset(cfgc.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfgc.cpu.rt_priority);
-                let _ = rx::rx_loop(
+                let _ = rx_udp::rx_udp_loop(
                     "A",
                     &sa,
                     parser_i.seq_extractor(),
                     q_i,
                     pool_i,
                     rx_shutdown,
-                    rx::RxConfig {
+                    rx_udp::UdpRxConfig {
                         spin_loops_per_yield: cfgc.general.spin_loops_per_yield,
                         rx_batch: cfgc.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfgc.channels.a.timestamping.clone(),
@@ -121,14 +121,14 @@ fn main() -> anyhow::Result<()> {
             .spawn(move || {
                 util::pin_to_core_with_offset(cfgc.cpu.b_rx_core, i);
                 set_realtime_priority_if(cfgc.cpu.rt_priority);
-                let _ = rx::rx_loop(
+                let _ = rx_udp::rx_udp_loop(
                     "B",
                     &sb,
                     parser_i.seq_extractor(),
                     q_i,
                     pool_i,
                     rx_shutdown,
-                    rx::RxConfig {
+                    rx_udp::UdpRxConfig {
                         spin_loops_per_yield: cfgc.general.spin_loops_per_yield,
                         rx_batch: cfgc.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfgc.channels.b.timestamping.clone(),

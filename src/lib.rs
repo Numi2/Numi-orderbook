@@ -18,7 +18,10 @@ pub mod pubsub;
 pub mod recovery;
 pub mod refdata;
 pub mod rx;
+#[cfg(target_os = "macos")]
+pub mod rx_darwin_udp;
 pub mod rx_packet_mmap;
+pub mod rx_udp;
 pub mod snapshot;
 pub mod spsc;
 pub mod util;

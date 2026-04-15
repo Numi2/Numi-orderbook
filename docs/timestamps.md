@@ -19,11 +19,16 @@ Current implementation
   `mmsghdr`, preserving timestamp ancillary data without hot-loop allocation.
 - `SCM_TIMESTAMPING` slot selection is based on the timestamp that is actually
   present: slot 2 is `HwRaw`, slot 1 is `HwSys`, and slot 0 remains `Sw`.
+- On macOS, UDP channels use Darwin `recvmsg_x` batching when
+  `rx_recvmmsg_batch > 1`. Software timestamping enables
+  `SO_TIMESTAMP_MONOTONIC`, parses `SCM_TIMESTAMP_MONOTONIC`, and converts the
+  returned `mach_absolute_time()` ticks with `mach_timebase_info`.
 - Socket setup fails fast if requested timestamping cannot be enabled on the
-  target platform. Non-Linux software or hardware timestamping is rejected
-  instead of silently falling back to unstamped packets.
+  target platform. macOS accepts software timestamping only; hardware
+  timestamping is rejected instead of silently falling back to unstamped packets.
 - Per-packet `recvmsg` remains the Linux fallback only when the configured batch
-  size is one.
+  size is one. On macOS, `recvmsg` is also the explicit fallback if the private
+  Darwin `recvmsg_x` syscall is unavailable for the socket.
 
 Unification
 -----------

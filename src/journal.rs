@@ -1,5 +1,5 @@
 use crate::orderbook::OrderBook;
-use crate::parser::{Event, Side};
+use crate::parser::{Event, Side, VenueState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -50,12 +50,34 @@ pub enum JournalEvent {
     Del {
         order_id: u64,
     },
+    MassDel {
+        instr: u32,
+    },
+    Execute {
+        instr: u32,
+        px: i64,
+        qty: i64,
+        order_id: u64,
+        taker_side: Option<Side>,
+        match_id: u32,
+        full: bool,
+    },
     Trade {
         instr: u32,
         px: i64,
         qty: i64,
         maker_order_id: Option<u64>,
         taker_side: Option<Side>,
+    },
+    State {
+        template_id: u16,
+        msg_seq_num: u32,
+        instr: Option<u32>,
+        state: VenueState,
+    },
+    SequenceGap {
+        expected: u32,
+        got: u32,
     },
     Heartbeat,
 }
@@ -78,6 +100,24 @@ impl From<&Event> for JournalEvent {
             },
             Event::Mod { order_id, qty } => Self::Mod { order_id, qty },
             Event::Del { order_id } => Self::Del { order_id },
+            Event::MassDel { instr } => Self::MassDel { instr },
+            Event::Execute {
+                instr,
+                px,
+                qty,
+                order_id,
+                taker_side,
+                match_id,
+                full,
+            } => Self::Execute {
+                instr,
+                px,
+                qty,
+                order_id,
+                taker_side,
+                match_id,
+                full,
+            },
             Event::Trade {
                 instr,
                 px,
@@ -91,6 +131,18 @@ impl From<&Event> for JournalEvent {
                 maker_order_id,
                 taker_side,
             },
+            Event::State {
+                template_id,
+                msg_seq_num,
+                instr,
+                state,
+            } => Self::State {
+                template_id,
+                msg_seq_num,
+                instr,
+                state,
+            },
+            Event::SequenceGap { expected, got } => Self::SequenceGap { expected, got },
             Event::Heartbeat => Self::Heartbeat,
         }
     }
@@ -114,6 +166,24 @@ impl From<JournalEvent> for Event {
             },
             JournalEvent::Mod { order_id, qty } => Self::Mod { order_id, qty },
             JournalEvent::Del { order_id } => Self::Del { order_id },
+            JournalEvent::MassDel { instr } => Self::MassDel { instr },
+            JournalEvent::Execute {
+                instr,
+                px,
+                qty,
+                order_id,
+                taker_side,
+                match_id,
+                full,
+            } => Self::Execute {
+                instr,
+                px,
+                qty,
+                order_id,
+                taker_side,
+                match_id,
+                full,
+            },
             JournalEvent::Trade {
                 instr,
                 px,
@@ -127,6 +197,18 @@ impl From<JournalEvent> for Event {
                 maker_order_id,
                 taker_side,
             },
+            JournalEvent::State {
+                template_id,
+                msg_seq_num,
+                instr,
+                state,
+            } => Self::State {
+                template_id,
+                msg_seq_num,
+                instr,
+                state,
+            },
+            JournalEvent::SequenceGap { expected, got } => Self::SequenceGap { expected, got },
             JournalEvent::Heartbeat => Self::Heartbeat,
         }
     }

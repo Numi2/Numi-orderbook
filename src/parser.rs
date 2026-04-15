@@ -25,6 +25,44 @@ pub enum Side {
     Bid,
     Ask,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VenueState {
+    Packet {
+        appl_seq_num: u32,
+        market_segment_id: i32,
+        partition_id: u8,
+        completion_indicator: u8,
+        appl_seq_reset_indicator: u8,
+    },
+    Product {
+        trading_session_id: u8,
+        trading_session_sub_id: u8,
+        trad_ses_status: u8,
+        market_condition: u8,
+        fast_market_indicator: u8,
+    },
+    Instrument {
+        security_status: u8,
+        security_trading_status: u8,
+        market_condition: u8,
+        fast_market_indicator: u8,
+    },
+    ProductSummary {
+        last_msg_seq_num_processed: u32,
+        trading_session_id: u8,
+        trading_session_sub_id: u8,
+        trad_ses_status: u8,
+    },
+    InstrumentSummary {
+        tot_no_orders: u16,
+        security_status: u8,
+        security_trading_status: u8,
+    },
+    Heartbeat {
+        last_msg_seq_num_processed: u32,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     Add {
@@ -41,12 +79,34 @@ pub enum Event {
     Del {
         order_id: u64,
     },
+    MassDel {
+        instr: u32,
+    },
+    Execute {
+        instr: u32,
+        px: i64,
+        qty: i64,
+        order_id: u64,
+        taker_side: Option<Side>,
+        match_id: u32,
+        full: bool,
+    },
     Trade {
         instr: u32,
         px: i64,
         qty: i64,
         maker_order_id: Option<u64>,
         taker_side: Option<Side>,
+    },
+    State {
+        template_id: u16,
+        msg_seq_num: u32,
+        instr: Option<u32>,
+        state: VenueState,
+    },
+    SequenceGap {
+        expected: u32,
+        got: u32,
     },
     Heartbeat,
 }
@@ -60,7 +120,7 @@ pub struct Parser {
 
 #[derive(Clone)]
 enum DecoderImpl {
-    Fixed(EobiSbeDecoder), // FixedBinary -> EOBI/SBE-like
+    Fixed(EobiSbeDecoder),
     Fast(FastEmdiDecoder),
     Itch(Itch50Decoder),
 }
@@ -95,7 +155,7 @@ pub fn build_parser(
     let seq_impl: Arc<dyn SeqExtractor> = Arc::new(FixedSeq { cfg: seq.clone() });
 
     let dec_impl: DecoderImpl = match kind {
-        ParserKind::FixedBinary => DecoderImpl::Fixed(EobiSbeDecoder::new()),
+        ParserKind::Eobi => DecoderImpl::Fixed(EobiSbeDecoder::new()),
         ParserKind::FastLike => DecoderImpl::Fast(FastEmdiDecoder::new()),
         ParserKind::Itch50 => DecoderImpl::Itch(Itch50Decoder::new()),
     };
@@ -144,7 +204,7 @@ impl SeqExtractor for FixedSeq {
     }
 }
 
-// FixedBinaryDecoder was a synthetic format used for bring-up. It has been
-// replaced by a real EOBI/SBE-like implementation in `decoder_eobi.rs`.
+// The `fixed_binary` config spelling is retained as a compatibility alias for
+// the generated T7 EOBI decoder in `decoder_eobi.rs`.
 
 // FastLike is implemented by FastEmdiDecoder in decoder_fast.rs

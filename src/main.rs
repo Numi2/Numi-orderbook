@@ -5,11 +5,12 @@ use orderbook::decode::decode_loop;
 use orderbook::merge::merge_loop;
 use orderbook::parser::{build_parser, SeqCfg};
 use orderbook::pool::PacketPool;
-use orderbook::rx::rx_loop;
 use orderbook::util::{
     lock_all_memory_if, pin_to_core_if_set, set_realtime_priority_if, BarrierFlag,
 };
-use orderbook::{metrics, net, pubsub, recovery, refdata, rx_packet_mmap, snapshot, ws_server};
+use orderbook::{
+    metrics, net, pubsub, recovery, refdata, rx_packet_mmap, rx_udp, snapshot, ws_server,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -318,14 +319,14 @@ fn main() -> anyhow::Result<()> {
             let t = thread::Builder::new().name(name).spawn(move || {
                 orderbook::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
-                if let Err(e) = rx_loop(
+                if let Err(e) = rx_udp::rx_udp_loop(
                     "A",
                     &sa,
                     parser_ai.seq_extractor(),
                     q_ai,
                     pool_ai,
                     rx_a_shutdown_i,
-                    orderbook::rx::RxConfig {
+                    rx_udp::UdpRxConfig {
                         spin_loops_per_yield: cfg.general.spin_loops_per_yield,
                         rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfg.channels.a.timestamping.clone(),
@@ -360,14 +361,14 @@ fn main() -> anyhow::Result<()> {
             let t = thread::Builder::new().name(name).spawn(move || {
                 orderbook::util::pin_to_core_with_offset(cfg.cpu.b_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
-                if let Err(e) = rx_loop(
+                if let Err(e) = rx_udp::rx_udp_loop(
                     "B",
                     &sb,
                     parser_bi.seq_extractor(),
                     q_bi,
                     pool_bi,
                     rx_b_shutdown_i,
-                    orderbook::rx::RxConfig {
+                    rx_udp::UdpRxConfig {
                         spin_loops_per_yield: cfg.general.spin_loops_per_yield,
                         rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfg.channels.b.timestamping.clone(),

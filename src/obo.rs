@@ -60,6 +60,28 @@ pub fn map_event_to_obo_parts(ev: &Event) -> (Option<u32>, Option<OboEventV1>) {
                 reason: 0,
             })),
         ),
+        Event::MassDel { .. } => (None, None),
+        Event::Execute {
+            instr,
+            px,
+            qty,
+            order_id,
+            taker_side,
+            match_id,
+            ..
+        } => {
+            let side = taker_side.map(side_to_u8).unwrap_or(0);
+            (
+                Some(instr),
+                Some(OboEventV1::Execute(OboExecuteV1 {
+                    maker_order_id: order_id,
+                    trade_qty: qty as u64,
+                    trade_price_e8: px,
+                    aggressor_side: side,
+                    match_id: u64::from(match_id),
+                })),
+            )
+        }
         Event::Trade {
             instr,
             px,
@@ -83,6 +105,7 @@ pub fn map_event_to_obo_parts(ev: &Event) -> (Option<u32>, Option<OboEventV1>) {
                 (Some(instr), None)
             }
         }
+        Event::State { .. } | Event::SequenceGap { .. } => (None, None),
         Event::Heartbeat => (None, None),
     }
 }

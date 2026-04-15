@@ -128,6 +128,14 @@ Completed in current working tree:
   buffer before sleeping or returning an error.
 - UDP `recvmmsg` now preserves Linux timestamp ancillary data with per-message
   control buffers, so timestamped channels keep the batched receive path.
+- macOS UDP RX now has a real Darwin batch path via `recvmsg_x`, with
+  `SO_TIMESTAMP_MONOTONIC` parsing and Mach absolute tick conversion for local
+  performance work.
+- UDP receive dispatch is shared by the main binary and `ingest_min`, so macOS
+  development binaries exercise the Darwin path instead of the generic
+  non-Linux fallback.
+- `rx_probe` provides a loopback receive integrity/timestamp smoke gate for the
+  active platform UDP path.
 - Timestamp parsing distinguishes actual `SCM_TIMESTAMPING` slots: software,
   system-hardware, and raw-hardware timestamps are labeled by the timestamp that
   was actually present, not only by requested mode.
@@ -195,12 +203,18 @@ Completed in current working tree:
 - Add CSV venue reference-data tick-table loading with header aliases for common
   instrument-id and tick-size column names; inline config entries remain
   available as overrides.
-- Add static EOBI/SBE message descriptors for the selected binary decoder and
-  dispatch through schema/version/template metadata before field decoding.
+- Replace the synthetic EOBI/SBE-style decoder with generated Deutsche Boerse
+  T7 14.1 EOBI layout descriptors from the official XML representation.
+- Decode EOBI MessageHeaderComp `BodyLen`, `TemplateID`, and `MsgSeqNum` rather
+  than synthetic schema/version framing.
+- Add replay regressions for Order Mass Delete, Order Modify Same Priority,
+  full and partial order execution, Snapshot Order with Instrument Summary
+  context, Product/Instrument state messages, PacketHeader sequence state, and
+  message-sequence gap detection.
 
 Remaining:
-- Replace static EOBI descriptors with generated descriptors from official venue
-  XML when those schema files are available.
+- Add certification artifacts from exchange conformance captures when licensed
+  production/simulation feed samples are available.
 
 M5: Kernel-Bypass Receive Path
 ------------------------------

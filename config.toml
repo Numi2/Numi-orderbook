@@ -9,12 +9,12 @@ rx_recvmmsg_batch = 32
 mlock_all = true
 
 [sequence]
-offset = 0
-length = 8
-endian = "be"
+offset = 8
+length = 4
+endian = "le"
 
 [parser]
-kind = "fixed_binary"
+kind = "eobi"
 max_messages_per_packet = 128
 
 [channels.a]

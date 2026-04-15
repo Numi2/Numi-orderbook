@@ -15,11 +15,14 @@ regression tests for packet ownership and replay correctness.
 - Dual A/B multicast ingestion with strict sequencing and duplicate suppression.
 - Linux UDP `recvmmsg` batching with software, hardware, and raw-hardware RX
   timestamp support.
+- macOS UDP `recvmsg_x` batching with `SO_TIMESTAMP_MONOTONIC` for local
+  development and performance work.
 - Optional Linux PACKET_MMAP receive path for high-throughput AF_PACKET ingest.
 - Bounded SPSC hot-path queues for RX, merge, and decode stages.
 - Price-time order book with per-instrument tick configuration and stable state
   hashing.
-- EOBI/SBE-like, ITCH 5.0, and FAST/EMDI-like decoder surfaces.
+- Generated Deutsche Boerse T7 14.1 EOBI, ITCH 5.0, and FAST/EMDI-like
+  decoder surfaces.
 - Snapshot load/save, framed journal replay verification, and deterministic
   restart checks.
 - TCP recovery injector with retry, throttling, stale replay rejection, SLO
@@ -53,9 +56,14 @@ The production receive path targets Linux. Linux-specific features include:
 - `SO_BUSY_POLL` socket tuning.
 - `mlockall`, realtime scheduling, and PACKET_MMAP.
 
-Non-Linux builds are useful for development and unit tests, but production
-latency validation must run on the target Linux host with the target NIC,
-driver, clock sync, kernel settings, and CPU isolation.
+macOS has a dedicated local-performance receive path. It uses Darwin's
+`recvmsg_x` batch syscall when available, parses `SCM_TIMESTAMP_MONOTONIC`, and
+converts Mach absolute ticks into nanoseconds. It intentionally does not claim
+hardware timestamping, PACKET_MMAP, AF_XDP, busy poll, or realtime Linux
+scheduling support.
+
+Production latency validation must run on the target Linux host with the target
+NIC, driver, clock sync, kernel settings, and CPU isolation.
 
 ## Build
 
@@ -77,6 +85,12 @@ used on Linux and mimalloc is used elsewhere.
 
 ```bash
 cargo run --release --locked -- config.toml
+```
+
+For macOS local receive testing:
+
+```bash
+cargo run --release --locked -- config.darwin.toml
 ```
 
 The process fails fast when requested production socket options cannot be
@@ -118,6 +132,7 @@ Hot-path allocation smoke gates:
 ```bash
 cargo run --release --bin pool_soak -- 65536 2048 10000 64
 cargo run --release --bin bench_orderbook -- 64 10000 64
+cargo run --release --bin rx_probe -- 100000 64 32 software 0
 ```
 
 `pool_soak` must report `misses=0` and `return_drops=0` for production pool
@@ -139,6 +154,16 @@ rx_queue_capacity = 65536
 merge_queue_capacity = 65536
 rx_recvmmsg_batch = 32
 mlock_all = true
+
+[sequence]
+# T7 EOBI PacketHeader.ApplSeqNum
+offset = 8
+length = 4
+endian = "le"
+
+[parser]
+kind = "eobi"
+max_messages_per_packet = 128
 
 [channels.a]
 group = "239.10.10.1"
@@ -212,7 +237,9 @@ whose cursor has fallen outside retained live replay, are rejected.
 ## Repository Layout
 
 - `src/rx.rs`: UDP receive, batching, timestamp extraction, packet recycling.
+- `src/rx_darwin_udp.rs`: macOS UDP `recvmsg_x` receive loop.
 - `src/rx_packet_mmap.rs`: Linux PACKET_MMAP receive loop.
+- `src/rx_udp.rs`: platform dispatcher for UDP receive loops.
 - `src/merge.rs`: sequence merge, duplicate suppression, gap signaling.
 - `src/decode.rs`: packet decode, book apply, snapshots, journaling, OBO publish.
 - `src/orderbook.rs`: price-time book implementation.
@@ -221,6 +248,7 @@ whose cursor has fallen outside retained live replay, are rejected.
 - `src/ws_server.rs`: WebSocket feed serving, reconnect, snapshot handling.
 - `src/metrics.rs`: Prometheus metrics and health endpoints.
 - `src/bin/pool_soak.rs`: packet-pool allocation soak.
+- `src/bin/rx_probe.rs`: loopback UDP receive integrity and timestamp probe.
 - `src/bin/bench_orderbook.rs`: synthetic order-book benchmark.
 - `docs/`: roadmap, timestamp strategy, SLOs, and raw-v1 wire format.
 - `ops/`: Linux tuning and queue steering helpers.
