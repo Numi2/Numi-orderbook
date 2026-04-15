@@ -18,6 +18,7 @@ state.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Runtime interfaces](#runtime-interfaces)
+- [Participant insight signals](#participant-insight-signals)
 - [Validation](#validation)
 - [Operations](#operations)
 - [Repository layout](#repository-layout)
@@ -43,8 +44,9 @@ state.
   eviction.
 - Prometheus metrics, health endpoints, packet-pool accounting, recovery SLO
   accounting, and local/target benchmark binaries.
-- Sidecar and replay tooling for liquidity-pull, absorption, and iceberg-style
-  order-book signals.
+- Sidecar and deterministic replay tooling for absorption,
+  iceberg/replenishment-candidate, and liquidity-pull participant insight
+  signals.
 
 ## Architecture
 
@@ -176,6 +178,57 @@ When `[metrics]` is configured, the HTTP server exposes:
 The raw-v1 WebSocket feed is configured under `[feeds]`. Clients should use the
 wire contract in [`docs/obo_raw_v1.md`](docs/obo_raw_v1.md), including snapshot
 cursor and reconnect semantics.
+
+## Participant Insight Signals
+
+The participant insight layer consumes raw-v1 order-by-order WebSocket frames
+outside the engine hot path. It gives users explainable market-participant
+behavior signals without changing ingest, merge, decode, or book-apply latency.
+
+Current signals:
+
+- Absorption: aggressive flow trades into a price while passive liquidity holds
+  or replenishes.
+- Iceberg/replenishment candidate: repeated same-price replenishment under
+  execution pressure, with executed quantity exceeding observed display size.
+- Liquidity pull: displayed size is withdrawn by cancels or quantity-reducing
+  modifies before it trades.
+
+Run the sidecar against one or more raw-v1 OBO WebSocket feeds:
+
+```bash
+cargo run --release --bin absorption_sidecar -- \
+  --url 'ws://127.0.0.1:7001/ws?channel=obo&codec=raw-v1&snapshot=1' \
+  --listen 127.0.0.1:9201
+```
+
+The sidecar emits each signal as tagged JSON and exposes:
+
+- `GET /stats`: frames, duplicates, parse errors, connection attempts, and
+  per-signal counters.
+- `GET /signals`: recent retained participant signals.
+- `GET /signals/absorption`: recent absorption signals.
+- `GET /signals/iceberg`: recent iceberg/replenishment candidates.
+- `GET /signals/liquidity_pull`: recent liquidity-pull candidates.
+
+Record raw frames for deterministic replay:
+
+```bash
+cargo run --release --bin absorption_sidecar -- \
+  --url 'ws://127.0.0.1:7001/ws?channel=obo&codec=raw-v1&snapshot=1' \
+  --record-frames /tmp/numi-obo.frames
+```
+
+Validate each signal family against the same recording:
+
+```bash
+cargo run --release --bin absorption_replay -- /tmp/numi-obo.frames
+cargo run --release --bin iceberg_replay -- /tmp/numi-obo.frames
+cargo run --release --bin liquidity_pull_replay -- /tmp/numi-obo.frames
+```
+
+The signal definitions, evidence fields, thresholds, and interpretation limits
+are documented in [`docs/participant_insights.md`](docs/participant_insights.md).
 
 ## Validation
 
