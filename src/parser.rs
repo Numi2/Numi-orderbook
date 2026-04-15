@@ -16,8 +16,6 @@ pub struct SeqCfg {
 pub trait SeqExtractor: Send + Sync + 'static {
     fn extract_seq(&self, pkt: &[u8]) -> Option<u64>;
 }
-
-#[allow(dead_code)]
 pub trait MessageDecoder: Send + Sync + 'static {
     fn decode_messages(&self, payload: &[u8], out: &mut Vec<Event>);
 }
@@ -27,8 +25,6 @@ pub enum Side {
     Bid,
     Ask,
 }
-
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Event {
     Add {

@@ -1,5 +1,5 @@
-// Optional global allocator selection. This module is compiled only when the
-// corresponding feature is enabled and the dependency is added to Cargo.toml.
+// Optional global allocator selection. jemalloc is preferred on Linux when both
+// allocator features are enabled; mimalloc remains available elsewhere.
 
 #[cfg(all(target_os = "linux", feature = "jemalloc"))]
 mod jemalloc_global {
@@ -8,7 +8,10 @@ mod jemalloc_global {
     static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 }
 
-#[cfg(all(feature = "mimalloc", not(feature = "jemalloc")))]
+#[cfg(all(
+    feature = "mimalloc",
+    any(not(feature = "jemalloc"), not(target_os = "linux"))
+))]
 mod mimalloc_global {
     use mimalloc::MiMalloc;
     #[global_allocator]

@@ -106,7 +106,7 @@ pub fn set_realtime_priority_if(_priority: Option<i32>) {
     if let Some(pri) = _priority {
         unsafe {
             let param = libc::sched_param {
-                sched_priority: pri as i32,
+                sched_priority: pri,
             };
             let _ = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
         }

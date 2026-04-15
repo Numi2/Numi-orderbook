@@ -109,23 +109,11 @@ impl MessageDecoder for Itch50Decoder {
 }
 
 #[inline]
-#[allow(dead_code)] // Used in decode_messages
 fn be_u16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
 }
-#[allow(dead_code)]
-#[inline]
-fn be_u32(b: &[u8]) -> u32 {
-    u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-}
-#[allow(dead_code)]
-#[inline]
-fn be_u64(b: &[u8]) -> u64 {
-    u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-}
 
 #[inline]
-#[allow(dead_code)] // Used by read_u* functions
 fn read_fixed<'a, const N: usize>(b: &'a [u8], off: &mut usize) -> Option<&'a [u8; N]> {
     if *off + N <= b.len() {
         // SAFETY: slice length checked
@@ -138,22 +126,17 @@ fn read_fixed<'a, const N: usize>(b: &'a [u8], off: &mut usize) -> Option<&'a [u
 }
 
 #[inline]
-#[allow(dead_code)] // Used in message handlers
 fn read_u16(b: &[u8], off: &mut usize) -> Option<u16> {
     read_fixed::<2>(b, off).map(|v| u16::from_be_bytes(*v))
 }
 #[inline]
-#[allow(dead_code)] // Used in message handlers
 fn read_u32(b: &[u8], off: &mut usize) -> Option<u32> {
     read_fixed::<4>(b, off).map(|v| u32::from_be_bytes(*v))
 }
 #[inline]
-#[allow(dead_code)] // Used in message handlers
 fn read_u64(b: &[u8], off: &mut usize) -> Option<u64> {
     read_fixed::<8>(b, off).map(|v| u64::from_be_bytes(*v))
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_stock_directory(body: &[u8], st: &mut Inner) {
     // 'R' Stock Directory (varies by venue/version). We only keep symbol by locate for debugging.
     // Layout (5.0 typical): locate(2) track(2) ts(6) stock[8] ... (ignore remainder)
@@ -167,8 +150,6 @@ fn on_stock_directory(body: &[u8], st: &mut Inner) {
         st.last_symbol_by_locate.insert(locate, *sym);
     }
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_add(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, with_mpid: bool) {
     // 'A' Add (no MPID) or 'F' Add with MPID (last 4 bytes MPID)
     // Layout:
@@ -218,8 +199,6 @@ fn on_add(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, with_mpid: bool) {
         },
     );
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_exec(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, _with_price: bool) {
     // 'E' Order Executed (or 'C' Executed w/ Price)
     // Layout:
@@ -266,8 +245,6 @@ fn on_exec(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, _with_price: bool)
         // If we don't have the order (late join), ignore or route to recovery.
     }
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_cancel(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     // 'X' Order Cancel (partial reduction)
     // Layout: locate(2) track(2) ts(6) order_ref(8) canceled_shares(4)
@@ -295,8 +272,6 @@ fn on_cancel(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
         }
     }
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_delete(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     // 'D' Order Delete (remove entire order)
     // Layout: locate(2) track(2) ts(6) order_ref(8)
@@ -314,8 +289,6 @@ fn on_delete(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
         });
     }
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_replace(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     // 'U' Order Replace
     // Layout: locate(2) track(2) ts(6) orig_ref(8) new_ref(8) shares(4) price(4)
@@ -360,8 +333,6 @@ fn on_replace(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
         },
     );
 }
-
-#[allow(dead_code)] // Called from decode_messages
 fn on_trade(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     // 'P' Trade (non-cross)
     // Layout: locate(2) track(2) ts(6) order_ref(8) side(1) shares(4) stock[8] price(4) match(8)
@@ -421,7 +392,6 @@ fn on_trade(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Used in on_exec and on_trade
 fn opposite(s: Side) -> Side {
     match s {
         Side::Bid => Side::Ask,

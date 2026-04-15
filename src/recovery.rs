@@ -4,7 +4,7 @@ use bytes::BufMut;
 use crossbeam_channel::{Receiver, Sender};
 use serde::Deserialize;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,13 +45,14 @@ impl Replayer for Client {
 }
 
 pub struct RecoveryHandle {
-    _join: thread::JoinHandle<()>,
+    join: thread::JoinHandle<()>,
 }
 
 impl RecoveryHandle {
-    #[allow(dead_code)]
     pub fn join(self) {
-        let _ = self._join.join();
+        if self.join.join().is_err() {
+            log::error!("recovery thread panicked");
+        }
     }
 }
 
@@ -80,19 +81,14 @@ impl Default for RecoveryOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayProtocol {
     /// Control request is `REPLAY <from> <to>\n`.
     /// Response stream is repeated `[u32_be len][u64_be seq][payload]`,
     /// terminated by a zero len frame or EOF.
+    #[default]
     LenSeqPayload,
-}
-
-impl Default for ReplayProtocol {
-    fn default() -> Self {
-        Self::LenSeqPayload
-    }
 }
 
 impl ReplayProtocol {
@@ -103,22 +99,16 @@ impl ReplayProtocol {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnrecoverablePolicy {
+    #[default]
     Log,
     Panic,
     Exit,
 }
 
-impl Default for UnrecoverablePolicy {
-    fn default() -> Self {
-        Self::Log
-    }
-}
-
-/// Spawn a basic recovery manager that logs requests.
-/// Replace internals with exchange-specific replay logic.
+/// Spawn a recovery manager that records gap requests without replay injection.
 pub fn spawn_logger() -> (RecoveryClient, RecoveryHandle) {
     let (tx, rx) = crossbeam_channel::bounded::<RecoveryRequest>(1024);
     let join = std::thread::Builder::new()
@@ -126,7 +116,7 @@ pub fn spawn_logger() -> (RecoveryClient, RecoveryHandle) {
         .spawn(move || run(rx))
         .expect("spawn recovery");
     let client: RecoveryClient = Arc::new(Client { tx });
-    (client, RecoveryHandle { _join: join })
+    (client, RecoveryHandle { join })
 }
 
 fn run(rx: Receiver<RecoveryRequest>) {
@@ -150,9 +140,8 @@ fn run(rx: Receiver<RecoveryRequest>) {
 }
 
 // -------------------- Optional: TCP replay injector --------------------
-// Feed recovered sequences directly into the merged decode queue. Keeps
-// the Pkt contract intact. The on-wire replay protocol is venue-specific;
-// replace the body of `fetch_and_inject` accordingly.
+// Feed recovered sequences directly into the merged decode queue while keeping
+// the Pkt contract intact. Venue wire formats are isolated behind ReplayProtocol.
 
 use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
 use crate::spsc::SpscQueue;
@@ -170,7 +159,7 @@ pub fn spawn_tcp_injector<A: std::net::ToSocketAddrs + Send + 'static>(
         .spawn(move || run_injector(addr, q_recovery, pool, rx, backlog_path, opts))
         .expect("spawn recovery injector");
     let client: RecoveryClient = Arc::new(Client { tx });
-    (client, RecoveryHandle { _join: join })
+    (client, RecoveryHandle { join })
 }
 
 fn run_injector<A: std::net::ToSocketAddrs>(
@@ -360,7 +349,6 @@ fn fetch_and_inject<A: std::net::ToSocketAddrs>(
     pool: &Arc<PacketPool>,
     opts: RecoveryOptions,
 ) -> anyhow::Result<usize> {
-    use std::io::Read;
     use std::net::TcpStream;
     // Establish TCP to replay service
     let mut stream = TcpStream::connect(addr)?;

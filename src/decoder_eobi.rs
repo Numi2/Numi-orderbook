@@ -56,7 +56,6 @@ impl MessageDecoder for EobiSbeDecoder {
 }
 
 #[inline]
-#[allow(dead_code)] // Used in decode_messages
 fn le_u16(b: &[u8]) -> u16 {
     u16::from_le_bytes([b[0], b[1]])
 }
@@ -99,7 +98,6 @@ fn read_le_i64_checked(b: &[u8], off: usize) -> Option<i64> {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn decode_add(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 29;
     if body.len() < LEN {
@@ -138,7 +136,6 @@ fn decode_add(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 16;
     if body.len() < LEN {
@@ -156,7 +153,6 @@ fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn decode_del(body: &[u8], out: &mut Vec<Event>) {
     if body.len() < 8 {
         return;
@@ -167,7 +163,6 @@ fn decode_del(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn decode_trade(body: &[u8], out: &mut Vec<Event>) {
     const LEN: usize = 29;
     if body.len() < LEN {

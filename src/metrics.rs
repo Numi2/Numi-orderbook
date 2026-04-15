@@ -456,6 +456,18 @@ pub fn set_packet_pool_preallocated_bytes(n: usize) {
     PACKET_POOL_PREALLOC_BYTES.set(n as i64);
 }
 
+pub fn packet_pool_misses() -> u64 {
+    PACKET_POOL_MISSES.get()
+}
+
+pub fn packet_pool_return_drops() -> u64 {
+    PACKET_POOL_RETURN_DROPS.get()
+}
+
+pub fn packet_pool_preallocated_bytes() -> i64 {
+    PACKET_POOL_PREALLOC_BYTES.get()
+}
+
 pub fn inc_merge_dup() {
     MERGE_DUPS.inc();
 }

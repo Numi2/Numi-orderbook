@@ -1,4 +1,5 @@
 // src/rx.rs (: metrics)
+use crate::config::TimestampingMode;
 use crate::metrics;
 use crate::parser::SeqExtractor;
 use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
@@ -10,11 +11,6 @@ use bytes::BufMut;
 use bytes::BytesMut;
 use log::debug;
 use nix::errno::Errno;
-use nix::libc;
-#[cfg(target_os = "linux")]
-use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-#[cfg(target_os = "linux")]
-use std::io::IoSliceMut;
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -22,7 +18,7 @@ use std::sync::Arc;
 pub struct RxConfig {
     pub spin_loops_per_yield: u32,
     pub rx_batch: usize,
-    pub ts_mode: Option<crate::config::TimestampingMode>,
+    pub ts_mode: Option<TimestampingMode>,
 }
 
 pub fn rx_loop(
@@ -48,12 +44,14 @@ pub fn rx_loop(
     let batch = rx_batch.max(1);
     let ts_off = ts_mode
         .as_ref()
-        .map(|m| matches!(m, crate::config::TimestampingMode::Off))
+        .map(|m| matches!(m, TimestampingMode::Off))
         .unwrap_or(true);
     #[cfg(target_os = "linux")]
-    let use_recvmmsg: bool = ts_off && batch > 1;
+    let use_recvmmsg: bool = batch > 1;
     #[cfg(not(target_os = "linux"))]
     let use_recvmmsg: bool = false;
+    #[cfg(target_os = "linux")]
+    let wants_timestamps = !ts_off;
 
     // Preallocate vectors for recvmmsg path to avoid per-iteration allocations
     #[cfg(target_os = "linux")]
@@ -76,11 +74,11 @@ pub fn rx_loop(
     #[cfg(target_os = "linux")]
     let mut hdrs: Vec<libc::mmsghdr> = if use_recvmmsg {
         let mut v = Vec::with_capacity(batch);
-        for i in 0..batch {
+        for iovec in iovecs.iter_mut().take(batch) {
             let mut mh: libc::msghdr = unsafe { std::mem::zeroed() };
             mh.msg_name = std::ptr::null_mut();
             mh.msg_namelen = 0;
-            mh.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+            mh.msg_iov = iovec as *mut libc::iovec;
             mh.msg_iovlen = 1;
             mh.msg_control = std::ptr::null_mut();
             mh.msg_controllen = 0;
@@ -91,6 +89,12 @@ pub fn rx_loop(
             });
         }
         v
+    } else {
+        Vec::new()
+    };
+    #[cfg(target_os = "linux")]
+    let mut cmsgs: Vec<TimestampCmsgBuffer> = if use_recvmmsg && wants_timestamps {
+        (0..batch).map(|_| TimestampCmsgBuffer::new()).collect()
     } else {
         Vec::new()
     };
@@ -120,6 +124,16 @@ pub fn rx_loop(
                     let s = bufs[i].chunk_mut();
                     iovecs[i].iov_base = s.as_mut_ptr() as *mut libc::c_void;
                     iovecs[i].iov_len = s.len();
+                    hdrs[i].msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
+                    hdrs[i].msg_hdr.msg_iovlen = 1;
+                    hdrs[i].msg_hdr.msg_flags = 0;
+                    if wants_timestamps {
+                        hdrs[i].msg_hdr.msg_control = cmsgs[i].as_mut_ptr() as *mut libc::c_void;
+                        hdrs[i].msg_hdr.msg_controllen = cmsgs[i].len();
+                    } else {
+                        hdrs[i].msg_hdr.msg_control = std::ptr::null_mut();
+                        hdrs[i].msg_hdr.msg_controllen = 0;
+                    }
                     hdrs[i].msg_len = 0;
                 }
 
@@ -134,8 +148,10 @@ pub fn rx_loop(
                 if ret < 0 {
                     let err = Errno::last();
                     if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK || err == Errno::EINTR {
+                        recycle_prepared_buffers(&mut bufs, &pool);
                         // no progress
                     } else {
+                        recycle_prepared_buffers(&mut bufs, &pool);
                         return Err(anyhow::anyhow!(
                             "recvmmsg error: {}",
                             std::io::Error::from(err)
@@ -143,7 +159,6 @@ pub fn rx_loop(
                     }
                 } else if ret > 0 {
                     progressed = true;
-                    let ts = loop_now_cache.unwrap_or_else(now_nanos);
                     let count = ret as usize;
                     for i in 0..count {
                         let n = hdrs[i].msg_len as usize;
@@ -151,37 +166,34 @@ pub fn rx_loop(
                         buf.advance_mut(n);
                         let maybe_seq = seq.extract_seq(&buf);
                         if let Some(sv) = maybe_seq {
+                            let rx_ts = packet_timestamp(
+                                wants_timestamps.then_some(&hdrs[i].msg_hdr),
+                                &mut loop_now_cache,
+                            );
                             let pkt = Pkt {
                                 buf: PktBuf::Bytes(buf),
                                 len: n,
                                 seq: sv,
-                                ts_nanos: ts,
+                                ts_nanos: rx_ts.nanos,
                                 chan: chan_id,
-                                _ts_kind: TsKind::Sw,
+                                _ts_kind: rx_ts.kind,
                                 merge_emit_ns: 0,
                             };
-                            if let Err(_full) = q_out.push(pkt) {
-                                dropped += 1;
-                                metrics::inc_rx_drop(chan_name);
-                                if dropped % 10_000 == 1 {
-                                    debug!("{}_rx: queue full, dropped={}", chan_name, dropped);
-                                }
-                            } else {
-                                metrics::inc_rx(chan_name, n);
-                            }
+                            push_or_recycle(chan_name, &q_out, &pool, pkt, n, &mut dropped);
                         } else {
                             pool.put(buf);
                         }
                     }
                     // Return unused buffers to pool
-                    for j in count..batch {
-                        let b = std::mem::take(&mut bufs[j]);
+                    for buf in bufs.iter_mut().take(batch).skip(count) {
+                        let b = std::mem::take(buf);
                         if b.capacity() > 0 {
                             pool.put(b);
                         }
                     }
                 } else {
                     // ret == 0 unlikely for DONTWAIT but handle conservatively
+                    recycle_prepared_buffers(&mut bufs, &pool);
                 }
             }
         } else {
@@ -199,63 +211,7 @@ pub fn rx_loop(
                 let res_len_ts = if !ts_off {
                     #[cfg(target_os = "linux")]
                     {
-                        let mut iov = [IoSliceMut::new(dst)];
-                        let mut cmsg_buf = nix::cmsg_space!([libc::timespec; 3]);
-                        match recvmsg(fd, &mut iov, Some(&mut cmsg_buf), MsgFlags::MSG_DONTWAIT) {
-                            Ok(msg) => {
-                                let mut ts_nanos: u64 = 0;
-                                let mut kind = TsKind::Sw;
-                                for c in msg.cmsgs() {
-                                    match c {
-                                        ControlMessageOwned::ScmTimestampns(ts) => {
-                                            ts_nanos = (ts.tv_sec() as u64) * 1_000_000_000
-                                                + (ts.tv_nsec() as u64);
-                                            kind = TsKind::Sw;
-                                        }
-                                        ControlMessageOwned::ScmTimestamping(tss) => {
-                                            let pick = tss
-                                                .iter()
-                                                .rev()
-                                                .find(|t| t.tv_sec() != 0 || t.tv_nsec() != 0)
-                                                .copied();
-                                            if let Some(tv) = pick {
-                                                ts_nanos = (tv.tv_sec() as u64) * 1_000_000_000
-                                                    + (tv.tv_nsec() as u64);
-                                                kind = match ts_mode.as_ref() {
-                                                    Some(crate::config::TimestampingMode::HardwareRaw) => TsKind::HwRaw,
-                                                    Some(crate::config::TimestampingMode::Hardware) => TsKind::HwSys,
-                                                    _ => TsKind::HwSys,
-                                                };
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                if ts_nanos == 0 {
-                                    // Fallback only if timestamp not present; cache once per loop
-                                    let fallback = if let Some(v) = loop_now_cache {
-                                        v
-                                    } else {
-                                        let v = now_nanos();
-                                        loop_now_cache = Some(v);
-                                        v
-                                    };
-                                    if msg.bytes > 0 {
-                                        Ok((msg.bytes, fallback, TsKind::Sw))
-                                    } else {
-                                        Err(Errno::EAGAIN)
-                                    }
-                                } else {
-                                    if msg.bytes > 0 {
-                                        Ok((msg.bytes, ts_nanos, kind))
-                                    } else {
-                                        Err(Errno::EAGAIN)
-                                    }
-                                }
-                            }
-                            Err(nix::Error::Sys(e)) => Err(e),
-                            Err(_) => Err(Errno::EAGAIN),
-                        }
+                        recvmsg_one(fd, dst, &mut loop_now_cache)
                     }
                     #[cfg(not(target_os = "linux"))]
                     {
@@ -305,15 +261,7 @@ pub fn rx_loop(
                                 _ts_kind: kind,
                                 merge_emit_ns: 0,
                             };
-                            if let Err(_full) = q_out.push(pkt) {
-                                dropped += 1;
-                                metrics::inc_rx_drop(chan_name);
-                                if dropped % 10_000 == 1 {
-                                    debug!("{}_rx: queue full, dropped={}", chan_name, dropped);
-                                }
-                            } else {
-                                metrics::inc_rx(chan_name, n);
-                            }
+                            push_or_recycle(chan_name, &q_out, &pool, pkt, n, &mut dropped);
                         } else {
                             pool.put(buf);
                         }
@@ -322,8 +270,10 @@ pub fn rx_loop(
                     Err(err) => {
                         if err == Errno::EAGAIN || err == Errno::EWOULDBLOCK || err == Errno::EINTR
                         {
+                            pool.put(buf);
                             break;
                         } else {
+                            pool.put(buf);
                             return Err(anyhow::anyhow!(
                                 "recv error: {}",
                                 std::io::Error::from(err)
@@ -349,4 +299,360 @@ pub fn rx_loop(
     Ok(())
 }
 
-// Removed unused legacy adapter `rx_loop_compat`. If needed, reintroduce via a small wrapper.
+#[inline]
+pub(crate) fn push_or_recycle(
+    chan_name: &str,
+    q_out: &SpscQueue<Pkt>,
+    pool: &PacketPool,
+    pkt: Pkt,
+    nbytes: usize,
+    dropped: &mut u64,
+) -> bool {
+    match q_out.push(pkt) {
+        Ok(()) => {
+            metrics::inc_rx(chan_name, nbytes);
+            true
+        }
+        Err(pkt) => {
+            pkt.recycle(pool);
+            *dropped = dropped.saturating_add(1);
+            metrics::inc_rx_drop(chan_name);
+            if *dropped % 10_000 == 1 {
+                debug!("{}_rx: queue full, dropped={}", chan_name, *dropped);
+            }
+            false
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recycle_prepared_buffers(bufs: &mut [BytesMut], pool: &PacketPool) {
+    for buf in bufs {
+        let b = std::mem::take(buf);
+        if b.capacity() > 0 {
+            pool.put(b);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RxTimestamp {
+    nanos: u64,
+    kind: TsKind,
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn cached_now(cache: &mut Option<u64>) -> u64 {
+    if let Some(v) = *cache {
+        v
+    } else {
+        let v = now_nanos();
+        *cache = Some(v);
+        v
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn packet_timestamp(hdr: Option<&libc::msghdr>, cache: &mut Option<u64>) -> RxTimestamp {
+    if let Some(hdr) = hdr {
+        if let Some(ts) = unsafe { timestamp_from_cmsgs(hdr) } {
+            return ts;
+        }
+    }
+
+    RxTimestamp {
+        nanos: cached_now(cache),
+        kind: TsKind::Sw,
+    }
+}
+
+#[cfg(target_os = "linux")]
+const TIMESTAMP_CMSG_SPACE: usize = unsafe {
+    libc::CMSG_SPACE(std::mem::size_of::<[libc::timespec; 3]>() as libc::c_uint) as usize
+};
+
+#[cfg(target_os = "linux")]
+#[repr(C, align(16))]
+struct TimestampCmsgBuffer {
+    bytes: [u8; TIMESTAMP_CMSG_SPACE],
+}
+
+#[cfg(target_os = "linux")]
+impl TimestampCmsgBuffer {
+    fn new() -> Self {
+        Self {
+            bytes: [0; TIMESTAMP_CMSG_SPACE],
+        }
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.bytes.as_mut_ptr()
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn recvmsg_one(
+    fd: libc::c_int,
+    dst: &mut [u8],
+    cache: &mut Option<u64>,
+) -> Result<(usize, u64, TsKind), Errno> {
+    let mut iov = libc::iovec {
+        iov_base: dst.as_mut_ptr() as *mut libc::c_void,
+        iov_len: dst.len(),
+    };
+    let mut cmsg = TimestampCmsgBuffer::new();
+    let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    hdr.msg_iov = &mut iov as *mut libc::iovec;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+    hdr.msg_controllen = cmsg.len();
+
+    let n = unsafe { libc::recvmsg(fd, &mut hdr, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(Errno::last());
+    }
+    if n == 0 {
+        return Err(Errno::EAGAIN);
+    }
+
+    let ts = packet_timestamp(Some(&hdr), cache);
+    Ok((n as usize, ts.nanos, ts.kind))
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn timestamp_from_cmsgs(hdr: &libc::msghdr) -> Option<RxTimestamp> {
+    if hdr.msg_controllen == 0 || (hdr.msg_flags & libc::MSG_CTRUNC) != 0 {
+        return None;
+    }
+
+    let hdr_ptr = hdr as *const libc::msghdr;
+    let mut cmsg = libc::CMSG_FIRSTHDR(hdr_ptr);
+    while !cmsg.is_null() {
+        let level = (*cmsg).cmsg_level;
+        let ty = (*cmsg).cmsg_type;
+        if level == libc::SOL_SOCKET && ty == libc::SCM_TIMESTAMPNS {
+            if cmsg_has_payload(cmsg, std::mem::size_of::<libc::timespec>()) {
+                let tv = (libc::CMSG_DATA(cmsg) as *const libc::timespec).read_unaligned();
+                if let Some(nanos) = timespec_to_nanos(tv) {
+                    return Some(RxTimestamp {
+                        nanos,
+                        kind: TsKind::Sw,
+                    });
+                }
+            }
+        } else if level == libc::SOL_SOCKET
+            && ty == libc::SCM_TIMESTAMPING
+            && cmsg_has_payload(cmsg, std::mem::size_of::<[libc::timespec; 3]>())
+        {
+            let tv = libc::CMSG_DATA(cmsg) as *const libc::timespec;
+            for idx in (0..3).rev() {
+                let current = tv.add(idx).read_unaligned();
+                if let Some(nanos) = timespec_to_nanos(current) {
+                    let kind = match idx {
+                        2 => TsKind::HwRaw,
+                        1 => TsKind::HwSys,
+                        _ => TsKind::Sw,
+                    };
+                    return Some(RxTimestamp { nanos, kind });
+                }
+            }
+        }
+        cmsg = libc::CMSG_NXTHDR(hdr_ptr, cmsg);
+    }
+
+    None
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+unsafe fn cmsg_has_payload(cmsg: *const libc::cmsghdr, payload_len: usize) -> bool {
+    let required = libc::CMSG_LEN(payload_len as libc::c_uint) as usize;
+    (*cmsg).cmsg_len >= required
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn timespec_to_nanos(tv: libc::timespec) -> Option<u64> {
+    if tv.tv_sec < 0 || tv.tv_nsec < 0 {
+        return None;
+    }
+    let nanos = (tv.tv_sec as u64)
+        .checked_mul(1_000_000_000)?
+        .checked_add(tv.tv_nsec as u64)?;
+    (nanos != 0).then_some(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    fn pkt_from_pool(pool: &PacketPool, seq: u64) -> Pkt {
+        Pkt {
+            buf: PktBuf::Bytes(pool.get()),
+            len: 0,
+            seq,
+            ts_nanos: 0,
+            chan: b'A',
+            _ts_kind: TsKind::Sw,
+            merge_emit_ns: 0,
+        }
+    }
+
+    fn dummy_pkt(seq: u64) -> Pkt {
+        Pkt {
+            buf: PktBuf::Bytes(BytesMut::new()),
+            len: 0,
+            seq,
+            ts_nanos: 0,
+            chan: b'A',
+            _ts_kind: TsKind::Sw,
+            merge_emit_ns: 0,
+        }
+    }
+
+    #[test]
+    fn queue_full_recycles_rejected_packet_buffer() {
+        let pool = PacketPool::new(1, 64).unwrap();
+        let q = SpscQueue::new(2);
+        q.push(dummy_pkt(1)).unwrap();
+        q.push(dummy_pkt(2)).unwrap();
+
+        let pkt = pkt_from_pool(&pool, 3);
+        assert_eq!(pool.available(), 0);
+
+        let mut dropped = 0;
+        assert!(!push_or_recycle("A", &q, &pool, pkt, 0, &mut dropped));
+
+        assert_eq!(dropped, 1);
+        assert_eq!(pool.available(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_recvmmsg_buffers_are_recycled_on_no_progress() {
+        let pool = PacketPool::new(3, 64).unwrap();
+        let mut bufs = vec![pool.get(), pool.get(), pool.get()];
+        assert_eq!(pool.available(), 0);
+
+        recycle_prepared_buffers(&mut bufs, &pool);
+
+        assert_eq!(pool.available(), 3);
+        assert!(bufs.iter().all(|buf| buf.capacity() == 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timestamping_cmsg_uses_actual_timestamp_slot_kind() {
+        let tss = [
+            libc::timespec {
+                tv_sec: 11,
+                tv_nsec: 7,
+            },
+            libc::timespec {
+                tv_sec: 12,
+                tv_nsec: 8,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        ];
+        let ts = timestamp_from_test_cmsg(libc::SCM_TIMESTAMPING, &tss).unwrap();
+
+        assert_eq!(ts.kind, TsKind::HwSys);
+        assert_eq!(ts.nanos, 12_000_000_008);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timestamping_cmsg_uses_software_when_hardware_slots_are_empty() {
+        let tss = [
+            libc::timespec {
+                tv_sec: 11,
+                tv_nsec: 7,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        ];
+        let ts = timestamp_from_test_cmsg(libc::SCM_TIMESTAMPING, &tss).unwrap();
+
+        assert_eq!(ts.kind, TsKind::Sw);
+        assert_eq!(ts.nanos, 11_000_000_007);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timestampns_cmsg_reports_software_timestamp() {
+        let ts = libc::timespec {
+            tv_sec: 13,
+            tv_nsec: 9,
+        };
+        let parsed = timestampns_from_test_cmsg(ts).unwrap();
+
+        assert_eq!(parsed.kind, TsKind::Sw);
+        assert_eq!(parsed.nanos, 13_000_000_009);
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe fn empty_msghdr_for_cmsg(buf: &mut TimestampCmsgBuffer) -> libc::msghdr {
+        let mut hdr: libc::msghdr = std::mem::zeroed();
+        hdr.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+        hdr.msg_controllen = buf.len();
+        hdr
+    }
+
+    #[cfg(target_os = "linux")]
+    fn timestamp_from_test_cmsg(
+        cmsg_type: libc::c_int,
+        tss: &[libc::timespec; 3],
+    ) -> Option<RxTimestamp> {
+        let mut buf = TimestampCmsgBuffer::new();
+        let mut hdr = unsafe { empty_msghdr_for_cmsg(&mut buf) };
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = cmsg_type;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<[libc::timespec; 3]>() as libc::c_uint) as usize;
+            std::ptr::copy_nonoverlapping(
+                tss.as_ptr(),
+                libc::CMSG_DATA(cmsg) as *mut libc::timespec,
+                3,
+            );
+            hdr.msg_controllen = (*cmsg).cmsg_len;
+            timestamp_from_cmsgs(&hdr)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn timestampns_from_test_cmsg(ts: libc::timespec) -> Option<RxTimestamp> {
+        let mut buf = TimestampCmsgBuffer::new();
+        let mut hdr = unsafe { empty_msghdr_for_cmsg(&mut buf) };
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_TIMESTAMPNS;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN(std::mem::size_of::<libc::timespec>() as libc::c_uint) as usize;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::timespec, ts);
+            hdr.msg_controllen = (*cmsg).cmsg_len;
+            timestamp_from_cmsgs(&hdr)
+        }
+    }
+}

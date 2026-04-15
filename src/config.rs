@@ -81,10 +81,9 @@ pub struct ChannelCfg {
     pub port: u16,            // e.g., 5001
     pub iface_addr: Ipv4Addr, // local interface IPv4 of the NIC to join on
     pub reuse_port: bool,
-    pub recv_buffer_bytes: u32, // e.g., 64<<20
-    #[allow(dead_code)]
+    pub recv_buffer_bytes: u32,    // e.g., 64<<20
     pub busy_poll_us: Option<u32>, // Linux SO_BUSY_POLL (optional)
-    pub nonblocking: bool,      // true for busy-spin recv path
+    pub nonblocking: bool,         // true for busy-spin recv path
     #[serde(default)]
     pub timestamping: Option<TimestampingMode>, // default Off
     #[serde(default)]
@@ -274,8 +273,6 @@ impl AppConfig {
         if self.general.max_packet_size < 512 || self.general.max_packet_size > 65535 {
             anyhow::bail!("general.max_packet_size must be in [512, 65535]");
         }
-        // Touch optional logging flag to ensure it's validated across minimal binaries
-        let _ = self.general.json_logs;
         if self.merge.reorder_window == 0 {
             anyhow::bail!("merge.reorder_window must be > 0");
         }
@@ -292,7 +289,6 @@ impl AppConfig {
         if self.book.snapshot_interval_ms == 0 {
             anyhow::bail!("book.snapshot_interval_ms must be > 0");
         }
-        let _ = self.book.consume_trades;
         if self.book.default_tick <= 0 {
             anyhow::bail!("book.default_tick must be > 0");
         }
@@ -345,7 +341,6 @@ impl AppConfig {
                 if obo.client_max_connections == 0 {
                     anyhow::bail!("feeds.obo.client_max_connections must be > 0");
                 }
-                let _ = obo.enabled; // ensure field considered
             }
         }
         // Snapshot cfg
@@ -353,30 +348,25 @@ impl AppConfig {
             if s.path.trim().is_empty() {
                 anyhow::bail!("snapshot.path must be non-empty when snapshot is configured");
             }
-            let _ = s.load_on_start;
-            let _ = s.enable_writer;
         }
         if let Some(ref j) = self.journal {
             if j.enable_writer && j.path.trim().is_empty() {
                 anyhow::bail!("journal.path must be non-empty when journal writer is enabled");
             }
-            let _ = j.record_state_hash;
         }
         // Recovery cfg
         if let Some(ref r) = self.recovery {
             if r.enable_injector && (r.endpoint.trim().is_empty() || !r.endpoint.contains(':')) {
                 anyhow::bail!("recovery.endpoint must be host:port when enable_injector = true");
             }
-            let _ = r.backlog_path; // read to avoid unused warning in minimal builds
+            if let Some(ref path) = r.backlog_path {
+                if path.trim().is_empty() {
+                    anyhow::bail!("recovery.backlog_path must be non-empty if set");
+                }
+            }
             if r.retry_attempts == Some(0) {
                 anyhow::bail!("recovery.retry_attempts must be > 0 if set");
             }
-            let _ = r.retry_backoff_ms;
-            let _ = r.min_request_interval_ms;
-            let _ = r.slo_ms;
-            let _ = r.unrecoverable_policy;
-            let _ = r.request_timeout_ms;
-            let _ = r.replay_protocol;
         }
         // AF_XDP cfg (if present)
         if let Some(ref a) = self.afxdp {
@@ -388,12 +378,16 @@ impl AppConfig {
             if a.ifname.trim().is_empty() {
                 anyhow::bail!("afxdp.ifname must be non-empty if afxdp is configured");
             }
-            let _ = a.queues;
+            if a.queues == Some(0) {
+                anyhow::bail!("afxdp.queues must be > 0 if set");
+            }
         }
         if let Some(ref p) = self.packet_mmap {
-            let _ = p.enable;
             if p.ifname.trim().is_empty() {
                 anyhow::bail!("packet_mmap.ifname must be non-empty if packet_mmap is configured");
+            }
+            if p.queues == Some(0) {
+                anyhow::bail!("packet_mmap.queues must be > 0 if set");
             }
             if p.frame_size < 2048 || !p.frame_size.is_power_of_two() {
                 anyhow::bail!("packet_mmap.frame_size must be a power of two and at least 2048");
@@ -404,15 +398,12 @@ impl AppConfig {
             if p.block_count == 0 {
                 anyhow::bail!("packet_mmap.block_count must be > 0");
             }
-            let _ = p
-                .frame_size
+            p.frame_size
                 .checked_mul(p.frames_per_block)
                 .ok_or_else(|| anyhow::anyhow!("packet_mmap block size overflow"))?;
-            let _ = p
-                .frames_per_block
+            p.frames_per_block
                 .checked_mul(p.block_count)
                 .ok_or_else(|| anyhow::anyhow!("packet_mmap frame count overflow"))?;
-            let _ = p.queues;
         }
         if self.afxdp.as_ref().map(|c| c.enable).unwrap_or(false)
             && self.packet_mmap.as_ref().map(|c| c.enable).unwrap_or(false)

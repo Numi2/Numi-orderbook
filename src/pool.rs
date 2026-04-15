@@ -53,10 +53,14 @@ impl PacketPool {
             crate::metrics::inc_packet_pool_return_drop();
         }
     }
+
+    #[inline]
+    pub fn available(&self) -> usize {
+        self.inner.len()
+    }
 }
 
 #[repr(u8)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TsKind {
     None = 0,

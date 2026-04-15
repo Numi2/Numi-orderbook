@@ -65,6 +65,11 @@ impl<T> SpscQueue<T> {
         head.wrapping_sub(tail)
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Attempt to push with bounded spinning/yielding before giving up.
     #[inline]
     pub fn push_with_backoff(&self, mut value: T, max_spins: u32) -> Result<(), T> {

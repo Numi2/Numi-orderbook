@@ -364,34 +364,50 @@ mod tests {
         seqs
     }
 
-    fn spawn_merge_fixture(
+    struct MergeFixture {
         q_a: Arc<SpscQueue<Pkt>>,
         q_b: Arc<SpscQueue<Pkt>>,
         q_out: Arc<SpscQueue<Pkt>>,
         shutdown: Arc<crate::util::BarrierFlag>,
         recovery: Option<RecoveryClient>,
         q_recovery: Option<Arc<SpscQueue<Pkt>>>,
-        reorder_window: u64,
-        adaptive: bool,
-        reorder_window_max: u64,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            let cfg = MergeConfig {
+        cfg: MergeConfig,
+    }
+
+    fn merge_fixture(
+        q_a: Arc<SpscQueue<Pkt>>,
+        q_b: Arc<SpscQueue<Pkt>>,
+        q_out: Arc<SpscQueue<Pkt>>,
+        shutdown: Arc<crate::util::BarrierFlag>,
+    ) -> MergeFixture {
+        MergeFixture {
+            q_a,
+            q_b,
+            q_out,
+            shutdown,
+            recovery: None,
+            q_recovery: None,
+            cfg: MergeConfig {
                 next_seq: 1,
-                reorder_window,
+                reorder_window: 4,
                 max_pending: 64,
                 dwell_ns: 0,
-                adaptive,
-                reorder_window_max,
-            };
+                adaptive: false,
+                reorder_window_max: 8,
+            },
+        }
+    }
+
+    fn spawn_merge_fixture(fixture: MergeFixture) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
             let _ = merge_loop(
-                vec![q_a],
-                vec![q_b],
-                q_out,
-                cfg,
-                shutdown,
-                recovery,
-                q_recovery,
+                vec![fixture.q_a],
+                vec![fixture.q_b],
+                fixture.q_out,
+                fixture.cfg,
+                fixture.shutdown,
+                fixture.recovery,
+                fixture.q_recovery,
             );
         })
     }
@@ -403,17 +419,12 @@ mod tests {
         let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
         let shutdown = Arc::new(crate::util::BarrierFlag::default());
 
-        let t = spawn_merge_fixture(
+        let t = spawn_merge_fixture(merge_fixture(
             q_a.clone(),
             q_b.clone(),
             q_out.clone(),
             shutdown.clone(),
-            None,
-            None,
-            4,
-            false,
-            8,
-        );
+        ));
 
         // Feed out-of-order within window and duplicates across channels
         let _ = q_a.push(pkt(1, b'A'));
@@ -424,7 +435,7 @@ mod tests {
 
         let seqs = collect_until(&q_out, 4);
         shutdown.raise();
-        let _ = t.join();
+        assert!(t.join().is_ok());
 
         assert_eq!(seqs, vec![1, 2, 3, 4]);
     }
@@ -436,17 +447,12 @@ mod tests {
         let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
         let shutdown = Arc::new(crate::util::BarrierFlag::default());
 
-        let t = spawn_merge_fixture(
+        let t = spawn_merge_fixture(merge_fixture(
             q_a.clone(),
             q_b.clone(),
             q_out.clone(),
             shutdown.clone(),
-            None,
-            None,
-            4,
-            false,
-            8,
-        );
+        ));
 
         let _ = q_a.push(pkt(1, b'A'));
         let _ = q_b.push(pkt(1, b'B'));
@@ -456,7 +462,7 @@ mod tests {
 
         let seqs = collect_until(&q_out, 4);
         shutdown.raise();
-        let _ = t.join();
+        assert!(t.join().is_ok());
 
         assert_eq!(seqs, vec![1, 2, 3, 4]);
     }
@@ -469,17 +475,11 @@ mod tests {
         let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
         let shutdown = Arc::new(crate::util::BarrierFlag::default());
 
-        let t = spawn_merge_fixture(
-            q_a.clone(),
-            q_b.clone(),
-            q_out.clone(),
-            shutdown.clone(),
-            None,
-            Some(q_rec.clone()),
-            2,
-            false,
-            4,
-        );
+        let mut fixture = merge_fixture(q_a.clone(), q_b.clone(), q_out.clone(), shutdown.clone());
+        fixture.q_recovery = Some(q_rec.clone());
+        fixture.cfg.reorder_window = 2;
+        fixture.cfg.reorder_window_max = 4;
+        let t = spawn_merge_fixture(fixture);
 
         let _ = q_a.push(pkt(1, b'A'));
         let first = collect_until(&q_out, 1);
@@ -493,7 +493,7 @@ mod tests {
 
         let seqs = collect_until(&q_out, 4);
         shutdown.raise();
-        let _ = t.join();
+        assert!(t.join().is_ok());
 
         assert_eq!(seqs, vec![2, 3, 4, 5]);
     }
@@ -507,17 +507,11 @@ mod tests {
         let recovery = Arc::new(RecordingRecovery::default());
         let recovery_client: RecoveryClient = recovery.clone();
 
-        let t = spawn_merge_fixture(
-            q_a.clone(),
-            q_b.clone(),
-            q_out.clone(),
-            shutdown.clone(),
-            Some(recovery_client),
-            None,
-            2,
-            false,
-            4,
-        );
+        let mut fixture = merge_fixture(q_a.clone(), q_b.clone(), q_out.clone(), shutdown.clone());
+        fixture.recovery = Some(recovery_client);
+        fixture.cfg.reorder_window = 2;
+        fixture.cfg.reorder_window_max = 4;
+        let t = spawn_merge_fixture(fixture);
 
         let _ = q_a.push(pkt(1, b'A'));
         let first = collect_until(&q_out, 1);
@@ -529,7 +523,7 @@ mod tests {
             crate::util::spin_wait(1000);
         }
         shutdown.raise();
-        let _ = t.join();
+        assert!(t.join().is_ok());
 
         assert_eq!(recovery.gaps.lock().unwrap().as_slice(), &[(2, 4)]);
     }
@@ -541,17 +535,11 @@ mod tests {
         let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
         let shutdown = Arc::new(crate::util::BarrierFlag::default());
 
-        let t = spawn_merge_fixture(
-            q_a.clone(),
-            q_b.clone(),
-            q_out.clone(),
-            shutdown.clone(),
-            None,
-            None,
-            8,
-            true,
-            64,
-        );
+        let mut fixture = merge_fixture(q_a.clone(), q_b.clone(), q_out.clone(), shutdown.clone());
+        fixture.cfg.reorder_window = 8;
+        fixture.cfg.adaptive = true;
+        fixture.cfg.reorder_window_max = 64;
+        let t = spawn_merge_fixture(fixture);
 
         let _ = q_a.push(pkt(1, b'A'));
         for seq in 3..=10 {
@@ -561,7 +549,7 @@ mod tests {
 
         let seqs = collect_until(&q_out, 10);
         shutdown.raise();
-        let _ = t.join();
+        assert!(t.join().is_ok());
 
         assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
     }

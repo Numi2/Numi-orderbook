@@ -3,6 +3,52 @@
 All notable changes to this project will be documented in this file.
 This project loosely follows the Keep a Changelog format.
 
+- 2026-04-15
+
+### Changed
+- Split the application into a reusable library plus binaries so benchmarks,
+  ingest tools, soak tools, and tests all use the same production modules.
+- Replaced duplicate path-based module copies in binaries with library imports.
+- UDP receive now keeps Linux `recvmmsg` enabled for timestamped channels by
+  preallocating per-message ancillary-data buffers and parsing
+  `SCM_TIMESTAMPNS` / `SCM_TIMESTAMPING` from each returned `mmsghdr`.
+- Timestamp kind classification now follows the actual kernel timestamp slot:
+  software, system-hardware, or raw-hardware.
+- Socket setup now fails fast when requested production options cannot be
+  applied, including reuse flags, receive-buffer sizing, busy poll, and Linux RX
+  timestamping.
+- Allocator feature flags now map to real optional dependencies; jemalloc is
+  preferred on Linux when both allocator features are enabled, and mimalloc
+  remains available elsewhere.
+- Public repository files now use conventional names: `Cargo.toml`, `README.md`,
+  and `CHANGELOG.md`.
+- Docker builds now use the current Rust toolchain, `--locked` dependency
+  resolution, and a reduced build context.
+- The README has been rewritten around scope, architecture, platform support,
+  validation, configuration, operations, and repository layout.
+
+### Fixed
+- RX queue-full drops recycle rejected packet buffers instead of leaking pooled
+  backing allocations under backpressure.
+- UDP `recvmmsg` no-progress and fatal-error paths recycle every prepared batch
+  buffer before sleeping or returning an error.
+- UDP `recv` / `recvmsg` transient and fatal-error paths return checked-out
+  packet buffers before retrying or exiting.
+- PACKET_MMAP queue-full drops recycle copied packet buffers before releasing
+  kernel frames.
+- Removed dead-code allowances, obsolete private helpers, and unimplemented
+  feature wiring instead of hiding them behind warning suppressions.
+
+### Validation
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `RUSTFLAGS='' cargo check --target x86_64-unknown-linux-gnu --all-targets`
+- `RUSTFLAGS='' cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings`
+- `cargo test --all-features`
+- `cargo build --release`
+- `cargo run --release --bin pool_soak -- 65536 2048 10000 64`
+- `cargo run --release --bin bench_orderbook -- 64 10000 64`
+- `docker build -t numi-orderbook:local .`
+
 - 2025-11-01
 
 ### Added
@@ -22,7 +68,7 @@ This project loosely follows the Keep a Changelog format.
   - `src/bin/ws_client.rs` (dual-endpoint first-arrival dedupe demo)
 - Documentation
   - `docs/obo_raw_v1.md` (wire format + API)
-  - `readme.md` updated with feed overview
+  - `README.md` updated with feed overview
 
 ### Added (performance & tooling)
 - OrderBook batch APIs: `apply_many(&[Event])` and `apply_many_for_instr(instr, &[Event])` to amortize lookups and reuse hot structures.
@@ -37,7 +83,7 @@ This project loosely follows the Keep a Changelog format.
 - `ws_server.rs`: sends GAP control with range payload; improved Authorization parsing
 - `metrics.rs`: added outbound counters/gauges
 - `main.rs`: wired publishers and A/B WebSocket endpoints
-- `cargo.toml`: added dependencies (`tungstenite`, `url`), introduced feature flags (`ws`, `obo`)
+- `Cargo.toml`: added dependencies (`tungstenite`, `url`), introduced feature flags (`ws`, `obo`)
 
 ### Changed (low-latency optimizations)
 - RX path switched to single-producer/single-consumer queues: migrated from `crossbeam::ArrayQueue` to an internal `SpscQueue` for strictly 1P/1C paths; updated `main.rs` wiring to per-worker SPSC lists.

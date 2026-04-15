@@ -1,42 +1,7 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-#[path = "../pool.rs"]
-mod pool;
-
-mod metrics {
-    use super::{AtomicU64, AtomicUsize, Ordering};
-
-    static POOL_MISSES: AtomicU64 = AtomicU64::new(0);
-    static POOL_RETURN_DROPS: AtomicU64 = AtomicU64::new(0);
-    static POOL_PREALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-    pub fn inc_packet_pool_miss() {
-        POOL_MISSES.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_packet_pool_return_drop() {
-        POOL_RETURN_DROPS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn set_packet_pool_preallocated_bytes(n: usize) {
-        POOL_PREALLOC_BYTES.store(n, Ordering::Relaxed);
-    }
-
-    pub fn packet_pool_misses() -> u64 {
-        POOL_MISSES.load(Ordering::Relaxed)
-    }
-
-    pub fn packet_pool_return_drops() -> u64 {
-        POOL_RETURN_DROPS.load(Ordering::Relaxed)
-    }
-
-    pub fn packet_pool_preallocated_bytes() -> usize {
-        POOL_PREALLOC_BYTES.load(Ordering::Relaxed)
-    }
-}
-
-use pool::PacketPool;
+use orderbook::metrics;
+use orderbook::pool::PacketPool;
 
 fn parse_arg_usize(args: &[String], idx: usize, default: usize) -> usize {
     args.get(idx)

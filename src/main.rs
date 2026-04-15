@@ -1,39 +1,15 @@
-// src/main.rs (updated: integrate metrics, snapshot, recovery)
-mod alloc;
-mod codec_raw;
-mod config;
-mod decode;
-mod decoder_eobi;
-mod decoder_fast;
-mod decoder_itch;
-mod decoder_schema;
-mod journal;
-mod merge;
-mod metrics;
-mod net;
-mod obo;
-mod orderbook;
-mod parser;
-mod pool;
-mod pubsub;
-mod recovery;
-mod refdata;
-mod rx;
-mod rx_packet_mmap;
-mod snapshot;
-mod spsc;
-mod util;
-mod ws_server;
-
-use crate::config::AppConfig;
-use crate::decode::decode_loop;
-use crate::merge::merge_loop;
-use crate::parser::{build_parser, SeqCfg};
-use crate::pool::PacketPool;
-use crate::rx::rx_loop;
-use crate::util::{lock_all_memory_if, pin_to_core_if_set, set_realtime_priority_if, BarrierFlag};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use log::{error, info};
+use orderbook::config::AppConfig;
+use orderbook::decode::decode_loop;
+use orderbook::merge::merge_loop;
+use orderbook::parser::{build_parser, SeqCfg};
+use orderbook::pool::PacketPool;
+use orderbook::rx::rx_loop;
+use orderbook::util::{
+    lock_all_memory_if, pin_to_core_if_set, set_realtime_priority_if, BarrierFlag,
+};
+use orderbook::{metrics, net, pubsub, recovery, refdata, rx_packet_mmap, snapshot, ws_server};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -83,12 +59,12 @@ fn main() -> anyhow::Result<()> {
     // NUMA advisories for PACKET_MMAP path: ensure threads/cores align to NIC node
     if let Some(pm) = &cfg.packet_mmap {
         if pm.enable {
-            let node = crate::util::iface_numa_node(&pm.ifname);
+            let node = orderbook::util::iface_numa_node(&pm.ifname);
             if let Some(n) = node {
-                if let Some(list) = crate::util::node_cpulist(n) {
+                if let Some(list) = orderbook::util::node_cpulist(n) {
                     let check = |name: &str, core: Option<usize>| {
                         if let Some(c) = core {
-                            if !crate::util::cpulist_contains(&list, c) {
+                            if !orderbook::util::cpulist_contains(&list, c) {
                                 log::warn!(
                                     "NUMA: core {} for {} not in NIC node {} cpulist {}",
                                     c,
@@ -137,21 +113,21 @@ fn main() -> anyhow::Result<()> {
         cfg.channels.a.workers.unwrap_or(1).max(1)
     };
     let b_workers = cfg.channels.b.workers.unwrap_or(1).max(1);
-    let mut q_rx_a_list: Vec<Arc<crate::spsc::SpscQueue<crate::pool::Pkt>>> =
+    let mut q_rx_a_list: Vec<Arc<orderbook::spsc::SpscQueue<orderbook::pool::Pkt>>> =
         Vec::with_capacity(a_workers);
-    let mut q_rx_b_list: Vec<Arc<crate::spsc::SpscQueue<crate::pool::Pkt>>> =
+    let mut q_rx_b_list: Vec<Arc<orderbook::spsc::SpscQueue<orderbook::pool::Pkt>>> =
         Vec::with_capacity(b_workers);
     for _ in 0..a_workers {
-        q_rx_a_list.push(Arc::new(crate::spsc::SpscQueue::new(
+        q_rx_a_list.push(Arc::new(orderbook::spsc::SpscQueue::new(
             cfg.general.rx_queue_capacity,
         )));
     }
     for _ in 0..b_workers {
-        q_rx_b_list.push(Arc::new(crate::spsc::SpscQueue::new(
+        q_rx_b_list.push(Arc::new(orderbook::spsc::SpscQueue::new(
             cfg.general.rx_queue_capacity,
         )));
     }
-    let q_merged = Arc::new(crate::spsc::SpscQueue::new(
+    let q_merged = Arc::new(orderbook::spsc::SpscQueue::new(
         cfg.general.merge_queue_capacity,
     ));
 
@@ -233,10 +209,10 @@ fn main() -> anyhow::Result<()> {
     let (recovery_client, recovery_handle, q_recovery_opt): (
         recovery::RecoveryClient,
         recovery::RecoveryHandle,
-        Option<Arc<crate::spsc::SpscQueue<crate::pool::Pkt>>>,
+        Option<Arc<orderbook::spsc::SpscQueue<orderbook::pool::Pkt>>>,
     ) = if let Some(rcfg) = &cfg.recovery {
         if rcfg.enable_injector {
-            let q_recovery = Arc::new(crate::spsc::SpscQueue::new(
+            let q_recovery = Arc::new(orderbook::spsc::SpscQueue::new(
                 cfg.general.merge_queue_capacity,
             ));
             let (cli, handle) = recovery::spawn_tcp_injector(
@@ -287,7 +263,7 @@ fn main() -> anyhow::Result<()> {
             };
             let name = format!("packet-mmap-A-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
-                crate::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
+                orderbook::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
                 if let Err(e) = rx_packet_mmap::packet_mmap_loop(
                     &ifn,
@@ -306,8 +282,10 @@ fn main() -> anyhow::Result<()> {
         thread::Builder::new()
             .name("rx-A-join".into())
             .spawn(move || {
-                for j in joins {
-                    let _ = j.join();
+                for (idx, j) in joins.into_iter().enumerate() {
+                    if j.join().is_err() {
+                        error!("packet-mmap-A worker {idx} panicked");
+                    }
                 }
             })?
     } else {
@@ -321,7 +299,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = cfg.clone();
             let name = format!("rx-A-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
-                crate::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
+                orderbook::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
                 if let Err(e) = rx_loop(
                     "A",
@@ -330,7 +308,7 @@ fn main() -> anyhow::Result<()> {
                     q_ai,
                     pool_ai,
                     rx_a_shutdown_i,
-                    crate::rx::RxConfig {
+                    orderbook::rx::RxConfig {
                         spin_loops_per_yield: cfg.general.spin_loops_per_yield,
                         rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfg.channels.a.timestamping.clone(),
@@ -345,8 +323,10 @@ fn main() -> anyhow::Result<()> {
         thread::Builder::new()
             .name("rx-A-join".into())
             .spawn(move || {
-                for j in joins {
-                    let _ = j.join();
+                for (idx, j) in joins.into_iter().enumerate() {
+                    if j.join().is_err() {
+                        error!("rx-A worker {idx} panicked");
+                    }
                 }
             })?
     };
@@ -361,7 +341,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = cfg.clone();
             let name = format!("rx-B-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
-                crate::util::pin_to_core_with_offset(cfg.cpu.b_rx_core, i);
+                orderbook::util::pin_to_core_with_offset(cfg.cpu.b_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
                 if let Err(e) = rx_loop(
                     "B",
@@ -370,7 +350,7 @@ fn main() -> anyhow::Result<()> {
                     q_bi,
                     pool_bi,
                     rx_b_shutdown_i,
-                    crate::rx::RxConfig {
+                    orderbook::rx::RxConfig {
                         spin_loops_per_yield: cfg.general.spin_loops_per_yield,
                         rx_batch: cfg.general.rx_recvmmsg_batch.unwrap_or(0),
                         ts_mode: cfg.channels.b.timestamping.clone(),
@@ -384,8 +364,10 @@ fn main() -> anyhow::Result<()> {
         thread::Builder::new()
             .name("rx-B-join".into())
             .spawn(move || {
-                for j in joins {
-                    let _ = j.join();
+                for (idx, j) in joins.into_iter().enumerate() {
+                    if j.join().is_err() {
+                        error!("rx-B worker {idx} panicked");
+                    }
                 }
             })?
     };
@@ -401,7 +383,7 @@ fn main() -> anyhow::Result<()> {
             q_rx_a_list,
             q_rx_b_list,
             q_merged_for_merge,
-            crate::merge::MergeConfig {
+            orderbook::merge::MergeConfig {
                 next_seq: cfg.merge.initial_expected_seq,
                 reorder_window: cfg.merge.reorder_window,
                 max_pending: cfg.merge.max_pending_packets,
@@ -481,13 +463,15 @@ fn main() -> anyhow::Result<()> {
                                 bus.clone(),
                                 pop.ws_endpoints[0].clone(),
                                 pop.ws_endpoints[1].clone(),
-                                snap_path,
-                                feeds.auth_token.clone(),
-                                client_write_timeout_ms,
-                                client_handshake_timeout_ms,
-                                client_heartbeat_interval_ms,
-                                client_max_connections,
-                                client_nodelay,
+                                ws_server::WsServerConfig {
+                                    snapshot_path: snap_path,
+                                    auth_token: feeds.auth_token.clone(),
+                                    client_write_timeout_ms,
+                                    client_handshake_timeout_ms,
+                                    client_heartbeat_interval_ms,
+                                    client_max_connections,
+                                    client_nodelay,
+                                },
                             );
                             hs.push(h);
                         }
@@ -513,7 +497,7 @@ fn main() -> anyhow::Result<()> {
                 pool,
                 parser,
                 decode_shutdown,
-                crate::decode::DecodeConfig {
+                orderbook::decode::DecodeConfig {
                     max_depth: cfg.book.max_depth,
                     snapshot_interval_ms: cfg.book.snapshot_interval_ms,
                     consume_trades: cfg.book.consume_trades,
@@ -555,9 +539,13 @@ fn main() -> anyhow::Result<()> {
         error!("decode thread panicked");
     }
     // WS handles
-    for (a, b) in ws_handles {
-        let _ = a.join();
-        let _ = b.join();
+    for (idx, (a, b)) in ws_handles.into_iter().enumerate() {
+        if a.join().is_err() {
+            error!("ws endpoint pair {idx} first thread panicked");
+        }
+        if b.join().is_err() {
+            error!("ws endpoint pair {idx} second thread panicked");
+        }
     }
     if let Some(h) = snapshot_handle {
         h.join();
@@ -568,7 +556,9 @@ fn main() -> anyhow::Result<()> {
         request_http_shutdown(&m.bind);
     }
     if let Some(h) = metrics_handle {
-        let _ = h.join();
+        if h.join().is_err() {
+            error!("metrics thread panicked");
+        }
     }
     info!("clean shutdown");
     Ok(())

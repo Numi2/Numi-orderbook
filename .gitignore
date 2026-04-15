@@ -1,6 +1,16 @@
+# Rust / Cargo
 target/
+.cargo/
 **/*.rs.bk
+
+# Build and profiling artifacts
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+criterion/
+
+# Local editor and OS files
 *.swp
 *.swo
 .DS_Store
-

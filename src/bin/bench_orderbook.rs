@@ -1,54 +1,7 @@
 use std::time::Instant;
 
-// Pull orderbook directly into this bench to avoid compiling the full binary graph
-#[path = "../orderbook.rs"]
-mod orderbook;
-
-mod metrics {
-    pub fn inc_orderbook_slab_grow() {}
-    pub fn inc_orderbook_depth_vec_grow() {}
-    pub fn inc_orderbook_export_vec_grow() {}
-}
-
-// Minimal parser types to satisfy orderbook interfaces
-mod parser {
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum Side {
-        Bid,
-        Ask,
-    }
-
-    #[derive(Debug, Clone)]
-    pub enum Event {
-        Add {
-            order_id: u64,
-            instr: u32,
-            px: i64,
-            qty: i64,
-            side: Side,
-        },
-        Mod {
-            order_id: u64,
-            qty: i64,
-        },
-        Del {
-            order_id: u64,
-        },
-        Trade {
-            instr: u32,
-            px: i64,
-            qty: i64,
-            maker_order_id: Option<u64>,
-            taker_side: Option<Side>,
-        },
-        Heartbeat,
-    }
-}
-
-use crate::orderbook::OrderBook;
-use crate::parser::{Event, Side};
+use orderbook::orderbook::OrderBook;
+use orderbook::parser::{Event, Side};
 
 fn parse_arg_usize(args: &[String], idx: usize, default: usize) -> usize {
     args.get(idx)

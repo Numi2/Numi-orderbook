@@ -127,7 +127,7 @@ pub struct LoadedSnapshot {
 }
 
 pub struct SnapshotWriter {
-    _tx: Sender<SnapshotImage>,
+    tx: Sender<SnapshotImage>,
     join: thread::JoinHandle<()>,
 }
 
@@ -138,11 +138,15 @@ impl SnapshotWriter {
             .name("snapshot-writer".into())
             .spawn(move || run_writer(path, rx))
             .expect("spawn snapshot writer");
-        (tx.clone(), SnapshotWriter { _tx: tx, join })
+        (tx.clone(), SnapshotWriter { tx, join })
     }
 
     pub fn join(self) {
-        let _ = self.join.join();
+        let SnapshotWriter { tx, join } = self;
+        drop(tx);
+        if join.join().is_err() {
+            log::error!("snapshot writer thread panicked");
+        }
     }
 }
 

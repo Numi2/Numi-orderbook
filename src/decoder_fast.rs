@@ -62,7 +62,6 @@ impl MessageDecoder for FastEmdiDecoder {
 }
 
 #[inline]
-#[allow(dead_code)] // Used in decode_messages
 fn read_pmap(b: &[u8], mut off: usize) -> (u64, usize) {
     let mut v: u64 = 0;
     let mut shift: u32 = 0;
@@ -84,7 +83,6 @@ fn read_pmap(b: &[u8], mut off: usize) -> (u64, usize) {
 }
 
 #[inline]
-#[allow(dead_code)] // Used in decode_messages and on_* functions
 fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
     let mut v: u64 = 0;
     let mut shift: u32 = 0;
@@ -106,7 +104,6 @@ fn read_sbi_u64(b: &[u8], mut off: usize) -> (u64, usize) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn on_add(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
     let (order_id, n1) = read_sbi_u64(body, o);
@@ -146,7 +143,6 @@ fn on_add(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn on_mod(body: &[u8], out: &mut Vec<Event>) {
     let mut o = 0usize;
     let (order_id, n1) = read_sbi_u64(body, o);
@@ -161,14 +157,12 @@ fn on_mod(body: &[u8], out: &mut Vec<Event>) {
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn on_del(body: &[u8], out: &mut Vec<Event>) {
     let (order_id, _n1) = read_sbi_u64(body, 0);
     out.push(Event::Del { order_id });
 }
 
 #[inline]
-#[allow(dead_code)] // Called from decode_messages
 fn on_trade(body: &[u8], out: &mut Vec<Event>, pmap: u64) {
     let mut o = 0usize;
     let (instr, n1) = read_sbi_u64(body, o);

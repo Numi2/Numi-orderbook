@@ -97,7 +97,6 @@ impl Level {
     // Methods operating purely on Level are kept minimal; order-node mutation is handled in InstrumentBook
 
     /// Iterate handles FIFO from head to tail
-    #[allow(dead_code)] // Used in export
     fn iter_fifo<'a>(&self, orders: &'a Slab<Node>) -> LevelIter<'a> {
         LevelIter {
             orders,
@@ -105,8 +104,6 @@ impl Level {
         }
     }
 }
-
-#[allow(dead_code)] // Used via iter_fifo in export
 struct LevelIter<'a> {
     orders: &'a Slab<Node>,
     cur: Option<NonZeroUsize>,
@@ -125,6 +122,7 @@ impl<'a> Iterator for LevelIter<'a> {
 }
 
 // Tick-addressable fixed grid for hot-path price levels, with overflow map fallback.
+#[derive(Debug)]
 struct PriceGrid {
     initialized: bool,
     start_price: i64, // price at index 0
@@ -177,7 +175,7 @@ impl PriceGrid {
     }
 
     #[inline]
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     fn get(&self, price: i64) -> Option<&Level> {
         if let Some(i) = self.price_to_idx(price) {
             self.slots[i].as_ref()
@@ -259,6 +257,7 @@ impl PriceGrid {
     }
 }
 
+#[derive(Debug)]
 struct InstrumentBook {
     bids_grid: PriceGrid,
     asks_grid: PriceGrid,
@@ -365,7 +364,7 @@ impl InstrumentBook {
     }
 
     #[inline]
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     fn get_level(&self, side: Side, price: i64) -> Option<&Level> {
         match side {
             Side::Bid => {
@@ -645,8 +644,6 @@ impl InstrumentBook {
         let ask = self.best_ask.map(|p| (p, self.best_ask_qty));
         (bid, ask)
     }
-
-    #[allow(dead_code)]
     fn top_n(&self, n: usize) -> (Depth32, Depth32) {
         let mut bids = SmallVec::<[(i64, i64); 32]>::new();
         let mut asks = SmallVec::<[(i64, i64); 32]>::new();
@@ -912,6 +909,7 @@ fn push_export_instrument(instruments: &mut Vec<InstrumentExport>, instrument: I
     }
 }
 
+#[derive(Debug)]
 pub struct OrderBook {
     _depth_for_reporting: usize,
     books: HashMap<u32, InstrumentBook>,
@@ -938,8 +936,6 @@ impl OrderBook {
             instrument_ticks: HashMap::new(),
         }
     }
-
-    #[allow(dead_code)]
     pub fn new_with_options(depth_for_reporting: usize, consume_trades: bool) -> Self {
         Self {
             _depth_for_reporting: depth_for_reporting,
@@ -953,8 +949,6 @@ impl OrderBook {
             instrument_ticks: HashMap::new(),
         }
     }
-
-    #[allow(dead_code)]
     pub fn new_with_options_and_capacity(
         depth_for_reporting: usize,
         consume_trades: bool,
@@ -972,8 +966,6 @@ impl OrderBook {
             instrument_ticks: HashMap::new(),
         }
     }
-
-    #[allow(dead_code)]
     pub fn new_with_grid(
         depth_for_reporting: usize,
         consume_trades: bool,
@@ -1142,7 +1134,6 @@ impl OrderBook {
 
     /// Optimized batch apply for a known instrument: reuses the same book when possible.
     /// Events for other instruments fall back to the single-event path.
-    #[allow(dead_code)]
     pub fn apply_many_for_instr(&mut self, instr: u32, events: &[Event]) {
         let consume_trades = self.consume_trades;
         for e in events {
@@ -1234,8 +1225,6 @@ impl OrderBook {
         }
         (None, None)
     }
-
-    #[allow(dead_code)]
     pub fn top_n_of(&self, instr: u32, n: usize) -> Option<(Depth32, Depth32)> {
         self.books.get(&instr).map(|b| b.top_n(n))
     }
@@ -1248,8 +1237,6 @@ impl OrderBook {
     pub fn instrument_for_order(&self, order_id: u64) -> Option<u32> {
         self.index.get(&order_id).map(|(instr, _)| *instr)
     }
-
-    #[allow(dead_code)]
     pub fn validate_invariants(&self) -> Result<(), String> {
         let mut reverse_index: HashMap<(u32, Handle), u64> =
             HashMap::with_capacity(self.index.len());
@@ -1401,8 +1388,6 @@ impl OrderBook {
         }
         ob
     }
-
-    #[allow(dead_code)]
     pub fn state_hash(&self) -> u64 {
         let mut h = BOOK_HASH_OFFSET;
         let export = self.export();
@@ -1422,7 +1407,6 @@ impl OrderBook {
     }
 
     /// Export aggregated depth snapshots (top N) per instrument (not per-order).
-    #[allow(dead_code)]
     pub fn export_depth(&self, depth: usize) -> DepthSnapshotExport {
         let mut instruments = Vec::with_capacity(self.books.len());
         let mut instrs: Vec<u32> = self.books.keys().copied().collect();

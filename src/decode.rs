@@ -176,16 +176,7 @@ pub fn decode_loop(
                             );
                             continue;
                         };
-                        let (msg_ty, payload_bytes) = match obo_ev {
-                            OboEventV1::Add(p) => (msg_type::OBO_ADD, p.as_bytes().to_vec()),
-                            OboEventV1::Modify(p) => (msg_type::OBO_MODIFY, p.as_bytes().to_vec()),
-                            OboEventV1::Cancel(p) => (msg_type::OBO_CANCEL, p.as_bytes().to_vec()),
-                            OboEventV1::Execute(p) => {
-                                (msg_type::OBO_EXECUTE, p.as_bytes().to_vec())
-                            }
-                        };
-                        let seq = pubh.next_seq_for_instrument(instr);
-                        pubh.publish_raw(msg_ty, channel_id::OBO_L3, instr, seq, &payload_bytes);
+                        publish_obo_event(pubh, instr, obo_ev);
                     }
                 }
             }
@@ -241,4 +232,47 @@ pub fn decode_loop(
         let _ = writer.flush();
     }
     Ok(())
+}
+
+#[inline]
+fn publish_obo_event(pubh: &OboPublisher, instr: u64, obo_ev: OboEventV1) {
+    let seq = pubh.next_seq_for_instrument(instr);
+    match obo_ev {
+        OboEventV1::Add(payload) => {
+            pubh.publish_raw(
+                msg_type::OBO_ADD,
+                channel_id::OBO_L3,
+                instr,
+                seq,
+                payload.as_bytes(),
+            );
+        }
+        OboEventV1::Modify(payload) => {
+            pubh.publish_raw(
+                msg_type::OBO_MODIFY,
+                channel_id::OBO_L3,
+                instr,
+                seq,
+                payload.as_bytes(),
+            );
+        }
+        OboEventV1::Cancel(payload) => {
+            pubh.publish_raw(
+                msg_type::OBO_CANCEL,
+                channel_id::OBO_L3,
+                instr,
+                seq,
+                payload.as_bytes(),
+            );
+        }
+        OboEventV1::Execute(payload) => {
+            pubh.publish_raw(
+                msg_type::OBO_EXECUTE,
+                channel_id::OBO_L3,
+                instr,
+                seq,
+                payload.as_bytes(),
+            );
+        }
+    }
 }

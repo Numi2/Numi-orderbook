@@ -12,7 +12,7 @@ Status key:
 M1: Correctness Baseline
 ------------------------
 
-Status: Next
+Status: Done
 
 Goals:
 - Deterministic book state for every accepted event.
@@ -52,10 +52,15 @@ Completed in current working tree:
   replay rejection, dropped-request visibility, and recovery lifecycle metrics.
 - Clean known default clippy findings that were already identified in static
   review.
+- Split the project into a reusable library plus binaries, so tools and tests
+  use the same production modules instead of path-based module copies.
+- Remove dead-code allowances and obsolete private helpers instead of hiding
+  unused code.
 
 Remaining:
-- Run `cargo test`, `cargo fmt`, and default `cargo clippy` when Cargo commands
-  are permitted.
+- No open baseline gate in the current working tree. Continue adding
+  venue-specific fixtures as production schemas and replay samples become
+  available.
 
 M2: A/B Merge And Recovery
 --------------------------
@@ -117,10 +122,42 @@ Completed in current working tree:
 - Snapshot export vector growth is counted with `orderbook_export_vec_grows_total`.
 - Snapshot writer payload growth and latest payload size are counted with
   `snapshot_payload_vec_grows_total` and `snapshot_payload_bytes`.
+- UDP RX recycles packet buffers when the output queue rejects a packet instead
+  of leaking the backing allocation under backpressure.
+- UDP `recvmmsg` no-progress and fatal-error paths recycle every prepared batch
+  buffer before sleeping or returning an error.
+- UDP `recvmmsg` now preserves Linux timestamp ancillary data with per-message
+  control buffers, so timestamped channels keep the batched receive path.
+- Timestamp parsing distinguishes actual `SCM_TIMESTAMPING` slots: software,
+  system-hardware, and raw-hardware timestamps are labeled by the timestamp that
+  was actually present, not only by requested mode.
+- UDP `recv`/`recvmsg` transient and fatal-error paths return the checked-out
+  packet buffer before retrying or exiting.
+- PACKET_MMAP queue-full drops recycle the copied packet buffer before
+  releasing the kernel frame.
+- Socket setup now fails fast when requested production options cannot be
+  applied: `SO_REUSEADDR`, `SO_REUSEPORT`, receive-buffer sizing, Linux busy
+  poll, and Linux RX timestamping.
+- Packet-pool ownership regression tests cover rejected queue pushes and the
+  Linux batched-receive no-progress recycle path.
+- Linux-only timestamp parser regressions cover software timestamping,
+  hardware-slot selection, and software fallback when hardware slots are empty.
+- Linux target checks now cover the production-only receive code:
+  `RUSTFLAGS='' cargo check --target x86_64-unknown-linux-gnu --all-targets`
+  and `RUSTFLAGS='' cargo clippy --target x86_64-unknown-linux-gnu --all-targets
+  -- -D warnings`.
+- Allocator feature switches now map to real optional dependencies instead of
+  empty feature flags.
+- Local development gates pass on 2026-04-15: `cargo fmt`, strict
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo test --all-features`, `cargo build --release`, and `pool_soak` with
+  zero misses and zero return drops.
 
 Remaining:
-- Run benchmark and latency SLO measurements when Cargo and target hardware are
-  available.
+- Run target-hardware benchmark and latency SLO measurements on pinned,
+  isolated production NIC hosts.
+- Continue hot-path allocation audits for journaling, snapshot export, and
+  client distribution under production load.
 
 Acceptance gates:
 - 10GbE 64-byte payload class: 14.88 Mpps for 60 seconds, zero app drops.
@@ -261,4 +298,3 @@ Completed in current working tree:
 Remaining:
 - Add durable client replay beyond the in-memory pubsub retention window, backed
   by venue replay or the local journal.
-- Run the new compatibility tests when Cargo commands are permitted.

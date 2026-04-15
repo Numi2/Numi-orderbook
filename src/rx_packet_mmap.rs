@@ -74,7 +74,7 @@ impl PacketMmapOptions {
             anyhow::bail!("could not read system page size");
         }
         let block_size = self.frame_size as usize * self.frames_per_block as usize;
-        if block_size % page_size as usize != 0 {
+        if !block_size.is_multiple_of(page_size as usize) {
             anyhow::bail!(
                 "packet_mmap block size must be a multiple of page size: block_size={} page_size={}",
                 block_size,
@@ -307,7 +307,7 @@ pub fn packet_mmap_loop(
             unsafe {
                 let dst = {
                     let s = buf.chunk_mut();
-                    std::slice::from_raw_parts_mut(s.as_mut_ptr() as *mut u8, s.len())
+                    std::slice::from_raw_parts_mut(s.as_mut_ptr(), s.len())
                 };
                 if nbytes <= dst.len() {
                     std::ptr::copy_nonoverlapping(udp_payload.as_ptr(), dst.as_mut_ptr(), nbytes);
@@ -323,7 +323,8 @@ pub fn packet_mmap_loop(
                             _ts_kind: TsKind::Sw,
                             merge_emit_ns: 0,
                         };
-                        if let Err(_full) = q_out.push(pkt) {
+                        if let Err(pkt) = q_out.push(pkt) {
+                            pkt.recycle(&pool);
                             metrics::inc_rx_drop(chan_name);
                         } else {
                             metrics::inc_rx(chan_name, nbytes);

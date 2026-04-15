@@ -24,6 +24,17 @@ struct ClientQuery {
     snapshot: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct WsServerConfig {
+    pub snapshot_path: Option<String>,
+    pub auth_token: Option<String>,
+    pub client_write_timeout_ms: u64,
+    pub client_handshake_timeout_ms: u64,
+    pub client_heartbeat_interval_ms: u64,
+    pub client_max_connections: usize,
+    pub client_nodelay: bool,
+}
+
 fn parse_query(uri: &str) -> anyhow::Result<ClientQuery> {
     let url = Url::parse(&format!("http://localhost{}", uri))?;
     let mut from_seq: Option<u64> = None;
@@ -89,74 +100,35 @@ pub fn spawn_pair(
     bus: Bus,
     addr_a: String,
     addr_b: String,
-    snapshot_path: Option<String>,
-    auth_token: Option<String>,
-    client_write_timeout_ms: u64,
-    client_handshake_timeout_ms: u64,
-    client_heartbeat_interval_ms: u64,
-    client_max_connections: usize,
-    client_nodelay: bool,
+    cfg: WsServerConfig,
 ) -> (thread::JoinHandle<()>, thread::JoinHandle<()>) {
-    let limiter = ClientLimiter::new(client_max_connections);
+    let limiter = ClientLimiter::new(cfg.client_max_connections);
+    let cfg = Arc::new(cfg);
     let b1 = bus.clone();
-    let a1 = addr_a.clone();
-    let snap1 = snapshot_path.clone();
-    let tok1 = auth_token.clone();
+    let cfg1 = cfg.clone();
     let limiter1 = limiter.clone();
     let t1 = thread::Builder::new()
         .name("ws-A".into())
         .spawn(move || {
-            run_ws_listener(
-                &b1,
-                &a1,
-                snap1.as_deref(),
-                tok1.as_deref(),
-                client_write_timeout_ms,
-                client_handshake_timeout_ms,
-                client_heartbeat_interval_ms,
-                limiter1,
-                client_nodelay,
-            );
+            run_ws_listener(b1, addr_a, cfg1, limiter1);
         })
         .expect("spawn ws A");
 
     let b2 = bus;
-    let a2 = addr_b.clone();
-    let snap2 = snapshot_path;
-    let tok2 = auth_token;
+    let cfg2 = cfg;
     let limiter2 = limiter;
     let t2 = thread::Builder::new()
         .name("ws-B".into())
         .spawn(move || {
-            run_ws_listener(
-                &b2,
-                &a2,
-                snap2.as_deref(),
-                tok2.as_deref(),
-                client_write_timeout_ms,
-                client_handshake_timeout_ms,
-                client_heartbeat_interval_ms,
-                limiter2,
-                client_nodelay,
-            );
+            run_ws_listener(b2, addr_b, cfg2, limiter2);
         })
         .expect("spawn ws B");
 
     (t1, t2)
 }
 
-fn run_ws_listener(
-    bus: &Bus,
-    addr: &str,
-    snapshot_path: Option<&str>,
-    auth_token: Option<&str>,
-    client_write_timeout_ms: u64,
-    client_handshake_timeout_ms: u64,
-    client_heartbeat_interval_ms: u64,
-    limiter: ClientLimiter,
-    client_nodelay: bool,
-) {
-    let listener = TcpListener::bind(addr).expect("bind ws");
+fn run_ws_listener(bus: Bus, addr: String, cfg: Arc<WsServerConfig>, limiter: ClientLimiter) {
+    let listener = TcpListener::bind(&addr).expect("bind ws");
     log::info!("ws listening on {}", addr);
     for stream in listener.incoming().flatten() {
         let Some(permit) = limiter.try_acquire() else {
@@ -164,20 +136,10 @@ fn run_ws_listener(
             continue;
         };
         let b = bus.clone();
-        let snap = snapshot_path.map(|s| s.to_string());
-        let tok = auth_token.map(|s| s.to_string());
+        let client_cfg = cfg.clone();
         thread::spawn(move || {
             let _permit = permit;
-            let r = handle_client(
-                b,
-                stream,
-                snap,
-                tok,
-                client_write_timeout_ms,
-                client_handshake_timeout_ms,
-                client_heartbeat_interval_ms,
-                client_nodelay,
-            );
+            let r = handle_client(b, stream, client_cfg);
             if let Err(e) = r {
                 log::warn!("ws client error: {:?}", e);
             }
@@ -185,21 +147,12 @@ fn run_ws_listener(
     }
 }
 
-fn handle_client(
-    bus: Bus,
-    stream: TcpStream,
-    snapshot_path: Option<String>,
-    auth_token: Option<String>,
-    client_write_timeout_ms: u64,
-    client_handshake_timeout_ms: u64,
-    client_heartbeat_interval_ms: u64,
-    client_nodelay: bool,
-) -> anyhow::Result<()> {
-    if client_nodelay {
+fn handle_client(bus: Bus, stream: TcpStream, cfg: Arc<WsServerConfig>) -> anyhow::Result<()> {
+    if cfg.client_nodelay {
         stream.set_nodelay(true)?;
     }
-    stream.set_read_timeout(Some(Duration::from_millis(client_handshake_timeout_ms)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(client_write_timeout_ms)))?;
+    stream.set_read_timeout(Some(Duration::from_millis(cfg.client_handshake_timeout_ms)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(cfg.client_write_timeout_ms)))?;
 
     let req_uri = Arc::new(Mutex::new(String::new()));
     let auth_header: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -224,12 +177,12 @@ fn handle_client(
     };
     ws.get_mut().set_read_timeout(None)?;
 
-    if let Some(token) = auth_token {
+    if let Some(token) = cfg.auth_token.as_deref() {
         let ok = auth_header
             .lock()
             .unwrap()
             .as_deref()
-            .map(|v| v == format!("Bearer {}", token))
+            .map(|v| v == format!("Bearer {token}"))
             .unwrap_or(false);
         if !ok {
             let _ = ws.close(None);
@@ -239,12 +192,11 @@ fn handle_client(
     }
 
     let ClientQuery { from_seq, snapshot } =
-        parse_query(&req_uri.lock().unwrap()).map_err(|err| {
+        parse_query(&req_uri.lock().unwrap()).inspect_err(|_| {
             metrics::inc_dropped_clients();
-            err
         })?;
     let _client_gauge = ConnectedClientGauge::new();
-    let heartbeat_interval = Duration::from_millis(client_heartbeat_interval_ms);
+    let heartbeat_interval = Duration::from_millis(cfg.client_heartbeat_interval_ms);
     let mut sub: Subscription = bus.subscribe();
     let mut frames_since_lag_sample: u32 = 0;
     if let Some(g) = from_seq {
@@ -254,15 +206,14 @@ fn handle_client(
     }
 
     if snapshot {
-        let Some(path) = snapshot_path else {
+        let Some(path) = cfg.snapshot_path.as_deref() else {
             metrics::inc_dropped_clients();
             anyhow::bail!("snapshot requested but snapshot path is not configured");
         };
-        let loaded = crate::snapshot::load_image(std::path::Path::new(&path))
+        let loaded = crate::snapshot::load_image(std::path::Path::new(path))
             .with_context(|| format!("load snapshot {path}"))
-            .map_err(|err| {
+            .inspect_err(|_| {
                 metrics::inc_dropped_clients();
-                err
             })?;
         let Some(replay_from) = loaded.replay_from else {
             metrics::inc_dropped_clients();
