@@ -56,5 +56,44 @@ Implementation notes:
 - Duplicate add replacement updates visible state without counting the removal
   as a behavioral pull or the replacement as behavioral replenishment.
 
-Next signals should not be added until absorption has a sidecar/API integration,
-replay validation, and user-facing evidence rendering.
+Next signals should not be added until absorption has been validated on recorded
+venue sessions and the UI renders the evidence fields clearly.
+
+Sidecar/API
+-----------
+
+Run the absorption sidecar against one or two raw-v1 OBO WebSocket endpoints:
+
+```bash
+cargo run --release --bin absorption_sidecar -- \
+  --url 'ws://127.0.0.1:7001/ws?channel=obo&codec=raw-v1&snapshot=1' \
+  --url 'ws://127.0.0.1:7002/ws?channel=obo&codec=raw-v1&snapshot=1' \
+  --listen 127.0.0.1:9201
+```
+
+The sidecar dedupes live A/B frames by per-instrument OBO sequence, feeds the
+absorption detector, prints each signal as one JSON line, and serves:
+
+- `GET /healthz`: process liveness.
+- `GET /ready`: ready after at least one upstream frame has been received.
+- `GET /stats`: counters for frames, parsed events, duplicates, parse errors,
+  connection attempts, and emitted signals.
+- `GET /signals`: recent retained absorption signals.
+
+Use `--record-frames /path/to/absorption.frames` to write a replayable raw-v1
+frame recording. The file format is repeated little-endian `u32` frame length
+followed by the raw-v1 frame bytes.
+
+Replay Validation
+-----------------
+
+Validate a sidecar recording deterministically:
+
+```bash
+cargo run --release --bin absorption_replay -- /path/to/absorption.frames
+```
+
+Replay runs the same frame sequence through the detector twice, dedupes live
+frames the same way as the sidecar, and reports the first pass, second pass, and
+whether the signal counts/hash are deterministic. It exits non-zero if replay is
+not deterministic or if any raw-v1 frame parse errors are present.

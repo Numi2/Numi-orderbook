@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 const FRAME_HEADER_LEN: usize = 48;
+const REPLAY_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const REPLAY_HASH_PRIME: u64 = 0x00000100000001b3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LevelKey {
@@ -110,6 +112,32 @@ pub struct ParsedOboEvent {
     pub event: OboEventV1,
 }
 
+#[derive(Debug, Default)]
+pub struct OboLiveDedupe {
+    last_seq_by_instr: HashMap<u64, u64>,
+}
+
+impl OboLiveDedupe {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn accept(&mut self, event: &ParsedOboEvent) -> bool {
+        if event.sequence == 0 {
+            return true;
+        }
+        let last = self
+            .last_seq_by_instr
+            .entry(event.instrument_id)
+            .or_insert(0);
+        if event.sequence <= *last {
+            return false;
+        }
+        *last = event.sequence;
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OboFrameError {
     #[error("frame shorter than raw-v1 header")]
@@ -132,6 +160,42 @@ pub enum OboFrameError {
     },
     #[error("unsupported raw-v1 message type: {0}")]
     UnsupportedMessageType(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsorptionReplayReport {
+    pub frames_total: u64,
+    pub control_frames: u64,
+    pub parsed_events: u64,
+    pub duplicate_events: u64,
+    pub parse_errors: u64,
+    pub signals: u64,
+    pub signal_hash: u64,
+    pub first_signal_ns: Option<u64>,
+    pub last_signal_ns: Option<u64>,
+}
+
+impl Default for AbsorptionReplayReport {
+    fn default() -> Self {
+        Self {
+            frames_total: 0,
+            control_frames: 0,
+            parsed_events: 0,
+            duplicate_events: 0,
+            parse_errors: 0,
+            signals: 0,
+            signal_hash: REPLAY_HASH_OFFSET,
+            first_signal_ns: None,
+            last_signal_ns: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AbsorptionReplayValidation {
+    pub first: AbsorptionReplayReport,
+    pub second: AbsorptionReplayReport,
+    pub deterministic: bool,
 }
 
 #[derive(Debug)]
@@ -456,6 +520,62 @@ pub fn parse_obo_frame(frame: &[u8]) -> Result<Option<ParsedOboEvent>, OboFrameE
     }))
 }
 
+pub fn replay_absorption_frames<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: AbsorptionConfig,
+) -> AbsorptionReplayReport {
+    let mut detector = AbsorptionDetector::new(cfg);
+    let mut dedupe = OboLiveDedupe::new();
+    let mut report = AbsorptionReplayReport::default();
+    for frame in frames {
+        report.frames_total = report.frames_total.saturating_add(1);
+        match parse_obo_frame(frame.as_ref()) {
+            Ok(Some(parsed)) => {
+                if !dedupe.accept(&parsed) {
+                    report.duplicate_events = report.duplicate_events.saturating_add(1);
+                    continue;
+                }
+                report.parsed_events = report.parsed_events.saturating_add(1);
+                if let Some(signal) =
+                    detector.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event)
+                {
+                    report.record_signal(&signal);
+                }
+            }
+            Ok(None) => {
+                report.control_frames = report.control_frames.saturating_add(1);
+            }
+            Err(_err) => {
+                report.parse_errors = report.parse_errors.saturating_add(1);
+            }
+        }
+    }
+    report
+}
+
+pub fn validate_absorption_replay<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: AbsorptionConfig,
+) -> AbsorptionReplayValidation {
+    let first = replay_absorption_frames(frames, cfg);
+    let second = replay_absorption_frames(frames, cfg);
+    let deterministic = first == second;
+    AbsorptionReplayValidation {
+        first,
+        second,
+        deterministic,
+    }
+}
+
+impl AbsorptionReplayReport {
+    fn record_signal(&mut self, signal: &AbsorptionSignal) {
+        self.signals = self.signals.saturating_add(1);
+        self.first_signal_ns.get_or_insert(signal.window_end_ns);
+        self.last_signal_ns = Some(signal.window_end_ns);
+        hash_signal(&mut self.signal_hash, signal);
+    }
+}
+
 impl OrderState {
     fn key(self) -> LevelKey {
         LevelKey {
@@ -595,6 +715,52 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
         return 0;
     }
     (((numerator as u128) * 10_000) / (denominator as u128)).min(u128::from(u32::MAX)) as u32
+}
+
+fn hash_signal(hash: &mut u64, signal: &AbsorptionSignal) {
+    hash_u64(hash, signal.instrument_id);
+    hash_i64(hash, signal.price);
+    hash_u8(hash, side_to_u8(signal.passive_side));
+    hash_u8(hash, side_to_u8(signal.aggressor_side));
+    hash_u64(hash, signal.window_start_ns);
+    hash_u64(hash, signal.window_end_ns);
+    hash_u64(hash, signal.executed_qty);
+    hash_u64(hash, signal.replenished_qty);
+    hash_u64(hash, signal.pulled_qty);
+    hash_u64(hash, signal.visible_qty_after);
+    hash_u32(hash, signal.execute_events);
+    hash_u32(hash, signal.replenish_events);
+    hash_u32(hash, signal.pull_events);
+    hash_u32(hash, signal.replenishment_ratio_bps);
+    hash_u32(hash, signal.pull_ratio_bps);
+    hash_u16(hash, signal.confidence_bps);
+}
+
+fn hash_u8(hash: &mut u64, value: u8) {
+    *hash ^= u64::from(value);
+    *hash = hash.wrapping_mul(REPLAY_HASH_PRIME);
+}
+
+fn hash_u16(hash: &mut u64, value: u16) {
+    for byte in value.to_le_bytes() {
+        hash_u8(hash, byte);
+    }
+}
+
+fn hash_u32(hash: &mut u64, value: u32) {
+    for byte in value.to_le_bytes() {
+        hash_u8(hash, byte);
+    }
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        hash_u8(hash, byte);
+    }
+}
+
+fn hash_i64(hash: &mut u64, value: i64) {
+    hash_u64(hash, value as u64);
 }
 
 fn require_payload_len(
@@ -915,5 +1081,45 @@ mod tests {
             parse_obo_frame(&frame),
             Err(OboFrameError::PayloadLengthMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn replay_validation_is_deterministic_and_dedupes_live_frames() {
+        let mut config = cfg();
+        config.min_executed_qty = 80;
+        config.min_execute_events = 1;
+        config.min_visible_qty_after = 1_000;
+        let add_event = add(1, 100, 100, Side::Bid);
+        let execute_event = execute(1, 100, 80, Side::Ask);
+        let replenish_event = add(2, 100, 60, Side::Bid);
+        let frames = vec![
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_event)),
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_event)),
+            raw_frame(
+                msg_type::OBO_EXECUTE,
+                7,
+                2,
+                11,
+                110,
+                event_payload(&execute_event),
+            ),
+            raw_frame(
+                msg_type::OBO_ADD,
+                7,
+                3,
+                12,
+                120,
+                event_payload(&replenish_event),
+            ),
+        ];
+
+        let validation = validate_absorption_replay(&frames, config);
+        assert!(validation.deterministic);
+        assert_eq!(validation.first.frames_total, 4);
+        assert_eq!(validation.first.parsed_events, 3);
+        assert_eq!(validation.first.duplicate_events, 1);
+        assert_eq!(validation.first.signals, 1);
+        assert_ne!(validation.first.signal_hash, REPLAY_HASH_OFFSET);
+        assert_eq!(validation.first, validation.second);
     }
 }

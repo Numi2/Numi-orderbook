@@ -1023,6 +1023,7 @@ dependencies = [
  "prometheus",
  "proptest",
  "serde",
+ "serde_json",
  "slab",
  "smallvec",
  "socket2",
