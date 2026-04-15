@@ -56,8 +56,90 @@ Implementation notes:
 - Duplicate add replacement updates visible state without counting the removal
   as a behavioral pull or the replacement as behavioral replenishment.
 
-Next signals should not be added until absorption has been validated on recorded
-venue sessions and the UI renders the evidence fields clearly.
+Signal 2: Iceberg/Replenishment Candidate
+-----------------------------------------
+
+An iceberg/replenishment candidate means aggressive flow repeatedly trades at a
+price while visible passive liquidity refills enough times that cumulative
+executed quantity exceeds the displayed quantity observed during the window.
+
+Examples:
+- Bid-side candidate: aggressive sellers keep hitting the bid, but the bid
+  refills at the same price across multiple cycles.
+- Ask-side candidate: aggressive buyers keep lifting the ask, but the ask
+  refreshes at the same price across multiple cycles.
+
+The detector is deliberately conservative. Each signal includes:
+- instrument id
+- price
+- passive side and aggressor side
+- observation window
+- executed quantity
+- replenished quantity
+- pulled quantity
+- visible quantity after the latest event
+- max visible quantity observed during the window
+- execute, replenish, and pull event counts
+- replenishment, over-display, and pull ratios
+- confidence in basis points
+
+Default thresholds require:
+- 5 second rolling window
+- at least 100 executed units
+- at least 3 execution events
+- at least 2 replenish events
+- at least 75 replenished units
+- executed quantity at least 1.25x max visible quantity
+- low pull ratio after pressure
+- per-level cooldown to avoid repeated alerts on the same candidate
+
+The detector calls this a candidate because reserve/iceberg behavior cannot be
+proven from anonymous public L3 alone. It identifies repeated same-price
+replenishment under execution pressure.
+
+Signal 3: Liquidity Pull
+------------------------
+
+A liquidity pull means displayed size at a price is withdrawn by cancels or
+quantity-reducing modifies before it trades. This is the opposite shape from
+absorption: visible interest thins out instead of holding under pressure.
+
+Examples:
+- Ask pull: displayed ask size is cancelled or reduced, leaving less supply
+  visible above the market.
+- Bid pull: displayed bid size is cancelled or reduced, leaving less demand
+  visible below the market.
+
+The detector does not treat executions as liquidity pulls. Executions are
+tracked as context and can suppress the signal when trading, not withdrawal, is
+the dominant reason the level disappeared.
+
+Each signal includes:
+- instrument id
+- price
+- pulled side and opposing side
+- observation window
+- pulled quantity
+- executed quantity
+- replenished quantity
+- visible quantity after the latest event
+- max visible quantity observed during the window
+- pull, execute, and replenish event counts
+- pull, execution, and visible-after ratios
+- confidence in basis points
+
+Default thresholds require:
+- 1 second rolling window
+- at least 100 pulled units
+- at least 2 pull events
+- at least 100 visible units observed at the level
+- at least 50% of observed visible size pulled
+- executions no more than 25% of pulled quantity
+- visible quantity after the pull no more than 50% of observed visible size
+- per-level cooldown to avoid repeated alerts on the same pull
+
+The signal says displayed liquidity was withdrawn. It does not claim spoofing,
+intent, or participant identity without venue-provided attribution.
 
 Sidecar/API
 -----------
@@ -72,13 +154,18 @@ cargo run --release --bin absorption_sidecar -- \
 ```
 
 The sidecar dedupes live A/B frames by per-instrument OBO sequence, feeds the
-absorption detector, prints each signal as one JSON line, and serves:
+absorption, iceberg, and liquidity pull detectors, prints each signal as one
+tagged JSON line,
+and serves:
 
 - `GET /healthz`: process liveness.
 - `GET /ready`: ready after at least one upstream frame has been received.
 - `GET /stats`: counters for frames, parsed events, duplicates, parse errors,
   connection attempts, and emitted signals.
-- `GET /signals`: recent retained absorption signals.
+- `GET /signals`: recent retained participant signals.
+- `GET /signals/absorption`: recent retained absorption signals.
+- `GET /signals/iceberg`: recent retained iceberg/replenishment candidates.
+- `GET /signals/liquidity_pull`: recent retained liquidity pull candidates.
 
 Use `--record-frames /path/to/absorption.frames` to write a replayable raw-v1
 frame recording. The file format is repeated little-endian `u32` frame length
@@ -87,13 +174,25 @@ followed by the raw-v1 frame bytes.
 Replay Validation
 -----------------
 
-Validate a sidecar recording deterministically:
+Validate absorption on a sidecar recording deterministically:
 
 ```bash
 cargo run --release --bin absorption_replay -- /path/to/absorption.frames
 ```
 
-Replay runs the same frame sequence through the detector twice, dedupes live
+Validate iceberg candidates on the same recording:
+
+```bash
+cargo run --release --bin iceberg_replay -- /path/to/absorption.frames
+```
+
+Validate liquidity pulls on the same recording:
+
+```bash
+cargo run --release --bin liquidity_pull_replay -- /path/to/absorption.frames
+```
+
+Replay runs the same frame sequence through each detector twice, dedupes live
 frames the same way as the sidecar, and reports the first pass, second pass, and
 whether the signal counts/hash are deterministic. It exits non-zero if replay is
 not deterministic or if any raw-v1 frame parse errors are present.

@@ -1,7 +1,8 @@
 use anyhow::Context;
 use crossbeam_channel::{bounded, Sender};
 use orderbook::insights::{
-    parse_obo_frame, AbsorptionConfig, AbsorptionDetector, AbsorptionSignal, OboLiveDedupe,
+    parse_obo_frame, AbsorptionConfig, AbsorptionDetector, IcebergConfig, IcebergDetector,
+    LiquidityPullConfig, LiquidityPullDetector, OboLiveDedupe, ParticipantSignal,
 };
 use orderbook::util::now_nanos;
 use serde::Serialize;
@@ -28,6 +29,8 @@ struct Args {
     retain_signals: usize,
     record_frames: Option<PathBuf>,
     absorption: AbsorptionConfig,
+    iceberg: IcebergConfig,
+    liquidity_pull: LiquidityPullConfig,
 }
 
 #[derive(Debug)]
@@ -40,13 +43,16 @@ struct SidecarState {
     duplicate_events: u64,
     parse_errors: u64,
     signals_emitted: u64,
+    absorption_signals: u64,
+    iceberg_signals: u64,
+    liquidity_pull_signals: u64,
     connection_attempts: u64,
     websocket_errors: u64,
     record_write_errors: u64,
     last_frame_ns: Option<u64>,
     last_signal_ns: Option<u64>,
     last_error: Option<String>,
-    recent_signals: VecDeque<AbsorptionSignal>,
+    recent_signals: VecDeque<ParticipantSignal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +64,9 @@ struct StatsResponse {
     duplicate_events: u64,
     parse_errors: u64,
     signals_emitted: u64,
+    absorption_signals: u64,
+    iceberg_signals: u64,
+    liquidity_pull_signals: u64,
     connection_attempts: u64,
     websocket_errors: u64,
     record_write_errors: u64,
@@ -69,7 +78,14 @@ struct StatsResponse {
 
 #[derive(Debug, Serialize)]
 struct SignalsResponse {
-    signals: Vec<AbsorptionSignal>,
+    signals: Vec<ParticipantSignal>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SignalKindFilter {
+    Absorption,
+    Iceberg,
+    LiquidityPull,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,7 +106,9 @@ fn main() -> anyhow::Result<()> {
     }
     drop(tx);
 
-    let mut detector = AbsorptionDetector::new(args.absorption);
+    let mut absorption_detector = AbsorptionDetector::new(args.absorption);
+    let mut iceberg_detector = IcebergDetector::new(args.iceberg);
+    let mut liquidity_pull_detector = LiquidityPullDetector::new(args.liquidity_pull);
     let mut dedupe = OboLiveDedupe::new();
     let mut recorder = match args.record_frames {
         Some(path) => {
@@ -115,7 +133,14 @@ fn main() -> anyhow::Result<()> {
             &frame,
             state.as_ref(),
         );
-        process_frame(&frame, &mut detector, &mut dedupe, state.as_ref());
+        process_frame(
+            &frame,
+            &mut absorption_detector,
+            &mut iceberg_detector,
+            &mut liquidity_pull_detector,
+            &mut dedupe,
+            state.as_ref(),
+        );
     }
 
     Ok(())
@@ -130,6 +155,8 @@ impl Args {
             retain_signals: DEFAULT_RETAIN_SIGNALS,
             record_frames: None,
             absorption: AbsorptionConfig::default(),
+            iceberg: IcebergConfig::default(),
+            liquidity_pull: LiquidityPullConfig::default(),
         };
 
         let mut args = std::env::args().skip(1);
@@ -181,6 +208,76 @@ impl Args {
                     parsed.absorption.cooldown_ns =
                         parse_next::<u64>(&mut args, "--cooldown-ms")?.saturating_mul(1_000_000)
                 }
+                "--iceberg-window-ms" => {
+                    parsed.iceberg.window_ns = parse_next::<u64>(&mut args, "--iceberg-window-ms")?
+                        .saturating_mul(1_000_000)
+                }
+                "--iceberg-min-executed-qty" => {
+                    parsed.iceberg.min_executed_qty =
+                        parse_next(&mut args, "--iceberg-min-executed-qty")?
+                }
+                "--iceberg-min-execute-events" => {
+                    parsed.iceberg.min_execute_events =
+                        parse_next(&mut args, "--iceberg-min-execute-events")?
+                }
+                "--iceberg-min-replenish-events" => {
+                    parsed.iceberg.min_replenish_events =
+                        parse_next(&mut args, "--iceberg-min-replenish-events")?
+                }
+                "--iceberg-min-replenished-qty" => {
+                    parsed.iceberg.min_replenished_qty =
+                        parse_next(&mut args, "--iceberg-min-replenished-qty")?
+                }
+                "--iceberg-min-replenishment-ratio-bps" => {
+                    parsed.iceberg.min_replenishment_ratio_bps =
+                        parse_next(&mut args, "--iceberg-min-replenishment-ratio-bps")?
+                }
+                "--iceberg-min-over-display-ratio-bps" => {
+                    parsed.iceberg.min_over_display_ratio_bps =
+                        parse_next(&mut args, "--iceberg-min-over-display-ratio-bps")?
+                }
+                "--iceberg-max-pull-ratio-bps" => {
+                    parsed.iceberg.max_pull_ratio_bps =
+                        parse_next(&mut args, "--iceberg-max-pull-ratio-bps")?
+                }
+                "--iceberg-cooldown-ms" => {
+                    parsed.iceberg.cooldown_ns =
+                        parse_next::<u64>(&mut args, "--iceberg-cooldown-ms")?
+                            .saturating_mul(1_000_000)
+                }
+                "--pull-window-ms" => {
+                    parsed.liquidity_pull.window_ns =
+                        parse_next::<u64>(&mut args, "--pull-window-ms")?.saturating_mul(1_000_000)
+                }
+                "--pull-min-pulled-qty" => {
+                    parsed.liquidity_pull.min_pulled_qty =
+                        parse_next(&mut args, "--pull-min-pulled-qty")?
+                }
+                "--pull-min-pull-events" => {
+                    parsed.liquidity_pull.min_pull_events =
+                        parse_next(&mut args, "--pull-min-pull-events")?
+                }
+                "--pull-min-visible-qty" => {
+                    parsed.liquidity_pull.min_visible_qty =
+                        parse_next(&mut args, "--pull-min-visible-qty")?
+                }
+                "--pull-min-pull-ratio-bps" => {
+                    parsed.liquidity_pull.min_pull_ratio_bps =
+                        parse_next(&mut args, "--pull-min-pull-ratio-bps")?
+                }
+                "--pull-max-execution-ratio-bps" => {
+                    parsed.liquidity_pull.max_execution_ratio_bps =
+                        parse_next(&mut args, "--pull-max-execution-ratio-bps")?
+                }
+                "--pull-max-visible-after-ratio-bps" => {
+                    parsed.liquidity_pull.max_visible_after_ratio_bps =
+                        parse_next(&mut args, "--pull-max-visible-after-ratio-bps")?
+                }
+                "--pull-cooldown-ms" => {
+                    parsed.liquidity_pull.cooldown_ns =
+                        parse_next::<u64>(&mut args, "--pull-cooldown-ms")?
+                            .saturating_mul(1_000_000)
+                }
                 other => anyhow::bail!("unknown argument {other:?}"),
             }
         }
@@ -204,6 +301,7 @@ options:\n\
   --auth-token TOKEN                    bearer token for upstream WebSocket feeds\n\
   --retain-signals N                    recent signals retained by /signals (default {DEFAULT_RETAIN_SIGNALS})\n\
   --record-frames PATH                  write length-prefixed raw-v1 frames for absorption_replay\n\
+  absorption thresholds:\n\
   --window-ms N                         rolling observation window\n\
   --min-executed-qty N                  minimum executed quantity\n\
   --min-execute-events N                minimum execution events\n\
@@ -211,7 +309,26 @@ options:\n\
   --min-replenishment-ratio-bps N       minimum replenish/executed ratio\n\
   --min-visible-qty-after N             minimum visible quantity after pressure\n\
   --max-pull-ratio-bps N                maximum pull/executed ratio\n\
-  --cooldown-ms N                       per-level signal cooldown"
+  --cooldown-ms N                       per-level signal cooldown\n\
+  iceberg thresholds:\n\
+  --iceberg-window-ms N\n\
+  --iceberg-min-executed-qty N\n\
+  --iceberg-min-execute-events N\n\
+  --iceberg-min-replenish-events N\n\
+  --iceberg-min-replenished-qty N\n\
+  --iceberg-min-replenishment-ratio-bps N\n\
+  --iceberg-min-over-display-ratio-bps N\n\
+  --iceberg-max-pull-ratio-bps N\n\
+  --iceberg-cooldown-ms N\n\
+  liquidity pull thresholds:\n\
+  --pull-window-ms N\n\
+  --pull-min-pulled-qty N\n\
+  --pull-min-pull-events N\n\
+  --pull-min-visible-qty N\n\
+  --pull-min-pull-ratio-bps N\n\
+  --pull-max-execution-ratio-bps N\n\
+  --pull-max-visible-after-ratio-bps N\n\
+  --pull-cooldown-ms N"
     );
 }
 
@@ -315,7 +432,9 @@ fn write_recorded_frame(writer: &mut BufWriter<File>, frame: &[u8]) -> std::io::
 
 fn process_frame(
     frame: &[u8],
-    detector: &mut AbsorptionDetector,
+    absorption_detector: &mut AbsorptionDetector,
+    iceberg_detector: &mut IcebergDetector,
+    liquidity_pull_detector: &mut LiquidityPullDetector,
     dedupe: &mut OboLiveDedupe,
     state: &Mutex<SidecarState>,
 ) {
@@ -335,13 +454,26 @@ fn process_frame(
             with_state(state, |s| {
                 s.parsed_events = s.parsed_events.saturating_add(1);
             });
-            if let Some(signal) =
-                detector.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event)
-            {
-                if let Ok(line) = serde_json::to_string(&signal) {
-                    println!("{line}");
-                }
-                with_state(state, |s| s.push_signal(signal));
+            if let Some(signal) = absorption_detector.observe_obo(
+                parsed.send_time_ns,
+                parsed.instrument_id,
+                parsed.event,
+            ) {
+                emit_signal(ParticipantSignal::Absorption(signal), state);
+            }
+            if let Some(signal) = iceberg_detector.observe_obo(
+                parsed.send_time_ns,
+                parsed.instrument_id,
+                parsed.event,
+            ) {
+                emit_signal(ParticipantSignal::Iceberg(signal), state);
+            }
+            if let Some(signal) = liquidity_pull_detector.observe_obo(
+                parsed.send_time_ns,
+                parsed.instrument_id,
+                parsed.event,
+            ) {
+                emit_signal(ParticipantSignal::LiquidityPull(signal), state);
             }
         }
         Ok(None) => {
@@ -356,6 +488,13 @@ fn process_frame(
             });
         }
     }
+}
+
+fn emit_signal(signal: ParticipantSignal, state: &Mutex<SidecarState>) {
+    if let Ok(line) = serde_json::to_string(&signal) {
+        println!("{line}");
+    }
+    with_state(state, |s| s.push_signal(signal));
 }
 
 fn spawn_http(
@@ -378,7 +517,7 @@ fn respond(req: tiny_http::Request, state: &Mutex<SidecarState>) {
     let path = req.url().split('?').next().unwrap_or(req.url());
     match path {
         "/" => {
-            let body = "endpoints: /healthz /ready /stats /signals\n";
+            let body = "endpoints: /healthz /ready /stats /signals /signals/absorption /signals/iceberg /signals/liquidity_pull\n";
             let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(200));
         }
         "/healthz" => {
@@ -395,7 +534,21 @@ fn respond(req: tiny_http::Request, state: &Mutex<SidecarState>) {
             let _ = req.respond(json_response(&stats));
         }
         "/signals" => {
-            let signals = with_state_result(state, SidecarState::signals);
+            let signals = with_state_result(state, |s| s.signals(None));
+            let _ = req.respond(json_response(&SignalsResponse { signals }));
+        }
+        "/signals/absorption" => {
+            let signals =
+                with_state_result(state, |s| s.signals(Some(SignalKindFilter::Absorption)));
+            let _ = req.respond(json_response(&SignalsResponse { signals }));
+        }
+        "/signals/iceberg" => {
+            let signals = with_state_result(state, |s| s.signals(Some(SignalKindFilter::Iceberg)));
+            let _ = req.respond(json_response(&SignalsResponse { signals }));
+        }
+        "/signals/liquidity_pull" => {
+            let signals =
+                with_state_result(state, |s| s.signals(Some(SignalKindFilter::LiquidityPull)));
             let _ = req.respond(json_response(&SignalsResponse { signals }));
         }
         _ => {
@@ -424,6 +577,9 @@ impl SidecarState {
             duplicate_events: 0,
             parse_errors: 0,
             signals_emitted: 0,
+            absorption_signals: 0,
+            iceberg_signals: 0,
+            liquidity_pull_signals: 0,
             connection_attempts: 0,
             websocket_errors: 0,
             record_write_errors: 0,
@@ -434,9 +590,20 @@ impl SidecarState {
         }
     }
 
-    fn push_signal(&mut self, signal: AbsorptionSignal) {
+    fn push_signal(&mut self, signal: ParticipantSignal) {
         self.signals_emitted = self.signals_emitted.saturating_add(1);
-        self.last_signal_ns = Some(signal.window_end_ns);
+        match &signal {
+            ParticipantSignal::Absorption(_) => {
+                self.absorption_signals = self.absorption_signals.saturating_add(1)
+            }
+            ParticipantSignal::Iceberg(_) => {
+                self.iceberg_signals = self.iceberg_signals.saturating_add(1)
+            }
+            ParticipantSignal::LiquidityPull(_) => {
+                self.liquidity_pull_signals = self.liquidity_pull_signals.saturating_add(1)
+            }
+        }
+        self.last_signal_ns = Some(signal.window_end_ns());
         if self.recent_signals.len() == self.retain_signals {
             self.recent_signals.pop_front();
         }
@@ -452,6 +619,9 @@ impl SidecarState {
             duplicate_events: self.duplicate_events,
             parse_errors: self.parse_errors,
             signals_emitted: self.signals_emitted,
+            absorption_signals: self.absorption_signals,
+            iceberg_signals: self.iceberg_signals,
+            liquidity_pull_signals: self.liquidity_pull_signals,
             connection_attempts: self.connection_attempts,
             websocket_errors: self.websocket_errors,
             record_write_errors: self.record_write_errors,
@@ -462,8 +632,21 @@ impl SidecarState {
         }
     }
 
-    fn signals(&self) -> Vec<AbsorptionSignal> {
-        self.recent_signals.iter().cloned().collect()
+    fn signals(&self, filter: Option<SignalKindFilter>) -> Vec<ParticipantSignal> {
+        self.recent_signals
+            .iter()
+            .filter(|signal| match filter {
+                None => true,
+                Some(SignalKindFilter::Absorption) => {
+                    matches!(signal, ParticipantSignal::Absorption(_))
+                }
+                Some(SignalKindFilter::Iceberg) => matches!(signal, ParticipantSignal::Iceberg(_)),
+                Some(SignalKindFilter::LiquidityPull) => {
+                    matches!(signal, ParticipantSignal::LiquidityPull(_))
+                }
+            })
+            .cloned()
+            .collect()
     }
 }
 

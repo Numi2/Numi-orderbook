@@ -49,10 +49,33 @@ struct LevelObservation {
     kind: ObservationKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IcebergObservation {
+    ts_ns: u64,
+    qty: u64,
+    kind: ObservationKind,
+    visible_before: u64,
+    visible_after: u64,
+}
+
 #[derive(Debug, Default)]
 struct LevelState {
     visible_qty: u64,
     observations: VecDeque<LevelObservation>,
+    last_signal_ns: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct IcebergLevelState {
+    visible_qty: u64,
+    observations: VecDeque<IcebergObservation>,
+    last_signal_ns: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct LiquidityPullLevelState {
+    visible_qty: u64,
+    observations: VecDeque<IcebergObservation>,
     last_signal_ns: Option<u64>,
 }
 
@@ -101,6 +124,124 @@ pub struct AbsorptionSignal {
     pub replenishment_ratio_bps: u32,
     pub pull_ratio_bps: u32,
     pub confidence_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergConfig {
+    pub window_ns: u64,
+    pub min_executed_qty: u64,
+    pub min_execute_events: u32,
+    pub min_replenish_events: u32,
+    pub min_replenished_qty: u64,
+    pub min_replenishment_ratio_bps: u32,
+    pub min_over_display_ratio_bps: u32,
+    pub max_pull_ratio_bps: u32,
+    pub cooldown_ns: u64,
+}
+
+impl Default for IcebergConfig {
+    fn default() -> Self {
+        Self {
+            window_ns: 5_000_000_000,
+            min_executed_qty: 100,
+            min_execute_events: 3,
+            min_replenish_events: 2,
+            min_replenished_qty: 75,
+            min_replenishment_ratio_bps: 5_000,
+            min_over_display_ratio_bps: 12_500,
+            max_pull_ratio_bps: 2_500,
+            cooldown_ns: 2_000_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergSignal {
+    pub instrument_id: u64,
+    pub price: i64,
+    pub passive_side: Side,
+    pub aggressor_side: Side,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub executed_qty: u64,
+    pub replenished_qty: u64,
+    pub pulled_qty: u64,
+    pub visible_qty_after: u64,
+    pub max_visible_qty: u64,
+    pub execute_events: u32,
+    pub replenish_events: u32,
+    pub pull_events: u32,
+    pub replenishment_ratio_bps: u32,
+    pub over_display_ratio_bps: u32,
+    pub pull_ratio_bps: u32,
+    pub confidence_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPullConfig {
+    pub window_ns: u64,
+    pub min_pulled_qty: u64,
+    pub min_pull_events: u32,
+    pub min_visible_qty: u64,
+    pub min_pull_ratio_bps: u32,
+    pub max_execution_ratio_bps: u32,
+    pub max_visible_after_ratio_bps: u32,
+    pub cooldown_ns: u64,
+}
+
+impl Default for LiquidityPullConfig {
+    fn default() -> Self {
+        Self {
+            window_ns: 1_000_000_000,
+            min_pulled_qty: 100,
+            min_pull_events: 2,
+            min_visible_qty: 100,
+            min_pull_ratio_bps: 5_000,
+            max_execution_ratio_bps: 2_500,
+            max_visible_after_ratio_bps: 5_000,
+            cooldown_ns: 1_000_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPullSignal {
+    pub instrument_id: u64,
+    pub price: i64,
+    pub pulled_side: Side,
+    pub opposing_side: Side,
+    pub window_start_ns: u64,
+    pub window_end_ns: u64,
+    pub pulled_qty: u64,
+    pub executed_qty: u64,
+    pub replenished_qty: u64,
+    pub visible_qty_after: u64,
+    pub max_visible_qty: u64,
+    pub pull_events: u32,
+    pub execute_events: u32,
+    pub replenish_events: u32,
+    pub pull_ratio_bps: u32,
+    pub execution_ratio_bps: u32,
+    pub visible_after_ratio_bps: u32,
+    pub confidence_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "signal", rename_all = "snake_case")]
+pub enum ParticipantSignal {
+    Absorption(AbsorptionSignal),
+    Iceberg(IcebergSignal),
+    LiquidityPull(LiquidityPullSignal),
+}
+
+impl ParticipantSignal {
+    pub fn window_end_ns(&self) -> u64 {
+        match self {
+            ParticipantSignal::Absorption(signal) => signal.window_end_ns,
+            ParticipantSignal::Iceberg(signal) => signal.window_end_ns,
+            ParticipantSignal::LiquidityPull(signal) => signal.window_end_ns,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,11 +339,99 @@ pub struct AbsorptionReplayValidation {
     pub deterministic: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergReplayReport {
+    pub frames_total: u64,
+    pub control_frames: u64,
+    pub parsed_events: u64,
+    pub duplicate_events: u64,
+    pub parse_errors: u64,
+    pub signals: u64,
+    pub signal_hash: u64,
+    pub first_signal_ns: Option<u64>,
+    pub last_signal_ns: Option<u64>,
+}
+
+impl Default for IcebergReplayReport {
+    fn default() -> Self {
+        Self {
+            frames_total: 0,
+            control_frames: 0,
+            parsed_events: 0,
+            duplicate_events: 0,
+            parse_errors: 0,
+            signals: 0,
+            signal_hash: REPLAY_HASH_OFFSET,
+            first_signal_ns: None,
+            last_signal_ns: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IcebergReplayValidation {
+    pub first: IcebergReplayReport,
+    pub second: IcebergReplayReport,
+    pub deterministic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPullReplayReport {
+    pub frames_total: u64,
+    pub control_frames: u64,
+    pub parsed_events: u64,
+    pub duplicate_events: u64,
+    pub parse_errors: u64,
+    pub signals: u64,
+    pub signal_hash: u64,
+    pub first_signal_ns: Option<u64>,
+    pub last_signal_ns: Option<u64>,
+}
+
+impl Default for LiquidityPullReplayReport {
+    fn default() -> Self {
+        Self {
+            frames_total: 0,
+            control_frames: 0,
+            parsed_events: 0,
+            duplicate_events: 0,
+            parse_errors: 0,
+            signals: 0,
+            signal_hash: REPLAY_HASH_OFFSET,
+            first_signal_ns: None,
+            last_signal_ns: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiquidityPullReplayValidation {
+    pub first: LiquidityPullReplayReport,
+    pub second: LiquidityPullReplayReport,
+    pub deterministic: bool,
+}
+
 #[derive(Debug)]
 pub struct AbsorptionDetector {
     cfg: AbsorptionConfig,
     orders: HashMap<u64, OrderState>,
     levels: HashMap<LevelKey, LevelState>,
+    last_ts_ns: u64,
+}
+
+#[derive(Debug)]
+pub struct IcebergDetector {
+    cfg: IcebergConfig,
+    orders: HashMap<u64, OrderState>,
+    levels: HashMap<LevelKey, IcebergLevelState>,
+    last_ts_ns: u64,
+}
+
+#[derive(Debug)]
+pub struct LiquidityPullDetector {
+    cfg: LiquidityPullConfig,
+    orders: HashMap<u64, OrderState>,
+    levels: HashMap<LevelKey, LiquidityPullLevelState>,
     last_ts_ns: u64,
 }
 
@@ -433,6 +662,463 @@ impl AbsorptionDetector {
     }
 }
 
+impl IcebergDetector {
+    pub fn new(cfg: IcebergConfig) -> Self {
+        Self {
+            cfg,
+            orders: HashMap::new(),
+            levels: HashMap::new(),
+            last_ts_ns: 0,
+        }
+    }
+
+    pub fn config(&self) -> IcebergConfig {
+        self.cfg
+    }
+
+    pub fn observe_obo(
+        &mut self,
+        ts_ns: u64,
+        instrument_id: u64,
+        event: OboEventV1,
+    ) -> Option<IcebergSignal> {
+        let ts_ns = self.monotonic_ts(ts_ns);
+        match event {
+            OboEventV1::Add(add) => {
+                let side = side_from_u8(add.side)?;
+                let replaced_existing = self.replace_order_without_behavior(add.order_id, ts_ns);
+                let order = OrderState {
+                    instrument_id,
+                    price: add.price_e8,
+                    qty: add.qty,
+                    side,
+                };
+                self.orders.insert(add.order_id, order);
+                self.update_level(
+                    order.key(),
+                    ts_ns,
+                    add.qty as i128,
+                    (!replaced_existing).then_some((ObservationKind::Replenish, add.qty)),
+                )
+            }
+            OboEventV1::Modify(modify) => {
+                let order_id = modify.order_id;
+                let new_price_e8 = modify.new_price_e8;
+                let new_qty = modify.new_qty;
+                let flags = modify.flags;
+                let mut order = *self.orders.get(&order_id)?;
+                let new_price = if flags & 1 == 1 {
+                    order.price
+                } else {
+                    new_price_e8
+                };
+                let old_key = order.key();
+                let new_key = LevelKey {
+                    instrument_id: order.instrument_id,
+                    price: new_price,
+                    side: order.side,
+                };
+                let old_qty = order.qty;
+                order.price = new_price;
+                order.qty = new_qty;
+                if new_qty == 0 {
+                    self.orders.remove(&order_id);
+                } else {
+                    self.orders.insert(order_id, order);
+                }
+
+                if old_key == new_key {
+                    match new_qty.cmp(&old_qty) {
+                        std::cmp::Ordering::Greater => {
+                            let added = new_qty - old_qty;
+                            self.update_level(
+                                old_key,
+                                ts_ns,
+                                added as i128,
+                                Some((ObservationKind::Replenish, added)),
+                            )
+                        }
+                        std::cmp::Ordering::Less => {
+                            let removed = old_qty - new_qty;
+                            self.update_level(
+                                old_key,
+                                ts_ns,
+                                -(removed as i128),
+                                Some((ObservationKind::Pull, removed)),
+                            )
+                        }
+                        std::cmp::Ordering::Equal => None,
+                    }
+                } else {
+                    let pull = self.update_level(
+                        old_key,
+                        ts_ns,
+                        -(old_qty as i128),
+                        Some((ObservationKind::Pull, old_qty)),
+                    );
+                    let replenish = if new_qty == 0 {
+                        None
+                    } else {
+                        self.update_level(
+                            new_key,
+                            ts_ns,
+                            new_qty as i128,
+                            Some((ObservationKind::Replenish, new_qty)),
+                        )
+                    };
+                    pull.or(replenish)
+                }
+            }
+            OboEventV1::Cancel(cancel) => {
+                let order_id = cancel.order_id;
+                let qty_cxl = cancel.qty_cxl;
+                let mut order = *self.orders.get(&order_id)?;
+                let removed = if qty_cxl == 0 {
+                    order.qty
+                } else {
+                    qty_cxl.min(order.qty)
+                };
+                if removed == 0 {
+                    return None;
+                }
+                order.qty -= removed;
+                if order.qty == 0 {
+                    self.orders.remove(&order_id);
+                } else {
+                    self.orders.insert(order_id, order);
+                }
+                self.update_level(
+                    order.key(),
+                    ts_ns,
+                    -(removed as i128),
+                    Some((ObservationKind::Pull, removed)),
+                )
+            }
+            OboEventV1::Execute(exec) => {
+                let maker_order_id = exec.maker_order_id;
+                let trade_qty = exec.trade_qty;
+                let trade_price_e8 = exec.trade_price_e8;
+                let aggressor_side = side_from_u8(exec.aggressor_side)?;
+                let passive_side = opposite_side(aggressor_side);
+                let (key, visible_delta) =
+                    if let Some(mut order) = self.orders.get(&maker_order_id).copied() {
+                        let key = order.key();
+                        let visible_removed = trade_qty.min(order.qty);
+                        order.qty -= visible_removed;
+                        if order.qty == 0 {
+                            self.orders.remove(&maker_order_id);
+                        } else {
+                            self.orders.insert(maker_order_id, order);
+                        }
+                        (key, -(visible_removed as i128))
+                    } else {
+                        (
+                            LevelKey {
+                                instrument_id,
+                                price: trade_price_e8,
+                                side: passive_side,
+                            },
+                            0,
+                        )
+                    };
+                self.update_level(
+                    key,
+                    ts_ns,
+                    visible_delta,
+                    Some((ObservationKind::Execute, trade_qty)),
+                )
+            }
+        }
+    }
+
+    pub fn observe_raw_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<IcebergSignal>, OboFrameError> {
+        let Some(parsed) = parse_obo_frame(frame)? else {
+            return Ok(None);
+        };
+        Ok(self.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event))
+    }
+
+    fn monotonic_ts(&mut self, ts_ns: u64) -> u64 {
+        let ts_ns = ts_ns.max(self.last_ts_ns);
+        self.last_ts_ns = ts_ns;
+        ts_ns
+    }
+
+    fn replace_order_without_behavior(&mut self, order_id: u64, ts_ns: u64) -> bool {
+        let Some(old) = self.orders.remove(&order_id) else {
+            return false;
+        };
+        let _ = self.update_level(old.key(), ts_ns, -(old.qty as i128), None);
+        true
+    }
+
+    fn update_level(
+        &mut self,
+        key: LevelKey,
+        ts_ns: u64,
+        visible_delta: i128,
+        observation: Option<(ObservationKind, u64)>,
+    ) -> Option<IcebergSignal> {
+        let level = self.levels.entry(key).or_default();
+        level.evict(ts_ns, self.cfg.window_ns);
+        let visible_before = level.visible_qty;
+
+        let record_observation = match observation {
+            Some((ObservationKind::Execute, qty)) => qty > 0,
+            Some((_kind, qty)) => qty > 0 && level.has_execution_pressure(),
+            None => false,
+        };
+
+        if visible_delta >= 0 {
+            level.visible_qty = level.visible_qty.saturating_add(visible_delta as u64);
+        } else {
+            level.visible_qty = level.visible_qty.saturating_sub((-visible_delta) as u64);
+        }
+
+        if !record_observation {
+            return None;
+        }
+
+        let (kind, qty) = observation?;
+        level.observations.push_back(IcebergObservation {
+            ts_ns,
+            qty,
+            kind,
+            visible_before,
+            visible_after: level.visible_qty,
+        });
+        level.maybe_signal(key, ts_ns, &self.cfg)
+    }
+}
+
+impl LiquidityPullDetector {
+    pub fn new(cfg: LiquidityPullConfig) -> Self {
+        Self {
+            cfg,
+            orders: HashMap::new(),
+            levels: HashMap::new(),
+            last_ts_ns: 0,
+        }
+    }
+
+    pub fn config(&self) -> LiquidityPullConfig {
+        self.cfg
+    }
+
+    pub fn observe_obo(
+        &mut self,
+        ts_ns: u64,
+        instrument_id: u64,
+        event: OboEventV1,
+    ) -> Option<LiquidityPullSignal> {
+        let ts_ns = self.monotonic_ts(ts_ns);
+        match event {
+            OboEventV1::Add(add) => {
+                let side = side_from_u8(add.side)?;
+                let replaced_existing = self.replace_order_without_behavior(add.order_id, ts_ns);
+                let order = OrderState {
+                    instrument_id,
+                    price: add.price_e8,
+                    qty: add.qty,
+                    side,
+                };
+                self.orders.insert(add.order_id, order);
+                self.update_level(
+                    order.key(),
+                    ts_ns,
+                    add.qty as i128,
+                    (!replaced_existing).then_some((ObservationKind::Replenish, add.qty)),
+                )
+            }
+            OboEventV1::Modify(modify) => {
+                let order_id = modify.order_id;
+                let new_price_e8 = modify.new_price_e8;
+                let new_qty = modify.new_qty;
+                let flags = modify.flags;
+                let mut order = *self.orders.get(&order_id)?;
+                let new_price = if flags & 1 == 1 {
+                    order.price
+                } else {
+                    new_price_e8
+                };
+                let old_key = order.key();
+                let new_key = LevelKey {
+                    instrument_id: order.instrument_id,
+                    price: new_price,
+                    side: order.side,
+                };
+                let old_qty = order.qty;
+                order.price = new_price;
+                order.qty = new_qty;
+                if new_qty == 0 {
+                    self.orders.remove(&order_id);
+                } else {
+                    self.orders.insert(order_id, order);
+                }
+
+                if old_key == new_key {
+                    match new_qty.cmp(&old_qty) {
+                        std::cmp::Ordering::Greater => {
+                            let added = new_qty - old_qty;
+                            self.update_level(
+                                old_key,
+                                ts_ns,
+                                added as i128,
+                                Some((ObservationKind::Replenish, added)),
+                            )
+                        }
+                        std::cmp::Ordering::Less => {
+                            let removed = old_qty - new_qty;
+                            self.update_level(
+                                old_key,
+                                ts_ns,
+                                -(removed as i128),
+                                Some((ObservationKind::Pull, removed)),
+                            )
+                        }
+                        std::cmp::Ordering::Equal => None,
+                    }
+                } else {
+                    let pull = self.update_level(
+                        old_key,
+                        ts_ns,
+                        -(old_qty as i128),
+                        Some((ObservationKind::Pull, old_qty)),
+                    );
+                    let replenish = if new_qty == 0 {
+                        None
+                    } else {
+                        self.update_level(
+                            new_key,
+                            ts_ns,
+                            new_qty as i128,
+                            Some((ObservationKind::Replenish, new_qty)),
+                        )
+                    };
+                    pull.or(replenish)
+                }
+            }
+            OboEventV1::Cancel(cancel) => {
+                let order_id = cancel.order_id;
+                let qty_cxl = cancel.qty_cxl;
+                let mut order = *self.orders.get(&order_id)?;
+                let removed = if qty_cxl == 0 {
+                    order.qty
+                } else {
+                    qty_cxl.min(order.qty)
+                };
+                if removed == 0 {
+                    return None;
+                }
+                order.qty -= removed;
+                if order.qty == 0 {
+                    self.orders.remove(&order_id);
+                } else {
+                    self.orders.insert(order_id, order);
+                }
+                self.update_level(
+                    order.key(),
+                    ts_ns,
+                    -(removed as i128),
+                    Some((ObservationKind::Pull, removed)),
+                )
+            }
+            OboEventV1::Execute(exec) => {
+                let maker_order_id = exec.maker_order_id;
+                let trade_qty = exec.trade_qty;
+                let trade_price_e8 = exec.trade_price_e8;
+                let aggressor_side = side_from_u8(exec.aggressor_side)?;
+                let pulled_side = opposite_side(aggressor_side);
+                let (key, visible_delta) =
+                    if let Some(mut order) = self.orders.get(&maker_order_id).copied() {
+                        let key = order.key();
+                        let visible_removed = trade_qty.min(order.qty);
+                        order.qty -= visible_removed;
+                        if order.qty == 0 {
+                            self.orders.remove(&maker_order_id);
+                        } else {
+                            self.orders.insert(maker_order_id, order);
+                        }
+                        (key, -(visible_removed as i128))
+                    } else {
+                        (
+                            LevelKey {
+                                instrument_id,
+                                price: trade_price_e8,
+                                side: pulled_side,
+                            },
+                            0,
+                        )
+                    };
+                self.update_level(
+                    key,
+                    ts_ns,
+                    visible_delta,
+                    Some((ObservationKind::Execute, trade_qty)),
+                )
+            }
+        }
+    }
+
+    pub fn observe_raw_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<Option<LiquidityPullSignal>, OboFrameError> {
+        let Some(parsed) = parse_obo_frame(frame)? else {
+            return Ok(None);
+        };
+        Ok(self.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event))
+    }
+
+    fn monotonic_ts(&mut self, ts_ns: u64) -> u64 {
+        let ts_ns = ts_ns.max(self.last_ts_ns);
+        self.last_ts_ns = ts_ns;
+        ts_ns
+    }
+
+    fn replace_order_without_behavior(&mut self, order_id: u64, ts_ns: u64) -> bool {
+        let Some(old) = self.orders.remove(&order_id) else {
+            return false;
+        };
+        let _ = self.update_level(old.key(), ts_ns, -(old.qty as i128), None);
+        true
+    }
+
+    fn update_level(
+        &mut self,
+        key: LevelKey,
+        ts_ns: u64,
+        visible_delta: i128,
+        observation: Option<(ObservationKind, u64)>,
+    ) -> Option<LiquidityPullSignal> {
+        let level = self.levels.entry(key).or_default();
+        level.evict(ts_ns, self.cfg.window_ns);
+        let visible_before = level.visible_qty;
+
+        if visible_delta >= 0 {
+            level.visible_qty = level.visible_qty.saturating_add(visible_delta as u64);
+        } else {
+            level.visible_qty = level.visible_qty.saturating_sub((-visible_delta) as u64);
+        }
+
+        let (kind, qty) = observation?;
+        if qty == 0 {
+            return None;
+        }
+        level.observations.push_back(IcebergObservation {
+            ts_ns,
+            qty,
+            kind,
+            visible_before,
+            visible_after: level.visible_qty,
+        });
+        level.maybe_signal(key, ts_ns, &self.cfg)
+    }
+}
+
 pub fn parse_obo_frame(frame: &[u8]) -> Result<Option<ParsedOboEvent>, OboFrameError> {
     if frame.len() < FRAME_HEADER_LEN {
         return Err(OboFrameError::ShortHeader);
@@ -567,12 +1253,124 @@ pub fn validate_absorption_replay<B: AsRef<[u8]>>(
     }
 }
 
+pub fn replay_iceberg_frames<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: IcebergConfig,
+) -> IcebergReplayReport {
+    let mut detector = IcebergDetector::new(cfg);
+    let mut dedupe = OboLiveDedupe::new();
+    let mut report = IcebergReplayReport::default();
+    for frame in frames {
+        report.frames_total = report.frames_total.saturating_add(1);
+        match parse_obo_frame(frame.as_ref()) {
+            Ok(Some(parsed)) => {
+                if !dedupe.accept(&parsed) {
+                    report.duplicate_events = report.duplicate_events.saturating_add(1);
+                    continue;
+                }
+                report.parsed_events = report.parsed_events.saturating_add(1);
+                if let Some(signal) =
+                    detector.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event)
+                {
+                    report.record_signal(&signal);
+                }
+            }
+            Ok(None) => {
+                report.control_frames = report.control_frames.saturating_add(1);
+            }
+            Err(_err) => {
+                report.parse_errors = report.parse_errors.saturating_add(1);
+            }
+        }
+    }
+    report
+}
+
+pub fn validate_iceberg_replay<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: IcebergConfig,
+) -> IcebergReplayValidation {
+    let first = replay_iceberg_frames(frames, cfg);
+    let second = replay_iceberg_frames(frames, cfg);
+    let deterministic = first == second;
+    IcebergReplayValidation {
+        first,
+        second,
+        deterministic,
+    }
+}
+
+pub fn replay_liquidity_pull_frames<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: LiquidityPullConfig,
+) -> LiquidityPullReplayReport {
+    let mut detector = LiquidityPullDetector::new(cfg);
+    let mut dedupe = OboLiveDedupe::new();
+    let mut report = LiquidityPullReplayReport::default();
+    for frame in frames {
+        report.frames_total = report.frames_total.saturating_add(1);
+        match parse_obo_frame(frame.as_ref()) {
+            Ok(Some(parsed)) => {
+                if !dedupe.accept(&parsed) {
+                    report.duplicate_events = report.duplicate_events.saturating_add(1);
+                    continue;
+                }
+                report.parsed_events = report.parsed_events.saturating_add(1);
+                if let Some(signal) =
+                    detector.observe_obo(parsed.send_time_ns, parsed.instrument_id, parsed.event)
+                {
+                    report.record_signal(&signal);
+                }
+            }
+            Ok(None) => {
+                report.control_frames = report.control_frames.saturating_add(1);
+            }
+            Err(_err) => {
+                report.parse_errors = report.parse_errors.saturating_add(1);
+            }
+        }
+    }
+    report
+}
+
+pub fn validate_liquidity_pull_replay<B: AsRef<[u8]>>(
+    frames: &[B],
+    cfg: LiquidityPullConfig,
+) -> LiquidityPullReplayValidation {
+    let first = replay_liquidity_pull_frames(frames, cfg);
+    let second = replay_liquidity_pull_frames(frames, cfg);
+    let deterministic = first == second;
+    LiquidityPullReplayValidation {
+        first,
+        second,
+        deterministic,
+    }
+}
+
 impl AbsorptionReplayReport {
     fn record_signal(&mut self, signal: &AbsorptionSignal) {
         self.signals = self.signals.saturating_add(1);
         self.first_signal_ns.get_or_insert(signal.window_end_ns);
         self.last_signal_ns = Some(signal.window_end_ns);
         hash_signal(&mut self.signal_hash, signal);
+    }
+}
+
+impl IcebergReplayReport {
+    fn record_signal(&mut self, signal: &IcebergSignal) {
+        self.signals = self.signals.saturating_add(1);
+        self.first_signal_ns.get_or_insert(signal.window_end_ns);
+        self.last_signal_ns = Some(signal.window_end_ns);
+        hash_iceberg_signal(&mut self.signal_hash, signal);
+    }
+}
+
+impl LiquidityPullReplayReport {
+    fn record_signal(&mut self, signal: &LiquidityPullSignal) {
+        self.signals = self.signals.saturating_add(1);
+        self.first_signal_ns.get_or_insert(signal.window_end_ns);
+        self.last_signal_ns = Some(signal.window_end_ns);
+        hash_liquidity_pull_signal(&mut self.signal_hash, signal);
     }
 }
 
@@ -688,6 +1486,222 @@ impl LevelState {
     }
 }
 
+impl IcebergLevelState {
+    fn evict(&mut self, now_ns: u64, window_ns: u64) {
+        let cutoff = now_ns.saturating_sub(window_ns);
+        while let Some(front) = self.observations.front() {
+            if front.ts_ns >= cutoff {
+                break;
+            }
+            self.observations.pop_front();
+        }
+    }
+
+    fn has_execution_pressure(&self) -> bool {
+        self.observations
+            .iter()
+            .any(|obs| obs.kind == ObservationKind::Execute)
+    }
+
+    fn maybe_signal(
+        &mut self,
+        key: LevelKey,
+        now_ns: u64,
+        cfg: &IcebergConfig,
+    ) -> Option<IcebergSignal> {
+        if self
+            .last_signal_ns
+            .is_some_and(|last| now_ns.saturating_sub(last) < cfg.cooldown_ns)
+        {
+            return None;
+        }
+
+        let mut window_start_ns = now_ns;
+        let mut executed_qty = 0_u64;
+        let mut replenished_qty = 0_u64;
+        let mut pulled_qty = 0_u64;
+        let mut max_visible_qty = self.visible_qty;
+        let mut execute_events = 0_u32;
+        let mut replenish_events = 0_u32;
+        let mut pull_events = 0_u32;
+
+        for obs in &self.observations {
+            window_start_ns = window_start_ns.min(obs.ts_ns);
+            max_visible_qty = max_visible_qty
+                .max(obs.visible_before)
+                .max(obs.visible_after);
+            match obs.kind {
+                ObservationKind::Execute => {
+                    executed_qty = executed_qty.saturating_add(obs.qty);
+                    execute_events = execute_events.saturating_add(1);
+                }
+                ObservationKind::Replenish => {
+                    replenished_qty = replenished_qty.saturating_add(obs.qty);
+                    replenish_events = replenish_events.saturating_add(1);
+                }
+                ObservationKind::Pull => {
+                    pulled_qty = pulled_qty.saturating_add(obs.qty);
+                    pull_events = pull_events.saturating_add(1);
+                }
+            }
+        }
+
+        if executed_qty < cfg.min_executed_qty
+            || execute_events < cfg.min_execute_events
+            || replenish_events < cfg.min_replenish_events
+            || replenished_qty < cfg.min_replenished_qty
+            || max_visible_qty == 0
+        {
+            return None;
+        }
+
+        let replenishment_ratio_bps = ratio_bps(replenished_qty, executed_qty);
+        let over_display_ratio_bps = ratio_bps(executed_qty, max_visible_qty);
+        let pull_ratio_bps = ratio_bps(pulled_qty, executed_qty);
+        if replenishment_ratio_bps < cfg.min_replenishment_ratio_bps
+            || over_display_ratio_bps < cfg.min_over_display_ratio_bps
+            || pull_ratio_bps > cfg.max_pull_ratio_bps
+        {
+            return None;
+        }
+
+        let confidence_bps = iceberg_confidence_bps(
+            executed_qty,
+            execute_events,
+            replenish_events,
+            replenishment_ratio_bps,
+            over_display_ratio_bps,
+            pull_ratio_bps,
+            cfg,
+        );
+        self.last_signal_ns = Some(now_ns);
+        Some(IcebergSignal {
+            instrument_id: key.instrument_id,
+            price: key.price,
+            passive_side: key.side,
+            aggressor_side: opposite_side(key.side),
+            window_start_ns,
+            window_end_ns: now_ns,
+            executed_qty,
+            replenished_qty,
+            pulled_qty,
+            visible_qty_after: self.visible_qty,
+            max_visible_qty,
+            execute_events,
+            replenish_events,
+            pull_events,
+            replenishment_ratio_bps,
+            over_display_ratio_bps,
+            pull_ratio_bps,
+            confidence_bps,
+        })
+    }
+}
+
+impl LiquidityPullLevelState {
+    fn evict(&mut self, now_ns: u64, window_ns: u64) {
+        let cutoff = now_ns.saturating_sub(window_ns);
+        while let Some(front) = self.observations.front() {
+            if front.ts_ns >= cutoff {
+                break;
+            }
+            self.observations.pop_front();
+        }
+    }
+
+    fn maybe_signal(
+        &mut self,
+        key: LevelKey,
+        now_ns: u64,
+        cfg: &LiquidityPullConfig,
+    ) -> Option<LiquidityPullSignal> {
+        if self
+            .last_signal_ns
+            .is_some_and(|last| now_ns.saturating_sub(last) < cfg.cooldown_ns)
+        {
+            return None;
+        }
+
+        let mut window_start_ns = now_ns;
+        let mut pulled_qty = 0_u64;
+        let mut executed_qty = 0_u64;
+        let mut replenished_qty = 0_u64;
+        let mut max_visible_qty = self.visible_qty;
+        let mut pull_events = 0_u32;
+        let mut execute_events = 0_u32;
+        let mut replenish_events = 0_u32;
+
+        for obs in &self.observations {
+            window_start_ns = window_start_ns.min(obs.ts_ns);
+            max_visible_qty = max_visible_qty
+                .max(obs.visible_before)
+                .max(obs.visible_after);
+            match obs.kind {
+                ObservationKind::Execute => {
+                    executed_qty = executed_qty.saturating_add(obs.qty);
+                    execute_events = execute_events.saturating_add(1);
+                }
+                ObservationKind::Replenish => {
+                    replenished_qty = replenished_qty.saturating_add(obs.qty);
+                    replenish_events = replenish_events.saturating_add(1);
+                }
+                ObservationKind::Pull => {
+                    pulled_qty = pulled_qty.saturating_add(obs.qty);
+                    pull_events = pull_events.saturating_add(1);
+                }
+            }
+        }
+
+        if pulled_qty < cfg.min_pulled_qty
+            || pull_events < cfg.min_pull_events
+            || max_visible_qty < cfg.min_visible_qty
+            || max_visible_qty == 0
+        {
+            return None;
+        }
+
+        let pull_ratio_bps = ratio_bps(pulled_qty, max_visible_qty);
+        let execution_ratio_bps = ratio_bps(executed_qty, pulled_qty);
+        let visible_after_ratio_bps = ratio_bps(self.visible_qty, max_visible_qty);
+        if pull_ratio_bps < cfg.min_pull_ratio_bps
+            || execution_ratio_bps > cfg.max_execution_ratio_bps
+            || visible_after_ratio_bps > cfg.max_visible_after_ratio_bps
+        {
+            return None;
+        }
+
+        let confidence_bps = liquidity_pull_confidence_bps(
+            pulled_qty,
+            pull_events,
+            pull_ratio_bps,
+            execution_ratio_bps,
+            visible_after_ratio_bps,
+            cfg,
+        );
+        self.last_signal_ns = Some(now_ns);
+        Some(LiquidityPullSignal {
+            instrument_id: key.instrument_id,
+            price: key.price,
+            pulled_side: key.side,
+            opposing_side: opposite_side(key.side),
+            window_start_ns,
+            window_end_ns: now_ns,
+            pulled_qty,
+            executed_qty,
+            replenished_qty,
+            visible_qty_after: self.visible_qty,
+            max_visible_qty,
+            pull_events,
+            execute_events,
+            replenish_events,
+            pull_ratio_bps,
+            execution_ratio_bps,
+            visible_after_ratio_bps,
+            confidence_bps,
+        })
+    }
+}
+
 fn confidence_bps(
     executed_qty: u64,
     execute_events: u32,
@@ -708,6 +1722,76 @@ fn confidence_bps(
     let pull_score = 10_000_u32.saturating_sub(pull_ratio_bps.min(10_000));
     let weighted = pressure_score * 30 + event_score * 20 + passive_score * 35 + pull_score * 15;
     (weighted / 100).min(10_000) as u16
+}
+
+fn iceberg_confidence_bps(
+    executed_qty: u64,
+    execute_events: u32,
+    replenish_events: u32,
+    replenishment_ratio_bps: u32,
+    over_display_ratio_bps: u32,
+    pull_ratio_bps: u32,
+    cfg: &IcebergConfig,
+) -> u16 {
+    let pressure_score = ratio_bps(executed_qty, cfg.min_executed_qty).min(10_000);
+    let execute_event_score =
+        ratio_bps(u64::from(execute_events), u64::from(cfg.min_execute_events)).min(10_000);
+    let replenish_event_score = ratio_bps(
+        u64::from(replenish_events),
+        u64::from(cfg.min_replenish_events),
+    )
+    .min(10_000);
+    let replenish_score = replenishment_ratio_bps.min(10_000);
+    let over_display_score = ratio_bps(
+        u64::from(over_display_ratio_bps),
+        u64::from(cfg.min_over_display_ratio_bps),
+    )
+    .min(10_000);
+    let pull_score = 10_000_u32.saturating_sub(pull_ratio_bps.min(10_000));
+    let weighted = pressure_score * 15
+        + execute_event_score * 15
+        + replenish_event_score * 20
+        + replenish_score * 20
+        + over_display_score * 20
+        + pull_score * 10;
+    (weighted / 100).min(10_000) as u16
+}
+
+fn liquidity_pull_confidence_bps(
+    pulled_qty: u64,
+    pull_events: u32,
+    pull_ratio_bps: u32,
+    execution_ratio_bps: u32,
+    visible_after_ratio_bps: u32,
+    cfg: &LiquidityPullConfig,
+) -> u16 {
+    let qty_score = ratio_bps(pulled_qty, cfg.min_pulled_qty).min(10_000);
+    let event_score = ratio_bps(u64::from(pull_events), u64::from(cfg.min_pull_events)).min(10_000);
+    let pull_score = threshold_score_bps(pull_ratio_bps, cfg.min_pull_ratio_bps);
+    let execution_score =
+        inverse_threshold_score_bps(execution_ratio_bps, cfg.max_execution_ratio_bps);
+    let thin_score =
+        inverse_threshold_score_bps(visible_after_ratio_bps, cfg.max_visible_after_ratio_bps);
+    let weighted = qty_score * 25
+        + event_score * 20
+        + pull_score * 30
+        + execution_score * 15
+        + thin_score * 10;
+    (weighted / 100).min(10_000) as u16
+}
+
+fn threshold_score_bps(value_bps: u32, threshold_bps: u32) -> u32 {
+    if threshold_bps == 0 {
+        return 10_000;
+    }
+    ratio_bps(u64::from(value_bps), u64::from(threshold_bps)).min(10_000)
+}
+
+fn inverse_threshold_score_bps(value_bps: u32, threshold_bps: u32) -> u32 {
+    if threshold_bps == 0 {
+        return if value_bps == 0 { 10_000 } else { 0 };
+    }
+    10_000_u32.saturating_sub(ratio_bps(u64::from(value_bps), u64::from(threshold_bps)).min(10_000))
 }
 
 fn ratio_bps(numerator: u64, denominator: u64) -> u32 {
@@ -733,6 +1817,48 @@ fn hash_signal(hash: &mut u64, signal: &AbsorptionSignal) {
     hash_u32(hash, signal.pull_events);
     hash_u32(hash, signal.replenishment_ratio_bps);
     hash_u32(hash, signal.pull_ratio_bps);
+    hash_u16(hash, signal.confidence_bps);
+}
+
+fn hash_iceberg_signal(hash: &mut u64, signal: &IcebergSignal) {
+    hash_u64(hash, signal.instrument_id);
+    hash_i64(hash, signal.price);
+    hash_u8(hash, side_to_u8(signal.passive_side));
+    hash_u8(hash, side_to_u8(signal.aggressor_side));
+    hash_u64(hash, signal.window_start_ns);
+    hash_u64(hash, signal.window_end_ns);
+    hash_u64(hash, signal.executed_qty);
+    hash_u64(hash, signal.replenished_qty);
+    hash_u64(hash, signal.pulled_qty);
+    hash_u64(hash, signal.visible_qty_after);
+    hash_u64(hash, signal.max_visible_qty);
+    hash_u32(hash, signal.execute_events);
+    hash_u32(hash, signal.replenish_events);
+    hash_u32(hash, signal.pull_events);
+    hash_u32(hash, signal.replenishment_ratio_bps);
+    hash_u32(hash, signal.over_display_ratio_bps);
+    hash_u32(hash, signal.pull_ratio_bps);
+    hash_u16(hash, signal.confidence_bps);
+}
+
+fn hash_liquidity_pull_signal(hash: &mut u64, signal: &LiquidityPullSignal) {
+    hash_u64(hash, signal.instrument_id);
+    hash_i64(hash, signal.price);
+    hash_u8(hash, side_to_u8(signal.pulled_side));
+    hash_u8(hash, side_to_u8(signal.opposing_side));
+    hash_u64(hash, signal.window_start_ns);
+    hash_u64(hash, signal.window_end_ns);
+    hash_u64(hash, signal.pulled_qty);
+    hash_u64(hash, signal.executed_qty);
+    hash_u64(hash, signal.replenished_qty);
+    hash_u64(hash, signal.visible_qty_after);
+    hash_u64(hash, signal.max_visible_qty);
+    hash_u32(hash, signal.pull_events);
+    hash_u32(hash, signal.execute_events);
+    hash_u32(hash, signal.replenish_events);
+    hash_u32(hash, signal.pull_ratio_bps);
+    hash_u32(hash, signal.execution_ratio_bps);
+    hash_u32(hash, signal.visible_after_ratio_bps);
     hash_u16(hash, signal.confidence_bps);
 }
 
@@ -836,6 +1962,33 @@ mod tests {
             min_replenishment_ratio_bps: 5_000,
             min_visible_qty_after: 25,
             max_pull_ratio_bps: 2_500,
+            cooldown_ns: 500,
+        }
+    }
+
+    fn iceberg_cfg() -> IcebergConfig {
+        IcebergConfig {
+            window_ns: 1_000,
+            min_executed_qty: 100,
+            min_execute_events: 2,
+            min_replenish_events: 2,
+            min_replenished_qty: 100,
+            min_replenishment_ratio_bps: 5_000,
+            min_over_display_ratio_bps: 12_000,
+            max_pull_ratio_bps: 2_500,
+            cooldown_ns: 500,
+        }
+    }
+
+    fn liquidity_pull_cfg() -> LiquidityPullConfig {
+        LiquidityPullConfig {
+            window_ns: 1_000,
+            min_pulled_qty: 250,
+            min_pull_events: 2,
+            min_visible_qty: 400,
+            min_pull_ratio_bps: 5_000,
+            max_execution_ratio_bps: 2_500,
+            max_visible_after_ratio_bps: 5_000,
             cooldown_ns: 500,
         }
     }
@@ -1117,6 +2270,278 @@ mod tests {
         assert!(validation.deterministic);
         assert_eq!(validation.first.frames_total, 4);
         assert_eq!(validation.first.parsed_events, 3);
+        assert_eq!(validation.first.duplicate_events, 1);
+        assert_eq!(validation.first.signals, 1);
+        assert_ne!(validation.first.signal_hash, REPLAY_HASH_OFFSET);
+        assert_eq!(validation.first, validation.second);
+    }
+
+    #[test]
+    fn detects_iceberg_candidate_from_repeated_replenishment() {
+        let mut detector = IcebergDetector::new(iceberg_cfg());
+        detector.observe_obo(10, 7, add(1, 100, 100, Side::Bid));
+        detector.observe_obo(20, 7, execute(1, 100, 60, Side::Ask));
+        detector.observe_obo(30, 7, add(2, 100, 60, Side::Bid));
+        detector.observe_obo(40, 7, execute(2, 100, 60, Side::Ask));
+        let signal = detector
+            .observe_obo(50, 7, add(3, 100, 60, Side::Bid))
+            .expect("iceberg candidate signal");
+        assert_eq!(signal.instrument_id, 7);
+        assert_eq!(signal.price, 100);
+        assert_eq!(signal.passive_side, Side::Bid);
+        assert_eq!(signal.aggressor_side, Side::Ask);
+        assert_eq!(signal.executed_qty, 120);
+        assert_eq!(signal.replenished_qty, 120);
+        assert_eq!(signal.max_visible_qty, 100);
+        assert_eq!(signal.visible_qty_after, 100);
+        assert_eq!(signal.execute_events, 2);
+        assert_eq!(signal.replenish_events, 2);
+        assert_eq!(signal.over_display_ratio_bps, 12_000);
+        assert!(signal.confidence_bps >= 8_000);
+    }
+
+    #[test]
+    fn iceberg_rejects_single_refill_as_insufficient_cycles() {
+        let mut detector = IcebergDetector::new(iceberg_cfg());
+        detector.observe_obo(10, 7, add(1, 100, 100, Side::Bid));
+        detector.observe_obo(20, 7, execute(1, 100, 70, Side::Ask));
+        detector.observe_obo(30, 7, add(2, 100, 70, Side::Bid));
+        let signal = detector.observe_obo(40, 7, execute(2, 100, 50, Side::Ask));
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn iceberg_ignores_replenishment_before_execution_pressure() {
+        let mut config = iceberg_cfg();
+        config.min_execute_events = 1;
+        config.min_replenish_events = 1;
+        config.min_over_display_ratio_bps = 5_000;
+        let mut detector = IcebergDetector::new(config);
+        detector.observe_obo(10, 7, add(1, 100, 100, Side::Bid));
+        detector.observe_obo(20, 7, add(2, 100, 100, Side::Bid));
+        let signal = detector.observe_obo(30, 7, execute(1, 100, 100, Side::Ask));
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn iceberg_raw_frame_parser_feeds_detector() {
+        let mut config = iceberg_cfg();
+        config.min_execute_events = 1;
+        config.min_replenish_events = 1;
+        config.min_executed_qty = 80;
+        config.min_replenished_qty = 50;
+        config.min_over_display_ratio_bps = 8_000;
+        let mut detector = IcebergDetector::new(config);
+        let add_event = add(1, 100, 100, Side::Bid);
+        let execute_event = execute(1, 100, 80, Side::Ask);
+        let replenish_event = add(2, 100, 60, Side::Bid);
+
+        let add_frame = raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_event));
+        assert!(detector.observe_raw_frame(&add_frame).unwrap().is_none());
+        let execute_frame = raw_frame(
+            msg_type::OBO_EXECUTE,
+            7,
+            2,
+            11,
+            110,
+            event_payload(&execute_event),
+        );
+        assert!(detector
+            .observe_raw_frame(&execute_frame)
+            .unwrap()
+            .is_none());
+        let replenish_frame = raw_frame(
+            msg_type::OBO_ADD,
+            7,
+            3,
+            12,
+            120,
+            event_payload(&replenish_event),
+        );
+        let signal = detector
+            .observe_raw_frame(&replenish_frame)
+            .unwrap()
+            .expect("raw frame iceberg signal");
+        assert_eq!(signal.executed_qty, 80);
+        assert_eq!(signal.replenished_qty, 60);
+        assert_eq!(signal.max_visible_qty, 100);
+    }
+
+    #[test]
+    fn iceberg_replay_validation_is_deterministic_and_dedupes_live_frames() {
+        let mut config = iceberg_cfg();
+        config.min_execute_events = 1;
+        config.min_replenish_events = 1;
+        config.min_executed_qty = 80;
+        config.min_replenished_qty = 50;
+        config.min_over_display_ratio_bps = 8_000;
+        let add_event = add(1, 100, 100, Side::Bid);
+        let execute_event = execute(1, 100, 80, Side::Ask);
+        let replenish_event = add(2, 100, 60, Side::Bid);
+        let frames = vec![
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_event)),
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_event)),
+            raw_frame(
+                msg_type::OBO_EXECUTE,
+                7,
+                2,
+                11,
+                110,
+                event_payload(&execute_event),
+            ),
+            raw_frame(
+                msg_type::OBO_ADD,
+                7,
+                3,
+                12,
+                120,
+                event_payload(&replenish_event),
+            ),
+        ];
+
+        let validation = validate_iceberg_replay(&frames, config);
+        assert!(validation.deterministic);
+        assert_eq!(validation.first.frames_total, 4);
+        assert_eq!(validation.first.parsed_events, 3);
+        assert_eq!(validation.first.duplicate_events, 1);
+        assert_eq!(validation.first.signals, 1);
+        assert_ne!(validation.first.signal_hash, REPLAY_HASH_OFFSET);
+        assert_eq!(validation.first, validation.second);
+    }
+
+    #[test]
+    fn detects_liquidity_pull_from_cancels_and_qty_reductions() {
+        let mut detector = LiquidityPullDetector::new(liquidity_pull_cfg());
+        detector.observe_obo(10, 7, add(1, 100, 250, Side::Ask));
+        detector.observe_obo(20, 7, add(2, 100, 250, Side::Ask));
+        assert!(detector.observe_obo(30, 7, cancel(1, 200)).is_none());
+
+        let signal = detector
+            .observe_obo(40, 7, qty_modify(2, 100))
+            .expect("liquidity pull signal");
+        assert_eq!(signal.instrument_id, 7);
+        assert_eq!(signal.price, 100);
+        assert_eq!(signal.pulled_side, Side::Ask);
+        assert_eq!(signal.opposing_side, Side::Bid);
+        assert_eq!(signal.pulled_qty, 350);
+        assert_eq!(signal.executed_qty, 0);
+        assert_eq!(signal.replenished_qty, 500);
+        assert_eq!(signal.max_visible_qty, 500);
+        assert_eq!(signal.visible_qty_after, 150);
+        assert_eq!(signal.pull_events, 2);
+        assert_eq!(signal.pull_ratio_bps, 7_000);
+        assert_eq!(signal.execution_ratio_bps, 0);
+        assert_eq!(signal.visible_after_ratio_bps, 3_000);
+        assert!(signal.confidence_bps >= 8_000);
+    }
+
+    #[test]
+    fn liquidity_pull_rejects_execution_only_liquidity_removal() {
+        let mut config = liquidity_pull_cfg();
+        config.max_visible_after_ratio_bps = 10_000;
+        let mut detector = LiquidityPullDetector::new(config);
+        detector.observe_obo(10, 7, add(1, 100, 250, Side::Bid));
+        detector.observe_obo(20, 7, add(2, 100, 250, Side::Bid));
+        detector.observe_obo(30, 7, execute(1, 100, 250, Side::Ask));
+        let signal = detector.observe_obo(40, 7, execute(2, 100, 250, Side::Ask));
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn liquidity_pull_rejects_small_or_one_event_pull() {
+        let mut detector = LiquidityPullDetector::new(liquidity_pull_cfg());
+        detector.observe_obo(10, 7, add(1, 100, 500, Side::Ask));
+        let one_event_signal = detector.observe_obo(20, 7, cancel(1, 300));
+        assert!(one_event_signal.is_none());
+
+        let mut detector = LiquidityPullDetector::new(liquidity_pull_cfg());
+        detector.observe_obo(10, 7, add(1, 100, 250, Side::Ask));
+        detector.observe_obo(20, 7, add(2, 100, 250, Side::Ask));
+        detector.observe_obo(30, 7, cancel(1, 100));
+        let small_signal = detector.observe_obo(40, 7, cancel(2, 100));
+        assert!(small_signal.is_none());
+    }
+
+    #[test]
+    fn liquidity_pull_duplicate_add_replacement_does_not_count_as_pull() {
+        let mut config = liquidity_pull_cfg();
+        config.min_pull_events = 1;
+        config.min_pulled_qty = 200;
+        let mut detector = LiquidityPullDetector::new(config);
+        detector.observe_obo(10, 7, add(1, 100, 500, Side::Ask));
+        let signal = detector.observe_obo(20, 7, add(1, 100, 250, Side::Ask));
+        assert!(signal.is_none());
+    }
+
+    #[test]
+    fn liquidity_pull_raw_frame_parser_feeds_detector() {
+        let mut detector = LiquidityPullDetector::new(liquidity_pull_cfg());
+        let add_one = add(1, 100, 250, Side::Ask);
+        let add_two = add(2, 100, 250, Side::Ask);
+        let cancel_one = cancel(1, 200);
+        let modify_two = qty_modify(2, 100);
+
+        let add_frame = raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_one));
+        assert!(detector.observe_raw_frame(&add_frame).unwrap().is_none());
+        let add_frame = raw_frame(msg_type::OBO_ADD, 7, 2, 11, 110, event_payload(&add_two));
+        assert!(detector.observe_raw_frame(&add_frame).unwrap().is_none());
+        let cancel_frame = raw_frame(
+            msg_type::OBO_CANCEL,
+            7,
+            3,
+            12,
+            120,
+            event_payload(&cancel_one),
+        );
+        assert!(detector.observe_raw_frame(&cancel_frame).unwrap().is_none());
+        let modify_frame = raw_frame(
+            msg_type::OBO_MODIFY,
+            7,
+            4,
+            13,
+            130,
+            event_payload(&modify_two),
+        );
+        let signal = detector
+            .observe_raw_frame(&modify_frame)
+            .unwrap()
+            .expect("raw frame liquidity pull signal");
+        assert_eq!(signal.pulled_qty, 350);
+        assert_eq!(signal.max_visible_qty, 500);
+    }
+
+    #[test]
+    fn liquidity_pull_replay_validation_is_deterministic_and_dedupes_live_frames() {
+        let add_one = add(1, 100, 250, Side::Ask);
+        let add_two = add(2, 100, 250, Side::Ask);
+        let cancel_one = cancel(1, 200);
+        let modify_two = qty_modify(2, 100);
+        let frames = vec![
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_one)),
+            raw_frame(msg_type::OBO_ADD, 7, 1, 10, 100, event_payload(&add_one)),
+            raw_frame(msg_type::OBO_ADD, 7, 2, 11, 110, event_payload(&add_two)),
+            raw_frame(
+                msg_type::OBO_CANCEL,
+                7,
+                3,
+                12,
+                120,
+                event_payload(&cancel_one),
+            ),
+            raw_frame(
+                msg_type::OBO_MODIFY,
+                7,
+                4,
+                13,
+                130,
+                event_payload(&modify_two),
+            ),
+        ];
+
+        let validation = validate_liquidity_pull_replay(&frames, liquidity_pull_cfg());
+        assert!(validation.deterministic);
+        assert_eq!(validation.first.frames_total, 5);
+        assert_eq!(validation.first.parsed_events, 4);
         assert_eq!(validation.first.duplicate_events, 1);
         assert_eq!(validation.first.signals, 1);
         assert_ne!(validation.first.signal_hash, REPLAY_HASH_OFFSET);
