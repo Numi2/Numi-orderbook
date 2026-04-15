@@ -36,9 +36,42 @@ Packet ownership
   actual timestamp returned by the kernel.
 - PACKET_MMAP drops must recycle the copied packet buffer before releasing the
   kernel frame.
+- Merge-stage duplicate, stale, and out-of-window gap drops must recycle packet
+  buffers when the packet pool is available to merge.
 
 Local development gates
 -----------------------
+- `NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet` must complete.
+- `cargo run --release --bin bench_pipeline -- local-core` must report
+  `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`, `event_vec_reallocs=0`, and
+  `pool_available=pool_size`.
+- `cargo run --release --bin pool_soak -- 65536 2048 10000 64` must report
+  `misses=0` and `return_drops=0`.
+- `cargo run --release --bin rx_probe -- 100000 64 32 software 0` must report
+  `missing=0`, `seq_gaps=0`, and `dup_or_ooo=0`.
+- Local benchmark throughput is host-noise-sensitive and is not a production
+  SLO claim.
+
+Target-hardware benchmark gates
+-------------------------------
+- `cargo run --release --bin bench_pipeline -- target-rx --config config.toml
+  --duration-sec 60 --packets 892800000` while production-like multicast
+  traffic is present. For 10GbE 64-byte payload class, require 14.88 Mpps for
+  60 seconds, zero app drops, and latency buckets by timestamp source.
+- `cargo run --release --bin bench_pipeline -- target-rx --config config.toml
+  --duration-sec 30 --packets 1125000000` for the 25GbE profile. Require 37.5
+  Mpps for 30 seconds and zero drops.
+- `cargo run --release --bin bench_pipeline -- target-failover-recovery` must
+  report `status=ok`, no sequence gaps, no duplicate/out-of-order output, and
+  recovery under 100 ms for the injected gap.
+- `cargo run --release --bin bench_pipeline -- target-persistence --packets
+  1024` must report `status=ok`, `anchored=true`, no non-monotonic journal
+  records, and matching final/restored state hashes.
+- Target results must record git SHA, rustc, allocator, OS/kernel, CPU, NIC,
+  timestamp source, config path, and config hash from the benchmark output.
+
+Verification record
+-------------------
 - 2026-04-15: `cargo clippy --all-targets --all-features -- -D warnings`
   passed.
 - 2026-04-15: `RUSTFLAGS='' cargo check --target x86_64-unknown-linux-gnu
@@ -50,8 +83,12 @@ Local development gates
 - 2026-04-15: `cargo build --release` passed.
 - 2026-04-15: `cargo run --release --bin pool_soak -- 65536 2048 10000 64`
   completed 640,000 operations with `misses=0` and `return_drops=0`.
-- 2026-04-15: `cargo run --release --bin bench_orderbook -- 64 10000 64`
-  processed 1,173,376 synthetic events successfully on the local development
-  host. This is a smoke benchmark, not a substitute for the hardware SLO runs
-  above, and local throughput samples are treated as host-noise-sensitive.
+- 2026-04-15: `NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet`
+  completed the Criterion smoke microbenchmarks.
+- 2026-04-15: `cargo run --release --bin bench_pipeline -- local-core --packets
+  512` reported `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`,
+  `event_vec_reallocs=0`, and `pool_available=pool_size`.
+- 2026-04-15: `cargo run --release --bin bench_pipeline --
+  target-failover-recovery` reported `status=ok` for a 1,000-message gap with
+  `pool_available=pool_size`.
 - 2026-04-15: `docker build -t numi-orderbook:local .` passed.

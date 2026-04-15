@@ -1,6 +1,6 @@
 // src/merge.rs (updated: metrics + recovery)
 use crate::metrics;
-use crate::pool::Pkt;
+use crate::pool::{PacketPool, Pkt};
 use crate::recovery::RecoveryClient;
 use crate::spsc::{AdaptiveBatchCap, SpscQueue, DEFAULT_BATCH_CAP};
 use crate::util::BarrierFlag;
@@ -17,15 +17,26 @@ pub struct MergeConfig {
     pub reorder_window_max: u64,
 }
 
+#[derive(Default, Clone)]
+pub struct MergeRuntime {
+    pub recovery: Option<RecoveryClient>,
+    pub q_recovery_in: Option<Arc<SpscQueue<Pkt>>>,
+    pub drop_pool: Option<Arc<PacketPool>>,
+}
+
 pub fn merge_loop(
     q_a_list: Vec<Arc<SpscQueue<Pkt>>>,
     q_b_list: Vec<Arc<SpscQueue<Pkt>>>,
     q_out: Arc<SpscQueue<Pkt>>,
     cfg: MergeConfig,
     shutdown: Arc<BarrierFlag>,
-    recovery: Option<RecoveryClient>,
-    q_recovery_in: Option<Arc<SpscQueue<Pkt>>>, // optional recovery->merge SPSC queue
+    runtime: MergeRuntime,
 ) -> anyhow::Result<()> {
+    let MergeRuntime {
+        recovery,
+        q_recovery_in,
+        drop_pool,
+    } = runtime;
     let MergeConfig {
         mut next_seq,
         mut reorder_window,
@@ -95,6 +106,7 @@ pub fn merge_loop(
                     let s = pkt.seq;
                     if s < next_seq {
                         metrics::inc_merge_dup();
+                        recycle_dropped(pkt, drop_pool.as_deref());
                     } else if s == next_seq {
                         stage_forward(&q_out, &mut forward_batch, &mut forward_batch_cap, pkt);
                         metrics::inc_merge_forward_chan("R");
@@ -139,10 +151,16 @@ pub fn merge_loop(
                                 Some((seq_in_slot, _)) => {
                                     if *seq_in_slot == s {
                                         metrics::inc_merge_dup();
+                                        recycle_dropped(pkt, drop_pool.as_deref());
                                     } else if *seq_in_slot < next_seq {
-                                        ring[idx] = Some((s, pkt));
+                                        if let Some((_old_seq, old_pkt)) =
+                                            ring[idx].replace((s, pkt))
+                                        {
+                                            recycle_dropped(old_pkt, drop_pool.as_deref());
+                                        }
                                     } else {
                                         metrics::inc_merge_dup();
+                                        recycle_dropped(pkt, drop_pool.as_deref());
                                     }
                                 }
                                 None => {
@@ -159,6 +177,7 @@ pub fn merge_loop(
                                     cli.notify_gap(next_seq, s - 1);
                                 }
                             }
+                            recycle_dropped(pkt, drop_pool.as_deref());
                         }
                     }
                 } else {
@@ -183,6 +202,7 @@ pub fn merge_loop(
                 let s = pkt.seq;
                 if s < next_seq {
                     metrics::inc_merge_dup();
+                    recycle_dropped(pkt, drop_pool.as_deref());
                     continue;
                 }
                 if s == next_seq {
@@ -256,12 +276,16 @@ pub fn merge_loop(
                             Some((seq_in_slot, _)) => {
                                 if *seq_in_slot == s {
                                     metrics::inc_merge_dup();
+                                    recycle_dropped(pkt, drop_pool.as_deref());
                                 } else if *seq_in_slot < next_seq {
                                     // stale slot from an old window; replace
-                                    ring[idx] = Some((s, pkt));
+                                    if let Some((_old_seq, old_pkt)) = ring[idx].replace((s, pkt)) {
+                                        recycle_dropped(old_pkt, drop_pool.as_deref());
+                                    }
                                 } else {
                                     // different seq still in-window shouldn't alias due to cap, but guard anyway
                                     metrics::inc_merge_dup();
+                                    recycle_dropped(pkt, drop_pool.as_deref());
                                 }
                             }
                             None => {
@@ -283,6 +307,7 @@ pub fn merge_loop(
                                 cli.notify_gap(next_seq, s - 1);
                             }
                         }
+                        recycle_dropped(pkt, drop_pool.as_deref());
                     }
                 }
             }
@@ -317,7 +342,18 @@ pub fn merge_loop(
         }
     }
 
+    for (_seq, pkt) in ring.into_iter().flatten() {
+        recycle_dropped(pkt, drop_pool.as_deref());
+    }
+
     Ok(())
+}
+
+#[inline]
+fn recycle_dropped(pkt: Pkt, pool: Option<&PacketPool>) {
+    if let Some(pool) = pool {
+        pkt.recycle(pool);
+    }
 }
 
 #[inline]
@@ -437,6 +473,20 @@ mod tests {
         }
     }
 
+    fn pooled_pkt(pool: &crate::pool::PacketPool, seq: u64, chan: u8) -> Pkt {
+        let mut buf = pool.get();
+        buf.extend_from_slice(&seq.to_le_bytes());
+        Pkt {
+            buf: crate::pool::PktBuf::Bytes(buf),
+            len: 8,
+            seq,
+            ts_nanos: 0,
+            chan,
+            _ts_kind: crate::pool::TsKind::Sw,
+            merge_emit_ns: 0,
+        }
+    }
+
     fn collect_until(q_out: &Arc<SpscQueue<Pkt>>, expected: usize) -> Vec<u64> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
         while q_out.len() < expected && std::time::Instant::now() < deadline {
@@ -457,6 +507,7 @@ mod tests {
         shutdown: Arc<crate::util::BarrierFlag>,
         recovery: Option<RecoveryClient>,
         q_recovery: Option<Arc<SpscQueue<Pkt>>>,
+        drop_pool: Option<Arc<crate::pool::PacketPool>>,
         cfg: MergeConfig,
     }
 
@@ -473,6 +524,7 @@ mod tests {
             shutdown,
             recovery: None,
             q_recovery: None,
+            drop_pool: None,
             cfg: MergeConfig {
                 next_seq: 1,
                 reorder_window: 4,
@@ -492,8 +544,11 @@ mod tests {
                 fixture.q_out,
                 fixture.cfg,
                 fixture.shutdown,
-                fixture.recovery,
-                fixture.q_recovery,
+                MergeRuntime {
+                    recovery: fixture.recovery,
+                    q_recovery_in: fixture.q_recovery,
+                    drop_pool: fixture.drop_pool,
+                },
             );
         })
     }
@@ -612,6 +667,41 @@ mod tests {
         assert!(t.join().is_ok());
 
         assert_eq!(recovery.gaps.lock().unwrap().as_slice(), &[(2, 4)]);
+    }
+
+    #[test]
+    fn merge_recycles_duplicate_and_gap_drops_when_pool_is_available() {
+        let pool = Arc::new(crate::pool::PacketPool::new(8, 64).unwrap());
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+
+        let mut fixture = merge_fixture(q_a.clone(), q_b.clone(), q_out.clone(), shutdown.clone());
+        fixture.drop_pool = Some(pool.clone());
+        fixture.cfg.reorder_window = 2;
+        let t = spawn_merge_fixture(fixture);
+
+        let _ = q_a.push(pooled_pkt(&pool, 1, b'A'));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while q_out.is_empty() && std::time::Instant::now() < deadline {
+            crate::util::spin_wait(1000);
+        }
+        let first = q_out.pop().expect("first packet forwarded");
+        assert_eq!(first.seq, 1);
+        first.recycle(&pool);
+
+        let _ = q_b.push(pooled_pkt(&pool, 1, b'B'));
+        let _ = q_b.push(pooled_pkt(&pool, 5, b'B'));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while pool.available() < 8 && std::time::Instant::now() < deadline {
+            crate::util::spin_wait(1000);
+        }
+        shutdown.raise();
+        assert!(t.join().is_ok());
+
+        assert_eq!(pool.available(), 8);
     }
 
     #[test]

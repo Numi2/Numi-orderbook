@@ -1,4 +1,6 @@
 pub mod alloc;
+#[doc(hidden)]
+pub mod bench_support;
 pub mod codec_raw;
 pub mod config;
 pub mod decode;

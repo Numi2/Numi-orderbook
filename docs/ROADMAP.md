@@ -117,6 +117,12 @@ Completed in current working tree:
 - Order-book slab capacity growth is counted with `orderbook_slab_grows_total`.
 - `pool_soak` synthetic harness verifies packet-pool sizing and fails on
   fallback allocation or return-drop counters by default.
+- Criterion hot-path microbenchmarks now cover mixed L3 book apply, EOBI/ITCH/
+  FAST-like decoder throughput, SPSC/packet-pool hot loops, and raw-v1 OBO
+  publication.
+- `bench_pipeline` now provides local core/distribution smoke profiles plus
+  target RX, failover/recovery, and persistence benchmark profiles with
+  machine-readable metadata output.
 - Cold-path depth assembly vector growth is counted with
   `orderbook_depth_vec_grows_total`.
 - Snapshot export vector growth is counted with `orderbook_export_vec_grows_total`.
@@ -136,6 +142,9 @@ Completed in current working tree:
   non-Linux fallback.
 - `rx_probe` provides a loopback receive integrity/timestamp smoke gate for the
   active platform UDP path.
+- Merge now receives packet-pool ownership context and recycles duplicate,
+  stale, and out-of-window gap drops instead of letting dropped packet buffers
+  leave the preallocated pool.
 - Timestamp parsing distinguishes actual `SCM_TIMESTAMPING` slots: software,
   system-hardware, and raw-hardware timestamps are labeled by the timestamp that
   was actually present, not only by requested mode.
@@ -158,8 +167,8 @@ Completed in current working tree:
   empty feature flags.
 - Local development gates pass on 2026-04-15: `cargo fmt`, strict
   `cargo clippy --all-targets --all-features -- -D warnings`,
-  `cargo test --all-features`, `cargo build --release`, and `pool_soak` with
-  zero misses and zero return drops.
+  `cargo test --all-features`, `cargo build --release`, `pool_soak` with zero
+  misses and zero return drops, and the lean benchmark smoke gates.
 
 Remaining:
 - Run target-hardware benchmark and latency SLO measurements on pinned,

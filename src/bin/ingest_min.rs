@@ -141,6 +141,7 @@ fn main() -> anyhow::Result<()> {
     // Merge thread
     let q_merged_for_merge = q_merged.clone();
     let merge_shutdown = shutdown.clone();
+    let merge_drop_pool = pool.clone();
     let merge_cfg = merge::MergeConfig {
         next_seq: cfg.merge.initial_expected_seq,
         reorder_window: cfg.merge.reorder_window,
@@ -163,8 +164,10 @@ fn main() -> anyhow::Result<()> {
             q_merged_for_merge,
             merge_cfg,
             merge_shutdown,
-            None,
-            None,
+            merge::MergeRuntime {
+                drop_pool: Some(merge_drop_pool),
+                ..merge::MergeRuntime::default()
+            },
         );
     })?;
 

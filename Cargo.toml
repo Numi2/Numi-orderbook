@@ -10,6 +10,7 @@ license = "Apache-2.0"
 default = ["ws", "obo"]
 ws = []
 obo = []
+bench-fixtures = []
 jemalloc = ["dep:jemallocator"]
 mimalloc = ["dep:mimalloc"]
 
@@ -52,4 +53,9 @@ opt-level = 3
 panic = "abort"
 
 [dev-dependencies]
+criterion = "0.5"
 proptest = "1"
+
+[[bench]]
+name = "hot_paths"
+harness = false

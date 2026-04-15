@@ -127,16 +127,38 @@ RUSTFLAGS='' cargo check --target x86_64-unknown-linux-gnu --all-targets
 RUSTFLAGS='' cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
 ```
 
-Hot-path allocation smoke gates:
+Lean benchmark smoke gates:
 
 ```bash
+NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet
 cargo run --release --bin pool_soak -- 65536 2048 10000 64
-cargo run --release --bin bench_orderbook -- 64 10000 64
 cargo run --release --bin rx_probe -- 100000 64 32 software 0
+cargo run --release --bin bench_pipeline -- local-core
 ```
 
 `pool_soak` must report `misses=0` and `return_drops=0` for production pool
-sizing. The Dockerfile is also part of the pre-push gate:
+sizing. `bench_pipeline -- local-core` reports a single machine-readable
+`key=value` line and must show `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`,
+`event_vec_reallocs=0`, and `pool_available=pool_size`. Local throughput and
+latency samples are smoke signals only; production latency claims must come
+from pinned target hardware with the target NIC, kernel, timestamp source, and
+clock sync.
+
+Additional benchmark profiles:
+
+```bash
+cargo run --release --bin bench_pipeline -- local-distribution
+cargo run --release --bin bench_pipeline -- target-rx --config config.toml --duration-sec 60 --packets 892800000
+cargo run --release --bin bench_pipeline -- target-failover-recovery
+cargo run --release --bin bench_pipeline -- target-persistence --packets 1024
+```
+
+`target-rx` binds the configured multicast sockets and expects production-like
+traffic to already be present; use `mcast_burst` or `pcap_replay` from another
+process/host to drive the feed. `target-failover-recovery` uses a synthetic
+1,000-message gap and fails unless merge output stays monotonic and the packet
+pool returns to full availability. The Dockerfile is also part of the pre-push
+gate:
 
 ```bash
 docker build -t numi-orderbook:local .
@@ -247,9 +269,10 @@ whose cursor has fallen outside retained live replay, are rejected.
 - `src/pubsub.rs`: retained raw-v1 publication bus.
 - `src/ws_server.rs`: WebSocket feed serving, reconnect, snapshot handling.
 - `src/metrics.rs`: Prometheus metrics and health endpoints.
+- `benches/hot_paths.rs`: Criterion microbenchmarks for the highest-ROI hot paths.
+- `src/bin/bench_pipeline.rs`: local and target-hardware macro benchmark runner.
 - `src/bin/pool_soak.rs`: packet-pool allocation soak.
 - `src/bin/rx_probe.rs`: loopback UDP receive integrity and timestamp probe.
-- `src/bin/bench_orderbook.rs`: synthetic order-book benchmark.
 - `docs/`: roadmap, timestamp strategy, SLOs, and raw-v1 wire format.
 - `ops/`: Linux tuning and queue steering helpers.
 

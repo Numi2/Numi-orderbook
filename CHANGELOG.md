@@ -57,7 +57,8 @@ This project loosely follows the Keep a Changelog format.
 - `cargo test --all-features`
 - `cargo build --release`
 - `cargo run --release --bin pool_soak -- 65536 2048 10000 64`
-- `cargo run --release --bin bench_orderbook -- 64 10000 64`
+- `NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet`
+- `cargo run --release --bin bench_pipeline -- local-core`
 - `docker build -t numi-orderbook:local .`
 
 - 2025-11-01
@@ -83,7 +84,14 @@ This project loosely follows the Keep a Changelog format.
 
 ### Added (performance & tooling)
 - OrderBook batch APIs: `apply_many(&[Event])` and `apply_many_for_instr(instr, &[Event])` to amortize lookups and reuse hot structures.
-- Micro-benchmark binary: `src/bin/bench_orderbook.rs` to measure OrderBook adds/mods/dels throughput.
+- Criterion microbenchmarks: `benches/hot_paths.rs` for mixed book apply,
+  decoder throughput, queue/pool hot loops, and raw-v1 OBO publication.
+- Macro benchmark runner: `src/bin/bench_pipeline.rs` for local core,
+  local distribution, target RX, failover/recovery, and persistence profiles.
+- Merge-stage duplicate, stale, and out-of-window packet drops now recycle
+  packet buffers when merge is wired with the packet pool; the failover/recovery
+  benchmark asserts the pool returns to full availability after a 1,000-message
+  synthetic gap.
 - Minimal ingest runner: `src/bin/ingest_min.rs` (RX → merge → metrics) to facilitate end-to-end latency testing without publishers.
 
 ### Changed
@@ -108,7 +116,8 @@ This project loosely follows the Keep a Changelog format.
 - Optional Bearer token authentication for WebSocket endpoints (if `feeds.auth_token` configured)
 
 ### Performance
-- OrderBook micro-benchmark (32 instruments × 5k orders/instr, batch=64) on release build achieved ~9.68 M events/sec total across adds/mods/dels.
+- The old standalone `bench_orderbook` binary has been retired in favor of
+  Criterion hot-path benches and `bench_pipeline` profiles.
 - Stage metrics exposed for RX→merge and merge→decode latencies; Prometheus histograms for e2e latency.
 
 ### Notes

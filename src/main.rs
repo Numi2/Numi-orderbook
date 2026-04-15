@@ -394,6 +394,7 @@ fn main() -> anyhow::Result<()> {
     let merge_shutdown = shutdown.clone();
     let recovery_cli = recovery_client.clone();
     let q_merged_for_merge = q_merged.clone();
+    let merge_drop_pool = pool.clone();
     let t_merge = thread::Builder::new().name("merge".into()).spawn(move || {
         pin_to_core_if_set(cfg.cpu.merge_core);
         set_realtime_priority_if(cfg.cpu.rt_priority);
@@ -415,8 +416,11 @@ fn main() -> anyhow::Result<()> {
                 ),
             },
             merge_shutdown,
-            Some(recovery_cli),
-            q_recovery_opt,
+            orderbook::merge::MergeRuntime {
+                recovery: Some(recovery_cli),
+                q_recovery_in: q_recovery_opt,
+                drop_pool: Some(merge_drop_pool),
+            },
         ) {
             error!("merge failed: {e:?}");
         }
