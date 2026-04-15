@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use slab::Slab;
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::num::NonZeroUsize;
 
 type Handle = usize;
@@ -12,6 +13,93 @@ type Bbo = (Option<(i64, i64)>, Option<(i64, i64)>);
 type Depth32 = SmallVec<[(i64, i64); 32]>;
 const BOOK_HASH_OFFSET: u64 = 0xcbf29ce484222325;
 const BOOK_HASH_PRIME: u64 = 0x00000100000001b3;
+
+#[derive(Default)]
+struct NumericIdentityHasher {
+    state: u64,
+}
+
+impl Hasher for NumericIdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.state == 0 {
+            BOOK_HASH_OFFSET
+        } else {
+            self.state
+        };
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(BOOK_HASH_PRIME);
+        }
+        self.state = h;
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.state = u64::from(i);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.state = u64::from(i);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.state = u64::from(i);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.state = i;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.state = i as u64;
+    }
+
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.state = i as u64;
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.state = i as u64;
+    }
+}
+
+type NumericBuildHasher = BuildHasherDefault<NumericIdentityHasher>;
+type GlobalOrderIndex = HashMap<u64, (u32, Handle), NumericBuildHasher>;
+type LocalOrderIndex = HashMap<u64, Handle, NumericBuildHasher>;
+type InstrumentMap = HashMap<u32, InstrumentBook, NumericBuildHasher>;
+type InstrumentTickMap = HashMap<u32, i64, NumericBuildHasher>;
+
+#[inline]
+fn global_order_index_with_capacity(capacity: usize) -> GlobalOrderIndex {
+    HashMap::with_capacity_and_hasher(capacity, NumericBuildHasher::default())
+}
+
+#[inline]
+fn local_order_index_with_capacity(capacity: usize) -> LocalOrderIndex {
+    HashMap::with_capacity_and_hasher(capacity, NumericBuildHasher::default())
+}
+
+#[inline]
+fn instrument_map_with_capacity(capacity: usize) -> InstrumentMap {
+    HashMap::with_capacity_and_hasher(capacity, NumericBuildHasher::default())
+}
+
+#[inline]
+fn instrument_tick_map_with_capacity(capacity: usize) -> InstrumentTickMap {
+    HashMap::with_capacity_and_hasher(capacity, NumericBuildHasher::default())
+}
 
 #[inline(always)]
 fn to_nz(h: Handle) -> NonZeroUsize {
@@ -264,11 +352,21 @@ struct InstrumentBook {
     bids_overflow: BTreeMap<i64, Level>,
     asks_overflow: BTreeMap<i64, Level>,
     orders: Slab<Node>,
+    order_index: LocalOrderIndex,
     // Cached best prices and quantities for O(1) BBO
     best_bid: Option<i64>,
     best_ask: Option<i64>,
     best_bid_qty: i64,
     best_ask_qty: i64,
+}
+
+struct AddLevelTarget<'a> {
+    orders: &'a mut Slab<Node>,
+    grid: &'a mut PriceGrid,
+    overflow: &'a mut BTreeMap<i64, Level>,
+    best_price: &'a mut Option<i64>,
+    best_qty: &'a mut i64,
+    side: Side,
 }
 
 impl InstrumentBook {
@@ -280,6 +378,7 @@ impl InstrumentBook {
             bids_overflow: BTreeMap::new(),
             asks_overflow: BTreeMap::new(),
             orders: Slab::with_capacity(1 << 20),
+            order_index: local_order_index_with_capacity(1 << 20),
             best_bid: None,
             best_ask: None,
             best_bid_qty: 0,
@@ -288,13 +387,19 @@ impl InstrumentBook {
     }
 
     #[inline]
-    fn with_params(order_slab_capacity: usize, tick: i64, span: usize) -> Self {
+    fn with_params(
+        order_slab_capacity: usize,
+        order_index_capacity: usize,
+        tick: i64,
+        span: usize,
+    ) -> Self {
         Self {
             bids_grid: PriceGrid::new(tick, span),
             asks_grid: PriceGrid::new(tick, span),
             bids_overflow: BTreeMap::new(),
             asks_overflow: BTreeMap::new(),
             orders: Slab::with_capacity(order_slab_capacity),
+            order_index: local_order_index_with_capacity(order_index_capacity),
             best_bid: None,
             best_ask: None,
             best_bid_qty: 0,
@@ -303,12 +408,29 @@ impl InstrumentBook {
     }
 
     #[inline]
-    fn ensure_level_mut(&mut self, side: Side, price: i64) -> &mut Level {
-        let (grid, overflow) = match side {
-            Side::Bid => (&mut self.bids_grid, &mut self.bids_overflow),
-            Side::Ask => (&mut self.asks_grid, &mut self.asks_overflow),
-        };
-        Self::ensure_level_mut_in_grid(grid, overflow, price)
+    fn index_order(&mut self, order_id: u64, handle: Handle) {
+        self.order_index.insert(order_id, handle);
+    }
+
+    #[inline]
+    fn remove_indexed_order(&mut self, order_id: u64) -> Option<Handle> {
+        self.order_index.remove(&order_id)
+    }
+
+    #[inline]
+    fn order_handle(&self, order_id: u64) -> Option<Handle> {
+        self.order_index.get(&order_id).copied()
+    }
+
+    fn reserve_capacity(&mut self, order_slab_capacity: usize, order_index_capacity: usize) {
+        if order_slab_capacity > self.orders.capacity() {
+            self.orders
+                .reserve(order_slab_capacity.saturating_sub(self.orders.len()));
+        }
+        if order_index_capacity > self.order_index.capacity() {
+            self.order_index
+                .reserve(order_index_capacity.saturating_sub(self.order_index.len()));
+        }
     }
 
     #[inline]
@@ -495,60 +617,77 @@ impl InstrumentBook {
         if self.orders.capacity() > capacity_before {
             crate::metrics::inc_orderbook_slab_grow();
         }
-        // Obtain previous tail without holding the level borrow across order mutations
-        let prev_tail: Option<NonZeroUsize> = {
-            let lvl = self.ensure_level_mut(side, price);
-            lvl.tail
-        };
-        let h_nz = to_nz(h);
-        if let Some(t) = prev_tail {
-            self.orders[from_nz(t)].next = Some(h_nz);
-        }
-        {
-            let n = &mut self.orders[h];
-            n.prev = prev_tail;
-            n.next = None;
-        }
-        let new_total_opt: Option<i64>;
-        {
-            let lvl = self.ensure_level_mut(side, price);
-            if prev_tail.is_none() {
-                lvl.head = Some(h_nz);
-            }
-            lvl.tail = Some(h_nz);
-            lvl.count += 1;
-            lvl.total_qty += qty;
-            new_total_opt = Some(lvl.total_qty);
-        }
-        if let Some(new_total) = new_total_opt {
-            match side {
-                Side::Bid => {
-                    let improves_best = match self.best_bid {
-                        Some(b) => price > b,
-                        None => true,
-                    };
-                    if improves_best {
-                        self.best_bid = Some(price);
-                        self.best_bid_qty = new_total;
-                    } else if self.best_bid == Some(price) {
-                        self.best_bid_qty = new_total;
-                    }
-                }
-                Side::Ask => {
-                    let improves_best = match self.best_ask {
-                        Some(a) => price < a,
-                        None => true,
-                    };
-                    if improves_best {
-                        self.best_ask = Some(price);
-                        self.best_ask_qty = new_total;
-                    } else if self.best_ask == Some(price) {
-                        self.best_ask_qty = new_total;
-                    }
-                }
-            }
+        match side {
+            Side::Bid => Self::append_order_at_level(
+                AddLevelTarget {
+                    orders: &mut self.orders,
+                    grid: &mut self.bids_grid,
+                    overflow: &mut self.bids_overflow,
+                    best_price: &mut self.best_bid,
+                    best_qty: &mut self.best_bid_qty,
+                    side,
+                },
+                price,
+                qty,
+                h,
+            ),
+            Side::Ask => Self::append_order_at_level(
+                AddLevelTarget {
+                    orders: &mut self.orders,
+                    grid: &mut self.asks_grid,
+                    overflow: &mut self.asks_overflow,
+                    best_price: &mut self.best_ask,
+                    best_qty: &mut self.best_ask_qty,
+                    side,
+                },
+                price,
+                qty,
+                h,
+            ),
         }
         h
+    }
+
+    #[inline]
+    fn append_order_at_level(target: AddLevelTarget<'_>, price: i64, qty: i64, handle: Handle) {
+        let AddLevelTarget {
+            orders,
+            grid,
+            overflow,
+            best_price,
+            best_qty,
+            side,
+        } = target;
+        let lvl = Self::ensure_level_mut_in_grid(grid, overflow, price);
+        let prev_tail = lvl.tail;
+        let h_nz = to_nz(handle);
+
+        if let Some(tail) = prev_tail {
+            orders[from_nz(tail)].next = Some(h_nz);
+        }
+        {
+            let node = &mut orders[handle];
+            node.prev = prev_tail;
+            node.next = None;
+        }
+        if prev_tail.is_none() {
+            lvl.head = Some(h_nz);
+        }
+        lvl.tail = Some(h_nz);
+        lvl.count += 1;
+        lvl.total_qty += qty;
+
+        let improves_best = match *best_price {
+            Some(current) if side == Side::Bid => price > current,
+            Some(current) => price < current,
+            None => true,
+        };
+        if improves_best {
+            *best_price = Some(price);
+            *best_qty = lvl.total_qty;
+        } else if *best_price == Some(price) {
+            *best_qty = lvl.total_qty;
+        }
     }
 
     #[inline]
@@ -691,6 +830,33 @@ impl InstrumentBook {
         reverse_index: &HashMap<(u32, Handle), u64>,
         visited: &mut HashSet<(u32, Handle)>,
     ) -> Result<(), String> {
+        let global_indexed_for_instr = reverse_index
+            .keys()
+            .filter(|(indexed_instr, _)| *indexed_instr == instr)
+            .count();
+        if self.order_index.len() != global_indexed_for_instr {
+            return Err(format!(
+                "instr {instr}: local order index len {} != global index len {}",
+                self.order_index.len(),
+                global_indexed_for_instr
+            ));
+        }
+        for (order_id, handle) in &self.order_index {
+            match reverse_index.get(&(instr, *handle)) {
+                Some(global_order_id) if global_order_id == order_id => {}
+                Some(global_order_id) => {
+                    return Err(format!(
+                        "instr {instr}: local order {order_id} handle {handle} disagrees with global order {global_order_id}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "instr {instr}: local order {order_id} handle {handle} missing from global index"
+                    ));
+                }
+            }
+        }
+
         let mut seen_levels = HashSet::new();
         for i in 0..self.bids_grid.slots.len() {
             if let Some(level) = &self.bids_grid.slots[i] {
@@ -909,63 +1075,76 @@ fn push_export_instrument(instruments: &mut Vec<InstrumentExport>, instrument: I
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OrderBookCapacity {
+    /// Number of instrument books and tick-table entries to reserve up front.
+    /// Startup wiring sets this from explicit config or loaded refdata rows.
+    pub instruments: usize,
+    /// Total live order-id mappings to reserve in the cross-instrument index.
+    pub global_order_index: usize,
+    /// Live order-id mappings to reserve inside each instrument book.
+    pub per_instrument_order_index: usize,
+    /// Create books immediately for instruments found in refdata instead of
+    /// waiting for the first add. This also allocates each configured slab.
+    pub preallocate_instrument_books: bool,
+}
+
 #[derive(Debug)]
 pub struct OrderBook {
     _depth_for_reporting: usize,
-    books: HashMap<u32, InstrumentBook>,
-    index: HashMap<u64, (u32, Handle)>,
+    books: InstrumentMap,
+    index: GlobalOrderIndex,
     last_instr: Option<u32>,
     consume_trades: bool,
     default_slab_capacity: usize,
+    default_order_index_capacity: usize,
     grid_tick: i64,
     grid_span: usize,
-    instrument_ticks: HashMap<u32, i64>,
+    instrument_ticks: InstrumentTickMap,
 }
 
 impl OrderBook {
     pub fn new(depth_for_reporting: usize) -> Self {
-        Self {
-            _depth_for_reporting: depth_for_reporting,
-            books: HashMap::new(),
-            index: HashMap::new(),
-            last_instr: None,
-            consume_trades: false,
-            default_slab_capacity: 1 << 20,
-            grid_tick: 1,
-            grid_span: 16384,
-            instrument_ticks: HashMap::new(),
-        }
+        Self::new_with_grid_and_capacity(
+            depth_for_reporting,
+            false,
+            1 << 20,
+            1,
+            16384,
+            OrderBookCapacity::default(),
+        )
     }
+
     pub fn new_with_options(depth_for_reporting: usize, consume_trades: bool) -> Self {
-        Self {
-            _depth_for_reporting: depth_for_reporting,
-            books: HashMap::new(),
-            index: HashMap::new(),
-            last_instr: None,
+        Self::new_with_grid_and_capacity(
+            depth_for_reporting,
             consume_trades,
-            default_slab_capacity: 1 << 20,
-            grid_tick: 1,
-            grid_span: 16384,
-            instrument_ticks: HashMap::new(),
-        }
+            1 << 20,
+            1,
+            16384,
+            OrderBookCapacity::default(),
+        )
     }
+
     pub fn new_with_options_and_capacity(
         depth_for_reporting: usize,
         consume_trades: bool,
         default_slab_capacity: usize,
     ) -> Self {
-        Self {
-            _depth_for_reporting: depth_for_reporting,
-            books: HashMap::new(),
-            index: HashMap::new(),
-            last_instr: None,
+        Self::new_with_grid_and_capacity(
+            depth_for_reporting,
             consume_trades,
             default_slab_capacity,
-            grid_tick: 1,
-            grid_span: 16384,
-            instrument_ticks: HashMap::new(),
-        }
+            1,
+            16384,
+            OrderBookCapacity {
+                global_order_index: default_slab_capacity,
+                per_instrument_order_index: default_slab_capacity,
+                ..OrderBookCapacity::default()
+            },
+        )
     }
+
     pub fn new_with_grid(
         depth_for_reporting: usize,
         consume_trades: bool,
@@ -973,21 +1152,110 @@ impl OrderBook {
         grid_tick: i64,
         grid_span: usize,
     ) -> Self {
-        Self {
-            _depth_for_reporting: depth_for_reporting,
-            books: HashMap::new(),
-            index: HashMap::new(),
-            last_instr: None,
+        Self::new_with_grid_and_capacity(
+            depth_for_reporting,
             consume_trades,
             default_slab_capacity,
             grid_tick,
             grid_span,
-            instrument_ticks: HashMap::new(),
+            OrderBookCapacity {
+                global_order_index: default_slab_capacity,
+                per_instrument_order_index: default_slab_capacity,
+                ..OrderBookCapacity::default()
+            },
+        )
+    }
+
+    pub fn new_with_grid_and_capacity(
+        depth_for_reporting: usize,
+        consume_trades: bool,
+        default_slab_capacity: usize,
+        grid_tick: i64,
+        grid_span: usize,
+        capacity: OrderBookCapacity,
+    ) -> Self {
+        Self {
+            _depth_for_reporting: depth_for_reporting,
+            books: instrument_map_with_capacity(capacity.instruments),
+            index: global_order_index_with_capacity(capacity.global_order_index),
+            last_instr: None,
+            consume_trades,
+            default_slab_capacity,
+            default_order_index_capacity: capacity.per_instrument_order_index,
+            grid_tick,
+            grid_span,
+            instrument_ticks: instrument_tick_map_with_capacity(capacity.instruments),
         }
     }
 
     pub fn set_consume_trades(&mut self, v: bool) {
         self.consume_trades = v;
+    }
+
+    /// Updates defaults used when creating future instrument books.
+    ///
+    /// Loaded snapshots carry already-created books, but newly-listed
+    /// instruments after startup should still use the current process config.
+    pub fn configure_defaults(
+        &mut self,
+        default_slab_capacity: usize,
+        default_grid_tick: i64,
+        grid_span: usize,
+    ) -> Result<(), String> {
+        if default_slab_capacity == 0 {
+            return Err("default slab capacity must be > 0".to_string());
+        }
+        if default_grid_tick <= 0 {
+            return Err(format!(
+                "default grid tick must be > 0, got {default_grid_tick}"
+            ));
+        }
+        if grid_span == 0 {
+            return Err("grid span must be > 0".to_string());
+        }
+        self.default_slab_capacity = default_slab_capacity;
+        self.grid_tick = default_grid_tick;
+        self.grid_span = grid_span;
+        Ok(())
+    }
+
+    /// Reserves configured top-level and per-instrument storage.
+    ///
+    /// Existing books have their slabs and local indexes grown if needed. When
+    /// preallocation is enabled, books are created for every configured
+    /// instrument tick so allocation is paid during startup rather than on the
+    /// first market-data event.
+    pub fn reserve_capacity(&mut self, capacity: OrderBookCapacity) {
+        if capacity.instruments > self.books.capacity() {
+            self.books
+                .reserve(capacity.instruments.saturating_sub(self.books.len()));
+        }
+        if capacity.instruments > self.instrument_ticks.capacity() {
+            self.instrument_ticks.reserve(
+                capacity
+                    .instruments
+                    .saturating_sub(self.instrument_ticks.len()),
+            );
+        }
+        if capacity.global_order_index > self.index.capacity() {
+            self.index
+                .reserve(capacity.global_order_index.saturating_sub(self.index.len()));
+        }
+        if capacity.per_instrument_order_index > self.default_order_index_capacity {
+            self.default_order_index_capacity = capacity.per_instrument_order_index;
+        }
+        for book in self.books.values_mut() {
+            book.reserve_capacity(
+                self.default_slab_capacity,
+                self.default_order_index_capacity,
+            );
+        }
+        if capacity.preallocate_instrument_books {
+            let instruments: Vec<u32> = self.instrument_ticks.keys().copied().collect();
+            for instr in instruments {
+                let _ = self.book_mut(instr);
+            }
+        }
     }
 
     pub fn set_instrument_tick(&mut self, instr: u32, tick: i64) -> Result<(), String> {
@@ -1019,6 +1287,33 @@ impl OrderBook {
     where
         I: IntoIterator<Item = (u32, i64)>,
     {
+        Self::new_with_tick_table_and_capacity(
+            depth_for_reporting,
+            consume_trades,
+            default_slab_capacity,
+            default_grid_tick,
+            grid_span,
+            ticks,
+            OrderBookCapacity {
+                global_order_index: default_slab_capacity,
+                per_instrument_order_index: default_slab_capacity,
+                ..OrderBookCapacity::default()
+            },
+        )
+    }
+
+    pub fn new_with_tick_table_and_capacity<I>(
+        depth_for_reporting: usize,
+        consume_trades: bool,
+        default_slab_capacity: usize,
+        default_grid_tick: i64,
+        grid_span: usize,
+        ticks: I,
+        mut capacity: OrderBookCapacity,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (u32, i64)>,
+    {
         if default_grid_tick <= 0 {
             return Err(format!(
                 "default grid tick must be > 0, got {default_grid_tick}"
@@ -1027,14 +1322,25 @@ impl OrderBook {
         if grid_span == 0 {
             return Err("grid span must be > 0".to_string());
         }
-        let mut book = Self::new_with_grid(
+
+        let ticks: Vec<(u32, i64)> = ticks.into_iter().collect();
+        capacity.instruments = capacity.instruments.max(ticks.len());
+
+        let mut book = Self::new_with_grid_and_capacity(
             depth_for_reporting,
             consume_trades,
             default_slab_capacity,
             default_grid_tick,
             grid_span,
+            capacity,
         );
-        book.set_instrument_ticks(ticks)?;
+        book.set_instrument_ticks(ticks.iter().copied())?;
+        if capacity.preallocate_instrument_books {
+            let instruments: Vec<u32> = book.instrument_ticks.keys().copied().collect();
+            for instr in instruments {
+                let _ = book.book_mut(instr);
+            }
+        }
         Ok(book)
     }
 
@@ -1046,17 +1352,21 @@ impl OrderBook {
             .copied()
             .unwrap_or(self.grid_tick);
         let span = self.grid_span;
-        let cap = self.default_slab_capacity;
+        let slab_cap = self.default_slab_capacity;
+        let index_cap = self.default_order_index_capacity;
         self.books
             .entry(instr)
-            .or_insert_with(|| InstrumentBook::with_params(cap, tick, span))
+            .or_insert_with(|| InstrumentBook::with_params(slab_cap, index_cap, tick, span))
     }
 
     #[inline]
     fn remove_order_by_id(&mut self, order_id: u64) -> Option<u32> {
         if let Some((instr, h)) = self.index.remove(&order_id) {
-            let book = self.book_mut(instr);
-            book.cancel(h);
+            if let Some(book) = self.books.get_mut(&instr) {
+                let removed = book.remove_indexed_order(order_id);
+                debug_assert_eq!(removed, Some(h));
+                book.cancel(h);
+            }
             self.last_instr = Some(instr);
             Some(instr)
         } else {
@@ -1072,8 +1382,36 @@ impl OrderBook {
         self.remove_order_by_id(order_id);
         let book = self.book_mut(instr);
         let h = book.add(px, qty, side);
+        book.index_order(order_id, h);
         self.index.insert(order_id, (instr, h));
         self.last_instr = Some(instr);
+    }
+
+    #[inline]
+    fn cancel_known_order(&mut self, instr: u32, order_id: u64, handle: Handle) {
+        if let Some(book) = self.books.get_mut(&instr) {
+            let removed = book.remove_indexed_order(order_id);
+            debug_assert_eq!(removed, Some(handle));
+            book.cancel(handle);
+        }
+        let removed = self.index.remove(&order_id);
+        debug_assert_eq!(removed, Some((instr, handle)));
+        self.last_instr = Some(instr);
+    }
+
+    #[inline]
+    fn set_known_order_qty(&mut self, instr: u32, handle: Handle, qty: i64) {
+        if let Some(book) = self.books.get_mut(&instr) {
+            book.set_qty(handle, qty);
+            self.last_instr = Some(instr);
+        }
+    }
+
+    #[inline]
+    fn local_order_handle(&self, instr: u32, order_id: u64) -> Option<Handle> {
+        self.books
+            .get(&instr)
+            .and_then(|book| book.order_handle(order_id))
     }
 
     #[inline]
@@ -1089,19 +1427,27 @@ impl OrderBook {
                 self.add_order(order_id, instr, px, qty, side);
             }
             Event::Mod { order_id, qty } => {
-                if let Some((instr, h)) = self.index.get(&order_id).copied() {
-                    let book = self.book_mut(instr);
+                let known = self
+                    .last_instr
+                    .and_then(|instr| self.local_order_handle(instr, order_id).map(|h| (instr, h)))
+                    .or_else(|| self.index.get(&order_id).copied());
+                if let Some((instr, h)) = known {
                     if qty > 0 {
-                        book.set_qty(h, qty);
+                        self.set_known_order_qty(instr, h, qty);
                     } else {
-                        book.cancel(h);
-                        self.index.remove(&order_id);
+                        self.cancel_known_order(instr, order_id, h);
                     }
-                    self.last_instr = Some(instr);
                 }
             }
             Event::Del { order_id } => {
-                self.remove_order_by_id(order_id);
+                let known = self
+                    .last_instr
+                    .and_then(|instr| self.local_order_handle(instr, order_id).map(|h| (instr, h)));
+                if let Some((instr, h)) = known {
+                    self.cancel_known_order(instr, order_id, h);
+                } else {
+                    self.remove_order_by_id(order_id);
+                }
             }
             Event::Trade {
                 instr,
@@ -1112,17 +1458,22 @@ impl OrderBook {
                 self.last_instr = Some(instr);
                 if self.consume_trades {
                     if let Some(oid) = maker_order_id {
-                        if let Some((mi, h)) = self.index.get(&oid).copied() {
-                            let book = self.book_mut(mi);
-                            let new_qty = {
-                                let n = &book.orders[h];
-                                (n.qty - qty).max(0)
-                            };
-                            if new_qty > 0 {
-                                book.set_qty(h, new_qty);
-                            } else {
-                                book.cancel(h);
-                                self.index.remove(&oid);
+                        let known = self
+                            .local_order_handle(instr, oid)
+                            .map(|h| (instr, h))
+                            .or_else(|| self.index.get(&oid).copied());
+                        if let Some((mi, h)) = known {
+                            if let Some(current_qty) = self
+                                .books
+                                .get(&mi)
+                                .and_then(|book| book.orders.get(h).map(|node| node.qty))
+                            {
+                                let new_qty = (current_qty - qty).max(0);
+                                if new_qty > 0 {
+                                    self.set_known_order_qty(mi, h, new_qty);
+                                } else {
+                                    self.cancel_known_order(mi, oid, h);
+                                }
                             }
                         }
                     }
@@ -1148,30 +1499,27 @@ impl OrderBook {
                     self.add_order(order_id, instr, px, qty, side);
                 }
                 Event::Mod { order_id, qty } => {
-                    if let Some((mi, h)) = self.index.get(&order_id).copied() {
-                        if mi == instr {
-                            if qty > 0 {
-                                let b = self.book_mut(instr);
-                                b.set_qty(h, qty);
-                            } else {
-                                let b = self.book_mut(instr);
-                                b.cancel(h);
-                                self.index.remove(&order_id);
-                            }
-                            self.last_instr = Some(instr);
+                    let local_handle = self
+                        .books
+                        .get(&instr)
+                        .and_then(|book| book.order_handle(order_id));
+                    if let Some(h) = local_handle {
+                        if qty > 0 {
+                            self.set_known_order_qty(instr, h, qty);
                         } else {
-                            self.apply(e);
+                            self.cancel_known_order(instr, order_id, h);
                         }
+                    } else {
+                        self.apply(e);
                     }
                 }
                 Event::Del { order_id } => {
-                    if self
-                        .index
-                        .get(&order_id)
-                        .map(|(mi, _)| *mi == instr)
-                        .unwrap_or(false)
-                    {
-                        self.remove_order_by_id(order_id);
+                    let local_handle = self
+                        .books
+                        .get(&instr)
+                        .and_then(|book| book.order_handle(order_id));
+                    if let Some(h) = local_handle {
+                        self.cancel_known_order(instr, order_id, h);
                     } else {
                         self.apply(e);
                     }
@@ -1185,26 +1533,25 @@ impl OrderBook {
                     self.last_instr = Some(instr);
                     if consume_trades {
                         if let Some(oid) = maker_order_id {
-                            if let Some((mi, h)) = self.index.get(&oid).copied() {
-                                if mi == instr {
-                                    let new_qty = {
-                                        let qty0 = {
-                                            let b = self.book_mut(instr);
-                                            b.orders[h].qty
-                                        };
-                                        (qty0 - qty).max(0)
-                                    };
+                            let local_handle = self
+                                .books
+                                .get(&instr)
+                                .and_then(|book| book.order_handle(oid));
+                            if let Some(h) = local_handle {
+                                if let Some(current_qty) = self
+                                    .books
+                                    .get(&instr)
+                                    .and_then(|book| book.orders.get(h).map(|node| node.qty))
+                                {
+                                    let new_qty = (current_qty - qty).max(0);
                                     if new_qty > 0 {
-                                        let b = self.book_mut(instr);
-                                        b.set_qty(h, new_qty);
+                                        self.set_known_order_qty(instr, h, new_qty);
                                     } else {
-                                        let b = self.book_mut(instr);
-                                        b.cancel(h);
-                                        self.index.remove(&oid);
+                                        self.cancel_known_order(instr, oid, h);
                                     }
-                                } else {
-                                    self.apply(e);
                                 }
+                            } else {
+                                self.apply(e);
                             }
                         }
                     }
@@ -1235,6 +1582,11 @@ impl OrderBook {
 
     #[inline]
     pub fn instrument_for_order(&self, order_id: u64) -> Option<u32> {
+        if let Some(instr) = self.last_instr {
+            if self.local_order_handle(instr, order_id).is_some() {
+                return Some(instr);
+            }
+        }
         self.index.get(&order_id).map(|(instr, _)| *instr)
     }
     pub fn validate_invariants(&self) -> Result<(), String> {
@@ -1382,6 +1734,7 @@ impl OrderBook {
             for o in ie.orders {
                 let book = ob.book_mut(ie.instr);
                 let h = book.add(o.price, o.qty, o.side);
+                book.index_order(o.order_id, h);
                 ob.index.insert(o.order_id, (ie.instr, h));
             }
             ob.last_instr = Some(ie.instr);
@@ -1722,6 +2075,162 @@ mod tests {
 
         assert_eq!(ob.books.get(&9).unwrap().bids_grid.tick, 5);
         assert_eq!(ob.books.get(&10).unwrap().bids_grid.tick, 1);
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn capacity_config_preallocates_known_instrument_books() {
+        let ob = OrderBook::new_with_tick_table_and_capacity(
+            10,
+            false,
+            32,
+            1,
+            8,
+            [(9, 5), (10, 1)],
+            OrderBookCapacity {
+                instruments: 4,
+                global_order_index: 64,
+                per_instrument_order_index: 16,
+                preallocate_instrument_books: true,
+            },
+        )
+        .expect("valid capacity config");
+
+        assert!(ob.books.capacity() >= 4);
+        assert!(ob.index.capacity() >= 64);
+        assert!(ob.instrument_ticks.capacity() >= 4);
+        assert!(ob.books.contains_key(&9));
+        assert!(ob.books.contains_key(&10));
+        let book = ob.books.get(&9).unwrap();
+        assert!(book.orders.capacity() >= 32);
+        assert!(book.order_index.capacity() >= 16);
+    }
+
+    #[test]
+    fn reserve_capacity_applies_to_existing_and_refdata_books() {
+        let mut ob = OrderBook::new(10);
+        ob.apply(&Event::Add {
+            order_id: 1,
+            instr: 7,
+            px: 100,
+            qty: 10,
+            side: Side::Bid,
+        });
+        ob.set_instrument_tick(8, 5).unwrap();
+
+        ob.reserve_capacity(OrderBookCapacity {
+            instruments: 4,
+            global_order_index: 64,
+            per_instrument_order_index: 16,
+            preallocate_instrument_books: true,
+        });
+
+        assert!(ob.index.capacity() >= 64);
+        assert!(ob.books.capacity() >= 4);
+        assert!(ob.books.contains_key(&8));
+        assert!(ob.books.get(&7).unwrap().order_index.capacity() >= 16);
+        assert!(ob.books.get(&8).unwrap().order_index.capacity() >= 16);
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn configured_defaults_apply_to_future_books_after_snapshot_load() {
+        let mut ob = OrderBook::new(10);
+        ob.apply(&Event::Add {
+            order_id: 1,
+            instr: 7,
+            px: 100,
+            qty: 10,
+            side: Side::Bid,
+        });
+
+        ob.configure_defaults(8, 2, 16).unwrap();
+        ob.apply(&Event::Add {
+            order_id: 2,
+            instr: 8,
+            px: 100,
+            qty: 10,
+            side: Side::Ask,
+        });
+
+        let new_book = ob.books.get(&8).unwrap();
+        assert!(new_book.orders.capacity() >= 8);
+        assert_eq!(new_book.bids_grid.tick, 2);
+        assert_eq!(new_book.asks_grid.slots.len(), 16);
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn batched_known_instrument_updates_keep_local_and_global_indexes_in_sync() {
+        let mut ob = OrderBook::new_with_grid(10, true, 64, 1, 8);
+        let events = [
+            Event::Add {
+                order_id: 1,
+                instr: 7,
+                px: 100,
+                qty: 10,
+                side: Side::Bid,
+            },
+            Event::Add {
+                order_id: 2,
+                instr: 7,
+                px: 101,
+                qty: 20,
+                side: Side::Ask,
+            },
+            Event::Mod {
+                order_id: 1,
+                qty: 6,
+            },
+            Event::Trade {
+                instr: 7,
+                px: 100,
+                qty: 3,
+                maker_order_id: Some(1),
+                taker_side: Some(Side::Ask),
+            },
+            Event::Del { order_id: 2 },
+        ];
+
+        ob.apply_many_for_instr(7, &events);
+
+        assert_eq!(ob.order_count(), 1);
+        assert_eq!(ob.books.get(&7).unwrap().order_index.len(), 1);
+        assert_eq!(ob.instrument_for_order(1), Some(7));
+        assert_eq!(ob.instrument_for_order(2), None);
+        let (bids, asks) = ob.top_n_of(7, 10).unwrap();
+        assert_eq!(bids.as_slice(), &[(100, 3)]);
+        assert!(asks.is_empty());
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn single_event_updates_keep_local_and_global_indexes_in_sync() {
+        let mut ob = OrderBook::new_with_grid(10, false, 64, 1, 8);
+        ob.apply(&Event::Add {
+            order_id: 11,
+            instr: 3,
+            px: 100,
+            qty: 10,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Mod {
+            order_id: 11,
+            qty: 7,
+        });
+
+        let local = ob
+            .books
+            .get(&3)
+            .and_then(|book| book.order_handle(11))
+            .expect("local order index entry");
+        assert_eq!(ob.index.get(&11), Some(&(3, local)));
+
+        ob.apply(&Event::Del { order_id: 11 });
+
+        assert_eq!(ob.order_count(), 0);
+        assert!(ob.index.get(&11).is_none());
+        assert!(ob.books.get(&3).unwrap().order_handle(11).is_none());
         ob.validate_invariants().unwrap();
     }
 

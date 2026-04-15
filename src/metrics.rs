@@ -436,12 +436,26 @@ static HWM_TRACK: Lazy<Mutex<HashMap<&'static str, i64>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn inc_rx(chan: &str, bytes: usize) {
-    RX_PACKETS.with_label_values(&[chan]).inc();
+    inc_rx_batch(chan, 1, bytes);
+}
+
+pub fn inc_rx_batch(chan: &str, packets: usize, bytes: usize) {
+    if packets == 0 {
+        return;
+    }
+    RX_PACKETS.with_label_values(&[chan]).inc_by(packets as u64);
     RX_BYTES.with_label_values(&[chan]).inc_by(bytes as u64);
 }
 
 pub fn inc_rx_drop(chan: &str) {
-    RX_DROPS.with_label_values(&[chan]).inc();
+    inc_rx_drop_batch(chan, 1);
+}
+
+pub fn inc_rx_drop_batch(chan: &str, packets: usize) {
+    if packets == 0 {
+        return;
+    }
+    RX_DROPS.with_label_values(&[chan]).inc_by(packets as u64);
 }
 
 pub fn inc_packet_pool_miss() {

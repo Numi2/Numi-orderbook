@@ -3,7 +3,7 @@ use crate::config::TimestampingMode;
 use crate::metrics;
 use crate::parser::SeqExtractor;
 use crate::pool::{PacketPool, Pkt, PktBuf, TsKind};
-use crate::spsc::SpscQueue;
+use crate::spsc::{AdaptiveBatchCap, SpscQueue, DEFAULT_BATCH_CAP};
 use crate::util::now_nanos;
 use anyhow::Context;
 use bytes::BufMut;
@@ -98,6 +98,9 @@ pub fn rx_loop(
     } else {
         Vec::new()
     };
+    let ring_batch_limit = batch.min(DEFAULT_BATCH_CAP).min(q_out.capacity());
+    let mut ring_batch_cap = AdaptiveBatchCap::new(1, ring_batch_limit);
+    let mut pending_pkts: Vec<Pkt> = Vec::with_capacity(ring_batch_cap.max());
 
     let queue_label: &'static str = if chan_name == "A" { "rx_a" } else { "rx_b" };
     let mut iter: u64 = 0;
@@ -179,7 +182,15 @@ pub fn rx_loop(
                                 _ts_kind: rx_ts.kind,
                                 merge_emit_ns: 0,
                             };
-                            push_or_recycle(chan_name, &q_out, &pool, pkt, n, &mut dropped);
+                            stage_or_flush_rx_packet(
+                                chan_name,
+                                &q_out,
+                                &pool,
+                                pkt,
+                                &mut pending_pkts,
+                                &mut ring_batch_cap,
+                                &mut dropped,
+                            );
                         } else {
                             pool.put(buf);
                         }
@@ -261,7 +272,15 @@ pub fn rx_loop(
                                 _ts_kind: kind,
                                 merge_emit_ns: 0,
                             };
-                            push_or_recycle(chan_name, &q_out, &pool, pkt, n, &mut dropped);
+                            stage_or_flush_rx_packet(
+                                chan_name,
+                                &q_out,
+                                &pool,
+                                pkt,
+                                &mut pending_pkts,
+                                &mut ring_batch_cap,
+                                &mut dropped,
+                            );
                         } else {
                             pool.put(buf);
                         }
@@ -274,6 +293,14 @@ pub fn rx_loop(
                             break;
                         } else {
                             pool.put(buf);
+                            flush_rx_packet_batch(
+                                chan_name,
+                                &q_out,
+                                &pool,
+                                &mut pending_pkts,
+                                &mut ring_batch_cap,
+                                &mut dropped,
+                            );
                             return Err(anyhow::anyhow!(
                                 "recv error: {}",
                                 std::io::Error::from(err)
@@ -283,6 +310,14 @@ pub fn rx_loop(
                 }
             }
         }
+        flush_rx_packet_batch(
+            chan_name,
+            &q_out,
+            &pool,
+            &mut pending_pkts,
+            &mut ring_batch_cap,
+            &mut dropped,
+        );
 
         if !progressed {
             crate::util::adaptive_wait(&mut idle_iters, spin_loops_per_yield);
@@ -300,28 +335,72 @@ pub fn rx_loop(
 }
 
 #[inline]
-pub(crate) fn push_or_recycle(
+fn stage_or_flush_rx_packet(
     chan_name: &str,
     q_out: &SpscQueue<Pkt>,
     pool: &PacketPool,
     pkt: Pkt,
-    nbytes: usize,
+    pending: &mut Vec<Pkt>,
+    batch_cap: &mut AdaptiveBatchCap,
     dropped: &mut u64,
-) -> bool {
-    match q_out.push(pkt) {
-        Ok(()) => {
-            metrics::inc_rx(chan_name, nbytes);
-            true
-        }
-        Err(pkt) => {
+) {
+    pending.push(pkt);
+    if pending.len() >= batch_cap.current() {
+        flush_rx_packet_batch(chan_name, q_out, pool, pending, batch_cap, dropped);
+    }
+}
+
+#[inline]
+fn flush_rx_packet_batch(
+    chan_name: &str,
+    q_out: &SpscQueue<Pkt>,
+    pool: &PacketPool,
+    pending: &mut Vec<Pkt>,
+    batch_cap: &mut AdaptiveBatchCap,
+    dropped: &mut u64,
+) -> usize {
+    let attempted = pending.len().min(batch_cap.current());
+    if attempted == 0 {
+        return 0;
+    }
+
+    let writable = q_out.spare_capacity().min(attempted);
+    let accepted_bytes = pending
+        .iter()
+        .take(writable)
+        .map(|pkt| pkt.len)
+        .sum::<usize>();
+    let pushed = q_out.push_batch(pending, writable);
+    debug_assert_eq!(pushed, writable);
+    if pushed > 0 {
+        metrics::inc_rx_batch(chan_name, pushed, accepted_bytes);
+    }
+
+    if pushed < attempted {
+        let rejected = pending.len();
+        for pkt in pending.drain(..) {
             pkt.recycle(pool);
-            *dropped = dropped.saturating_add(1);
-            metrics::inc_rx_drop(chan_name);
-            if *dropped % 10_000 == 1 {
-                debug!("{}_rx: queue full, dropped={}", chan_name, *dropped);
-            }
-            false
         }
+        record_rx_drops(chan_name, rejected, dropped);
+        batch_cap.reset();
+    } else {
+        batch_cap.record(attempted, pushed);
+    }
+
+    pushed
+}
+
+#[inline]
+fn record_rx_drops(chan_name: &str, count: usize, dropped: &mut u64) {
+    if count == 0 {
+        return;
+    }
+
+    let before = *dropped;
+    *dropped = dropped.saturating_add(count as u64);
+    metrics::inc_rx_drop_batch(chan_name, count);
+    if before == 0 || before / 10_000 != *dropped / 10_000 {
+        debug!("{}_rx: queue full, dropped={}", chan_name, *dropped);
     }
 }
 
@@ -531,8 +610,43 @@ mod tests {
         assert_eq!(pool.available(), 0);
 
         let mut dropped = 0;
-        assert!(!push_or_recycle("A", &q, &pool, pkt, 0, &mut dropped));
+        let mut pending = Vec::new();
+        let mut batch_cap = AdaptiveBatchCap::new(1, DEFAULT_BATCH_CAP);
+        stage_or_flush_rx_packet(
+            "A",
+            &q,
+            &pool,
+            pkt,
+            &mut pending,
+            &mut batch_cap,
+            &mut dropped,
+        );
 
+        assert_eq!(dropped, 1);
+        assert_eq!(pool.available(), 1);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn packet_batch_recycles_rejected_suffix() {
+        let pool = PacketPool::new(3, 64).unwrap();
+        let q = SpscQueue::new(2);
+        let mut batch_cap = AdaptiveBatchCap::new(4, 4);
+        let mut pending = vec![
+            pkt_from_pool(&pool, 1),
+            pkt_from_pool(&pool, 2),
+            pkt_from_pool(&pool, 3),
+        ];
+        assert_eq!(pool.available(), 0);
+
+        let mut dropped = 0;
+        assert_eq!(
+            flush_rx_packet_batch("A", &q, &pool, &mut pending, &mut batch_cap, &mut dropped),
+            2
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(q.len(), 2);
         assert_eq!(dropped, 1);
         assert_eq!(pool.available(), 1);
     }

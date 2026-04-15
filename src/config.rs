@@ -116,6 +116,14 @@ pub struct Book {
     #[serde(default = "default_order_slab_capacity")]
     pub order_slab_capacity: usize,
     #[serde(default)]
+    pub order_index_capacity: Option<usize>,
+    #[serde(default)]
+    pub per_instrument_order_index_capacity: Option<usize>,
+    #[serde(default)]
+    pub instrument_capacity: Option<usize>,
+    #[serde(default)]
+    pub preallocate_instrument_books: bool,
+    #[serde(default)]
     pub instrument_ticks: Vec<InstrumentTickCfg>,
     #[serde(default)]
     pub instrument_ticks_path: Option<String>,
@@ -297,6 +305,15 @@ impl AppConfig {
         }
         if self.book.order_slab_capacity == 0 {
             anyhow::bail!("book.order_slab_capacity must be > 0");
+        }
+        if self.book.order_index_capacity == Some(0) {
+            anyhow::bail!("book.order_index_capacity must be > 0 when set");
+        }
+        if self.book.per_instrument_order_index_capacity == Some(0) {
+            anyhow::bail!("book.per_instrument_order_index_capacity must be > 0 when set");
+        }
+        if self.book.instrument_capacity == Some(0) {
+            anyhow::bail!("book.instrument_capacity must be > 0 when set");
         }
         for tick in &self.book.instrument_ticks {
             if tick.tick <= 0 {

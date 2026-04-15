@@ -14,6 +14,8 @@ use crate::pool::PktBuf;
 use crate::pool::TsKind;
 use crate::pool::{PacketPool, Pkt};
 use crate::spsc::SpscQueue;
+#[cfg(target_os = "linux")]
+use crate::spsc::{AdaptiveBatchCap, DEFAULT_BATCH_CAP};
 use crate::util::BarrierFlag;
 #[cfg(target_os = "linux")]
 use bytes::BufMut;
@@ -274,11 +276,21 @@ pub fn packet_mmap_loop(
 
     let chan_id = if chan_name == "A" { b'A' } else { b'B' };
     let mut frame_idx: u32 = 0;
+    let packet_batch_limit = DEFAULT_BATCH_CAP.min(q_out.capacity());
+    let mut packet_batch_cap = AdaptiveBatchCap::new(1, packet_batch_limit);
+    let mut pending_pkts: Vec<Pkt> = Vec::with_capacity(packet_batch_cap.max());
     while !shutdown.is_raised() {
         let off = (frame_idx as usize) * (frame_size as usize);
         let hdr_ptr = unsafe { ring.ptr().add(off) as *mut Tpacket2Hdr };
         let status = unsafe { (*hdr_ptr).tp_status };
         if (status & TP_STATUS_USER) == 0 {
+            flush_packet_mmap_batch(
+                chan_name,
+                &q_out,
+                &pool,
+                &mut pending_pkts,
+                &mut packet_batch_cap,
+            );
             crate::util::spin_wait(64);
             continue;
         }
@@ -323,11 +335,15 @@ pub fn packet_mmap_loop(
                             _ts_kind: TsKind::Sw,
                             merge_emit_ns: 0,
                         };
-                        if let Err(pkt) = q_out.push(pkt) {
-                            pkt.recycle(&pool);
-                            metrics::inc_rx_drop(chan_name);
-                        } else {
-                            metrics::inc_rx(chan_name, nbytes);
+                        pending_pkts.push(pkt);
+                        if pending_pkts.len() >= packet_batch_cap.current() {
+                            flush_packet_mmap_batch(
+                                chan_name,
+                                &q_out,
+                                &pool,
+                                &mut pending_pkts,
+                                &mut packet_batch_cap,
+                            );
                         }
                     } else {
                         pool.put(buf);
@@ -344,8 +360,54 @@ pub fn packet_mmap_loop(
         }
         frame_idx = (frame_idx + 1) % frame_nr;
     }
+    flush_packet_mmap_batch(
+        chan_name,
+        &q_out,
+        &pool,
+        &mut pending_pkts,
+        &mut packet_batch_cap,
+    );
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn flush_packet_mmap_batch(
+    chan_name: &str,
+    q_out: &SpscQueue<Pkt>,
+    pool: &PacketPool,
+    pending: &mut Vec<Pkt>,
+    batch_cap: &mut AdaptiveBatchCap,
+) -> usize {
+    let attempted = pending.len().min(batch_cap.current());
+    if attempted == 0 {
+        return 0;
+    }
+
+    let writable = q_out.spare_capacity().min(attempted);
+    let accepted_bytes = pending
+        .iter()
+        .take(writable)
+        .map(|pkt| pkt.len)
+        .sum::<usize>();
+    let pushed = q_out.push_batch(pending, writable);
+    debug_assert_eq!(pushed, writable);
+    if pushed > 0 {
+        metrics::inc_rx_batch(chan_name, pushed, accepted_bytes);
+    }
+
+    if pushed < attempted {
+        let rejected = pending.len();
+        for pkt in pending.drain(..) {
+            pkt.recycle(pool);
+        }
+        metrics::inc_rx_drop_batch(chan_name, rejected);
+        batch_cap.reset();
+    } else {
+        batch_cap.record(attempted, pushed);
+    }
+
+    pushed
 }
 
 #[cfg(target_os = "linux")]

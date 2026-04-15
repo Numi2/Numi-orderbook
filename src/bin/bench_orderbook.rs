@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use orderbook::orderbook::OrderBook;
+use orderbook::orderbook::{OrderBook, OrderBookCapacity};
 use orderbook::parser::{Event, Side};
 
 fn parse_arg_usize(args: &[String], idx: usize, default: usize) -> usize {
@@ -16,7 +16,20 @@ fn main() {
     let orders_per_instr = parse_arg_usize(&args, 2, 5000);
     let batch_size = parse_arg_usize(&args, 3, 64);
 
-    let mut book = OrderBook::new(10);
+    let total_live_order_capacity = instr_count.saturating_mul(orders_per_instr);
+    let mut book = OrderBook::new_with_grid_and_capacity(
+        10,
+        false,
+        orders_per_instr.max(1),
+        1,
+        16384,
+        OrderBookCapacity {
+            instruments: instr_count,
+            global_order_index: total_live_order_capacity,
+            per_instrument_order_index: orders_per_instr.max(1),
+            preallocate_instrument_books: false,
+        },
+    );
 
     let start_total = Instant::now();
     let mut total_events: usize = 0;

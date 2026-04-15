@@ -3,11 +3,11 @@ use crate::codec_raw::channel_id;
 use crate::codec_raw::msg_type;
 use crate::metrics;
 use crate::obo::{map_event_to_obo_parts, OboEventV1};
-use crate::orderbook::OrderBook;
+use crate::orderbook::{OrderBook, OrderBookCapacity};
 use crate::parser::Parser;
 use crate::pool::{PacketPool, Pkt};
 use crate::pubsub::Publisher as OboPublisher;
-use crate::spsc::SpscQueue;
+use crate::spsc::{AdaptiveBatchCap, SpscQueue, DEFAULT_BATCH_CAP};
 use crate::util::{now_nanos, BarrierFlag};
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
@@ -25,6 +25,7 @@ pub struct DecodeConfig {
     pub default_slab_capacity: usize,
     pub default_tick: i64,
     pub grid_span: usize,
+    pub book_capacity: OrderBookCapacity,
     pub instrument_ticks: Vec<(u32, i64)>,
     pub snapshot_tx: Option<Sender<crate::snapshot::SnapshotImage>>,
     pub initial_book: Option<OrderBook>,
@@ -48,6 +49,7 @@ pub fn decode_loop(
         default_slab_capacity,
         default_tick,
         grid_span,
+        book_capacity,
         instrument_ticks,
         snapshot_tx,
         initial_book,
@@ -58,22 +60,27 @@ pub fn decode_loop(
     } = cfg;
 
     let mut book = initial_book.unwrap_or_else(|| {
-        OrderBook::new_with_tick_table(
+        OrderBook::new_with_tick_table_and_capacity(
             max_depth,
             consume_trades,
             default_slab_capacity,
             default_tick,
             grid_span,
             instrument_ticks.iter().copied(),
+            book_capacity,
         )
         .unwrap_or_else(|e| {
             warn!("invalid book tick table ({e}); falling back to default book config");
             OrderBook::new(max_depth)
         })
     });
+    if let Err(e) = book.configure_defaults(default_slab_capacity, default_tick, grid_span) {
+        warn!("invalid book defaults for loaded book: {e}");
+    }
     if let Err(e) = book.set_instrument_ticks(instrument_ticks.iter().copied()) {
         warn!("invalid book tick table for loaded book: {e}");
     }
+    book.reserve_capacity(book_capacity);
     book.set_consume_trades(consume_trades);
     // Cache sizing to avoid per-packet re-evaluations
     let max_msgs = parser.max_messages_per_packet;
@@ -95,9 +102,22 @@ pub fn decode_loop(
     let mut processed_pkts: u64 = 0;
     let mut processed_msgs: u64 = 0;
 
+    let mut decode_batch_cap = AdaptiveBatchCap::new(1, DEFAULT_BATCH_CAP.min(q_in.capacity()));
+    let mut decode_batch: Vec<Pkt> = Vec::with_capacity(decode_batch_cap.max());
     let mut idle_iters: u32 = 0;
     while !shutdown.is_raised() {
-        if let Some(pkt) = q_in.pop() {
+        let requested = decode_batch_cap.current();
+        let popped = q_in.pop_batch(&mut decode_batch, requested);
+        if popped > 0 {
+            idle_iters = 0;
+            decode_batch_cap.record(requested, popped);
+        } else {
+            decode_batch_cap.reset();
+            crate::util::adaptive_wait(&mut idle_iters, 64);
+            continue;
+        }
+
+        for pkt in decode_batch.drain(..) {
             processed_pkts += 1;
             metrics::inc_decode_pkts();
 
@@ -132,10 +152,16 @@ pub fn decode_loop(
             }
 
             for (event_index, ev) in events.iter().enumerate() {
-                let instr_before_apply = match *ev {
-                    crate::parser::Event::Mod { order_id, .. }
-                    | crate::parser::Event::Del { order_id } => book.instrument_for_order(order_id),
-                    _ => None,
+                let instr_before_apply = if obo_publisher.is_some() {
+                    match *ev {
+                        crate::parser::Event::Mod { order_id, .. }
+                        | crate::parser::Event::Del { order_id } => {
+                            book.instrument_for_order(order_id)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
                 };
 
                 book.apply(ev);
@@ -224,8 +250,6 @@ pub fn decode_loop(
                 }
                 last_snap = Instant::now();
             }
-        } else {
-            crate::util::adaptive_wait(&mut idle_iters, 64);
         }
     }
     if let Some(mut writer) = journal {

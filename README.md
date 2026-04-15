@@ -165,6 +165,10 @@ max_depth = 50
 default_tick = 1
 grid_span = 16384
 order_slab_capacity = 1048576
+order_index_capacity = 1048576
+per_instrument_order_index_capacity = 1048576
+# instrument_capacity = 1024
+preallocate_instrument_books = false
 
 [packet_mmap]
 enable = false

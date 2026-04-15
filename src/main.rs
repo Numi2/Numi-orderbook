@@ -160,6 +160,23 @@ fn main() -> anyhow::Result<()> {
             .iter()
             .map(|tick| (tick.instr, tick.tick)),
     );
+    let refdata_instrument_count = instrument_ticks.len();
+    let book_capacity = orderbook::orderbook::OrderBookCapacity {
+        instruments: cfg
+            .book
+            .instrument_capacity
+            .unwrap_or(refdata_instrument_count)
+            .max(refdata_instrument_count),
+        global_order_index: cfg
+            .book
+            .order_index_capacity
+            .unwrap_or(cfg.book.order_slab_capacity),
+        per_instrument_order_index: cfg
+            .book
+            .per_instrument_order_index_capacity
+            .unwrap_or(cfg.book.order_slab_capacity),
+        preallocate_instrument_books: cfg.book.preallocate_instrument_books,
+    };
 
     // Sockets (support multi-worker via SO_REUSEPORT)
     let mut socks_a = Vec::with_capacity(a_workers);
@@ -504,6 +521,7 @@ fn main() -> anyhow::Result<()> {
                     default_slab_capacity: cfg.book.order_slab_capacity,
                     default_tick: cfg.book.default_tick,
                     grid_span: cfg.book.grid_span,
+                    book_capacity,
                     instrument_ticks,
                     snapshot_tx,
                     initial_book,

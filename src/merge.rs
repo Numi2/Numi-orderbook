@@ -2,7 +2,7 @@
 use crate::metrics;
 use crate::pool::Pkt;
 use crate::recovery::RecoveryClient;
-use crate::spsc::SpscQueue;
+use crate::spsc::{AdaptiveBatchCap, SpscQueue, DEFAULT_BATCH_CAP};
 use crate::util::BarrierFlag;
 use log::warn;
 // Reorder buffer is implemented as a fixed-size ring to minimize allocations and compares
@@ -39,6 +39,10 @@ pub fn merge_loop(
     } else {
         reorder_window
     };
+    if q_a_list.is_empty() || q_b_list.is_empty() {
+        anyhow::bail!("merge_loop requires at least one RX queue for both A and B");
+    }
+
     let cap: usize = (ring_window as usize).saturating_add(1);
     let mut ring: Vec<Option<(u64, Pkt)>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;
@@ -62,22 +66,37 @@ pub fn merge_loop(
 
     let mut idx_a: usize = 0;
     let mut idx_b: usize = 0;
-    let na = q_a_list.len().max(1);
-    let nb = q_b_list.len().max(1);
+    let na = q_a_list.len();
+    let nb = q_b_list.len();
+    let mut a_readers: Vec<BatchReader<Pkt>> = q_a_list
+        .iter()
+        .map(|q| BatchReader::new(DEFAULT_BATCH_CAP.min(q.capacity())))
+        .collect();
+    let mut b_readers: Vec<BatchReader<Pkt>> = q_b_list
+        .iter()
+        .map(|q| BatchReader::new(DEFAULT_BATCH_CAP.min(q.capacity())))
+        .collect();
+    let recovery_batch_limit = q_recovery_in
+        .as_ref()
+        .map(|q| DEFAULT_BATCH_CAP.min(q.capacity()))
+        .unwrap_or(1);
+    let mut recovery_reader = BatchReader::new(recovery_batch_limit);
+    let forward_batch_limit = DEFAULT_BATCH_CAP.min(q_out.capacity());
+    let mut forward_batch: Vec<Pkt> = Vec::with_capacity(forward_batch_limit);
+    let mut forward_batch_cap = AdaptiveBatchCap::new(1, forward_batch_limit);
 
     while !shutdown.is_raised() {
         let mut moved = false;
 
         // Drain at most a small batch of recovered packets each loop to avoid starvation
         if let Some(ref qrec) = q_recovery_in {
-            // up to 32 per iteration
-            for _ in 0..32 {
-                if let Some(pkt) = qrec.pop() {
+            for _ in 0..DEFAULT_BATCH_CAP {
+                if let Some(pkt) = recovery_reader.pop(qrec) {
                     let s = pkt.seq;
                     if s < next_seq {
                         metrics::inc_merge_dup();
                     } else if s == next_seq {
-                        forward(&q_out, pkt);
+                        stage_forward(&q_out, &mut forward_batch, &mut forward_batch_cap, pkt);
                         metrics::inc_merge_forward_chan("R");
                         next_seq = next_seq.wrapping_add(1);
                         forwarded_since_check = forwarded_since_check.saturating_add(1);
@@ -99,7 +118,12 @@ pub fn merge_loop(
                                 } else {
                                     "R"
                                 };
-                                forward(&q_out, node);
+                                stage_forward(
+                                    &q_out,
+                                    &mut forward_batch,
+                                    &mut forward_batch_cap,
+                                    node,
+                                );
                                 metrics::inc_merge_forward_chan(c);
                                 next_seq = next_seq.wrapping_add(1);
                                 forwarded_since_check = forwarded_since_check.saturating_add(1);
@@ -147,13 +171,13 @@ pub fn merge_loop(
         for src in 0..2 {
             let take_a_first = (src == 0) == prefer_a;
             let pkt = if take_a_first {
-                let q = &q_a_list[idx_a % na];
+                let idx = idx_a % na;
                 idx_a = idx_a.wrapping_add(1);
-                q.pop()
+                a_readers[idx].pop(&q_a_list[idx])
             } else {
-                let q = &q_b_list[idx_b % nb];
+                let idx = idx_b % nb;
                 idx_b = idx_b.wrapping_add(1);
-                q.pop()
+                b_readers[idx].pop(&q_b_list[idx])
             };
             if let Some(pkt) = pkt {
                 let s = pkt.seq;
@@ -163,7 +187,7 @@ pub fn merge_loop(
                 }
                 if s == next_seq {
                     let chan = if pkt.chan == b'A' { "A" } else { "B" };
-                    forward(&q_out, pkt);
+                    stage_forward(&q_out, &mut forward_batch, &mut forward_batch_cap, pkt);
                     metrics::inc_merge_forward_chan(chan);
                     next_seq = next_seq.wrapping_add(1);
                     forwarded_since_check = forwarded_since_check.saturating_add(1);
@@ -181,7 +205,7 @@ pub fn merge_loop(
                             metrics::inc_merge_ooo();
                             recent_ooo = recent_ooo.saturating_add(1);
                             let c = if node.chan == b'A' { "A" } else { "B" };
-                            forward(&q_out, node);
+                            stage_forward(&q_out, &mut forward_batch, &mut forward_batch_cap, node);
                             metrics::inc_merge_forward_chan(c);
                             next_seq = next_seq.wrapping_add(1);
                             forwarded_since_check = forwarded_since_check.saturating_add(1);
@@ -263,6 +287,7 @@ pub fn merge_loop(
                 }
             }
         }
+        flush_forward_batch(&q_out, &mut forward_batch, &mut forward_batch_cap);
 
         // Adaptive window adjustment checkpoint
         if adaptive && forwarded_since_check >= 4096 {
@@ -296,29 +321,90 @@ pub fn merge_loop(
 }
 
 #[inline]
-fn forward(q_out: &Arc<SpscQueue<Pkt>>, mut pkt: Pkt) {
+fn stage_forward(
+    q_out: &Arc<SpscQueue<Pkt>>,
+    batch: &mut Vec<Pkt>,
+    batch_cap: &mut AdaptiveBatchCap,
+    mut pkt: Pkt,
+) {
     // Stage timing and mark merge emit time
     let now = crate::util::now_nanos();
     if pkt.ts_nanos != 0 && now > pkt.ts_nanos {
         metrics::observe_stage_rx_to_merge_ns(now - pkt.ts_nanos);
     }
     pkt.merge_emit_ns = now;
+    batch.push(pkt);
+    if batch.len() >= batch_cap.current() {
+        flush_forward_batch(q_out, batch, batch_cap);
+    }
+}
+
+#[inline]
+fn flush_forward_batch(
+    q_out: &Arc<SpscQueue<Pkt>>,
+    batch: &mut Vec<Pkt>,
+    batch_cap: &mut AdaptiveBatchCap,
+) {
     let mut retries: u32 = 0;
-    loop {
-        match q_out.push_with_backoff(pkt, 1024) {
-            Ok(()) => break,
-            Err(returned) => {
-                pkt = returned;
-                retries = retries.wrapping_add(1);
-                if (retries & 0x3f) == 0 {
-                    warn!(
-                        "merge->decode backpressure: retries={} q_len~{}",
-                        retries,
-                        q_out.len()
-                    );
-                }
+    while !batch.is_empty() {
+        let requested = batch.len().min(batch_cap.current());
+        let writable = q_out.spare_capacity().min(requested);
+        if writable > 0 {
+            let pushed = q_out.push_batch(batch, writable);
+            debug_assert_eq!(pushed, writable);
+            if pushed == requested {
+                batch_cap.record(requested, pushed);
+                continue;
             }
+            batch_cap.reset();
         }
+
+        crate::util::spin_wait(64);
+        if (retries & 0xff) == 0 {
+            std::thread::yield_now();
+        }
+        retries = retries.wrapping_add(1);
+        if (retries & 0x3f) == 0 {
+            warn!(
+                "merge->decode backpressure: retries={} q_len~{} pending_batch={}",
+                retries,
+                q_out.len(),
+                batch.len()
+            );
+        }
+    }
+}
+
+struct BatchReader<T> {
+    pending: Vec<T>,
+    batch_cap: AdaptiveBatchCap,
+}
+
+impl<T> BatchReader<T> {
+    fn new(max_batch: usize) -> Self {
+        let max_batch = max_batch.max(1);
+        Self {
+            pending: Vec::with_capacity(max_batch),
+            batch_cap: AdaptiveBatchCap::new(1, max_batch),
+        }
+    }
+
+    #[inline]
+    fn pop(&mut self, q: &SpscQueue<T>) -> Option<T> {
+        if let Some(value) = self.pending.pop() {
+            return Some(value);
+        }
+
+        let requested = self.batch_cap.current();
+        let popped = q.pop_batch(&mut self.pending, requested);
+        if popped == 0 {
+            self.batch_cap.reset();
+            return None;
+        }
+
+        self.batch_cap.record(requested, popped);
+        self.pending.reverse();
+        self.pending.pop()
     }
 }
 

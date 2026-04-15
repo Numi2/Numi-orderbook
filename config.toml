@@ -49,6 +49,13 @@ consume_trades = false
 default_tick = 1
 grid_span = 16384
 order_slab_capacity = 1048576
+order_index_capacity = 1048576
+per_instrument_order_index_capacity = 1048576
+# Reserve top-level book/tick maps for at least this many instruments.
+# If omitted, the loaded refdata row count is used.
+# instrument_capacity = 1024
+# When true, eagerly creates books and per-instrument slabs for refdata instruments.
+preallocate_instrument_books = false
 instrument_ticks = []
 # Optional CSV reference data. Header aliases: instr/instrument_id/security_id
 # and tick/tick_size/minimum_price_increment.
