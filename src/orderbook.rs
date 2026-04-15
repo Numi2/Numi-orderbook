@@ -1,6 +1,6 @@
 // src/orderbook.rs Numan Thabit: extended with export/import
 use crate::parser::{Event, Side};
-use hashbrown::{HashMap, HashSet};
+use hashbrown::{hash_map::Entry, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use smallvec::SmallVec;
@@ -251,10 +251,15 @@ impl PriceGrid {
         if d < 0 {
             return None;
         }
-        if d % self.tick != 0 {
+        let tick = self.tick;
+        if tick == 1 {
+            let idx = d as usize;
+            return (idx < self.slots.len()).then_some(idx);
+        }
+        if tick <= 0 || d % tick != 0 {
             return None;
         }
-        let idx = (d / self.tick) as usize;
+        let idx = (d / tick) as usize;
         if idx < self.slots.len() {
             Some(idx)
         } else {
@@ -287,18 +292,13 @@ impl PriceGrid {
     }
 
     #[inline]
-    fn get_mut_or_create(&mut self, price: i64) -> Option<&mut Level> {
-        if !self.initialized {
-            self.init_around(price);
+    fn level_mut_or_create_at(&mut self, idx: usize) -> &mut Level {
+        if self.slots[idx].is_none() {
+            self.slots[idx] = Some(Level::default());
         }
-        if let Some(i) = self.price_to_idx(price) {
-            if self.slots[i].is_none() {
-                self.slots[i] = Some(Level::default());
-            }
-            self.slots[i].as_mut()
-        } else {
-            None
-        }
+        self.slots[idx]
+            .as_mut()
+            .expect("level slot was just created")
     }
 
     #[inline]
@@ -439,10 +439,16 @@ impl InstrumentBook {
         overflow: &'a mut BTreeMap<i64, Level>,
         price: i64,
     ) -> &'a mut Level {
-        if grid.price_to_idx(price).is_some() {
-            return grid
-                .get_mut_or_create(price)
-                .expect("price_to_idx succeeded but slot missing");
+        if !grid.initialized {
+            let tick = grid.tick;
+            if tick == 0 || price.rem_euclid(tick) != 0 {
+                return overflow.entry(price).or_default();
+            }
+            grid.init_around(price);
+        }
+
+        if let Some(idx) = grid.price_to_idx(price) {
+            return grid.level_mut_or_create_at(idx);
         }
 
         let tick = grid.tick;
@@ -458,10 +464,8 @@ impl InstrumentBook {
 
         Self::recenter_grid(grid, overflow, price);
 
-        if grid.price_to_idx(price).is_some() {
-            return grid
-                .get_mut_or_create(price)
-                .expect("recentered grid should hold price");
+        if let Some(idx) = grid.price_to_idx(price) {
+            return grid.level_mut_or_create_at(idx);
         }
 
         overflow.entry(price).or_default()
@@ -1075,6 +1079,27 @@ fn push_export_instrument(instruments: &mut Vec<InstrumentExport>, instrument: I
     }
 }
 
+#[inline]
+fn hash_level_orders(
+    h: &mut u64,
+    instr: u32,
+    price: i64,
+    side: Side,
+    level: &Level,
+    book: &InstrumentBook,
+    handle_to_id: &HashMap<(u32, Handle), u64>,
+) {
+    for handle in level.iter_fifo(&book.orders) {
+        let node = &book.orders[handle];
+        if let Some(&order_id) = handle_to_id.get(&(instr, handle)) {
+            hash_u64(h, order_id);
+            hash_i64(h, price);
+            hash_i64(h, node.qty);
+            hash_side(h, side);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrderBookCapacity {
     /// Number of instrument books and tick-table entries to reserve up front.
@@ -1346,17 +1371,39 @@ impl OrderBook {
 
     #[inline]
     fn book_mut(&mut self, instr: u32) -> &mut InstrumentBook {
-        let tick = self
-            .instrument_ticks
+        Self::book_mut_from_parts(
+            &mut self.books,
+            &self.instrument_ticks,
+            instr,
+            self.grid_tick,
+            self.grid_span,
+            self.default_slab_capacity,
+            self.default_order_index_capacity,
+        )
+    }
+
+    #[inline]
+    fn book_mut_from_parts<'a>(
+        books: &'a mut InstrumentMap,
+        instrument_ticks: &InstrumentTickMap,
+        instr: u32,
+        default_grid_tick: i64,
+        grid_span: usize,
+        default_slab_capacity: usize,
+        default_order_index_capacity: usize,
+    ) -> &'a mut InstrumentBook {
+        let tick = instrument_ticks
             .get(&instr)
             .copied()
-            .unwrap_or(self.grid_tick);
-        let span = self.grid_span;
-        let slab_cap = self.default_slab_capacity;
-        let index_cap = self.default_order_index_capacity;
-        self.books
-            .entry(instr)
-            .or_insert_with(|| InstrumentBook::with_params(slab_cap, index_cap, tick, span))
+            .unwrap_or(default_grid_tick);
+        books.entry(instr).or_insert_with(|| {
+            InstrumentBook::with_params(
+                default_slab_capacity,
+                default_order_index_capacity,
+                tick,
+                grid_span,
+            )
+        })
     }
 
     #[inline]
@@ -1391,12 +1438,56 @@ impl OrderBook {
         // Venue reconnects, replay, or synthetic tests can deliver a repeated
         // order id. Replace atomically from the public book's point of view so
         // the old node does not remain live but unreachable from `index`.
-        self.remove_order_by_id(order_id);
-        let book = self.book_mut(instr);
-        let h = book.add(px, qty, side);
-        book.index_order(order_id, h);
-        self.index.insert(order_id, (instr, h));
-        self.last_instr = Some(instr);
+        let OrderBook {
+            books,
+            index,
+            last_instr,
+            default_slab_capacity,
+            default_order_index_capacity,
+            grid_tick,
+            grid_span,
+            instrument_ticks,
+            ..
+        } = self;
+
+        match index.entry(order_id) {
+            Entry::Occupied(mut entry) => {
+                let (old_instr, old_handle) = *entry.get();
+                if let Some(book) = books.get_mut(&old_instr) {
+                    let removed = book.remove_indexed_order(order_id);
+                    debug_assert_eq!(removed, Some(old_handle));
+                    book.cancel(old_handle);
+                }
+
+                let book = Self::book_mut_from_parts(
+                    books,
+                    instrument_ticks,
+                    instr,
+                    *grid_tick,
+                    *grid_span,
+                    *default_slab_capacity,
+                    *default_order_index_capacity,
+                );
+                let handle = book.add(px, qty, side);
+                book.index_order(order_id, handle);
+                entry.insert((instr, handle));
+            }
+            Entry::Vacant(entry) => {
+                let book = Self::book_mut_from_parts(
+                    books,
+                    instrument_ticks,
+                    instr,
+                    *grid_tick,
+                    *grid_span,
+                    *default_slab_capacity,
+                    *default_order_index_capacity,
+                );
+                let handle = book.add(px, qty, side);
+                book.index_order(order_id, handle);
+                entry.insert((instr, handle));
+            }
+        }
+        *last_instr = Some(instr);
     }
 
     #[inline]
@@ -1795,17 +1886,61 @@ impl OrderBook {
     }
     pub fn state_hash(&self) -> u64 {
         let mut h = BOOK_HASH_OFFSET;
-        let export = self.export();
-        hash_u32(&mut h, export.version);
-        hash_u64(&mut h, export.instruments.len() as u64);
-        for instrument in export.instruments {
-            hash_u32(&mut h, instrument.instr);
-            hash_u64(&mut h, instrument.orders.len() as u64);
-            for order in instrument.orders {
-                hash_u64(&mut h, order.order_id);
-                hash_i64(&mut h, order.price);
-                hash_i64(&mut h, order.qty);
-                hash_side(&mut h, order.side);
+        hash_u32(&mut h, 1);
+        hash_u64(&mut h, self.books.len() as u64);
+
+        let mut handle_to_id: HashMap<(u32, Handle), u64> =
+            HashMap::with_capacity(self.index.len());
+        for (order_id, (instr, handle)) in self.index.iter() {
+            handle_to_id.insert((*instr, *handle), *order_id);
+        }
+
+        let mut instrs: Vec<u32> = self.books.keys().copied().collect();
+        instrs.sort_unstable();
+        for instr in instrs {
+            let Some(book) = self.books.get(&instr) else {
+                continue;
+            };
+            hash_u32(&mut h, instr);
+            hash_u64(&mut h, book.orders.len() as u64);
+
+            for i in (0..book.bids_grid.slots.len()).rev() {
+                if let Some(level) = &book.bids_grid.slots[i] {
+                    if !level.is_empty() {
+                        let price = book.bids_grid.start_price + (i as i64) * book.bids_grid.tick;
+                        hash_level_orders(
+                            &mut h,
+                            instr,
+                            price,
+                            Side::Bid,
+                            level,
+                            book,
+                            &handle_to_id,
+                        );
+                    }
+                }
+            }
+            for (price, level) in book.bids_overflow.iter().rev() {
+                hash_level_orders(&mut h, instr, *price, Side::Bid, level, book, &handle_to_id);
+            }
+            for i in 0..book.asks_grid.slots.len() {
+                if let Some(level) = &book.asks_grid.slots[i] {
+                    if !level.is_empty() {
+                        let price = book.asks_grid.start_price + (i as i64) * book.asks_grid.tick;
+                        hash_level_orders(
+                            &mut h,
+                            instr,
+                            price,
+                            Side::Ask,
+                            level,
+                            book,
+                            &handle_to_id,
+                        );
+                    }
+                }
+            }
+            for (price, level) in book.asks_overflow.iter() {
+                hash_level_orders(&mut h, instr, *price, Side::Ask, level, book, &handle_to_id);
             }
         }
         h

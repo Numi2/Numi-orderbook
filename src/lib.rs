@@ -8,6 +8,7 @@ pub mod decoder_eobi;
 pub mod decoder_fast;
 pub mod decoder_itch;
 pub mod decoder_schema;
+pub mod insights;
 pub mod journal;
 pub mod merge;
 pub mod metrics;

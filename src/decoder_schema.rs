@@ -2558,9 +2558,36 @@ pub const EOBI_MESSAGES: &[MessageDesc] = &[
 
 #[inline]
 pub fn eobi_message(template_id: u16) -> Option<&'static MessageDesc> {
-    EOBI_MESSAGES
-        .iter()
-        .find(|desc| desc.template_id == template_id)
+    match template_id {
+        13001 => Some(&EOBI_MESSAGES[0]),
+        13002 => Some(&EOBI_MESSAGES[1]),
+        13100 => Some(&EOBI_MESSAGES[2]),
+        13101 => Some(&EOBI_MESSAGES[3]),
+        13102 => Some(&EOBI_MESSAGES[4]),
+        13103 => Some(&EOBI_MESSAGES[5]),
+        13104 => Some(&EOBI_MESSAGES[6]),
+        13105 => Some(&EOBI_MESSAGES[7]),
+        13106 => Some(&EOBI_MESSAGES[8]),
+        13200 => Some(&EOBI_MESSAGES[9]),
+        13201 => Some(&EOBI_MESSAGES[10]),
+        13202 => Some(&EOBI_MESSAGES[11]),
+        13203 => Some(&EOBI_MESSAGES[12]),
+        13300 => Some(&EOBI_MESSAGES[13]),
+        13301 => Some(&EOBI_MESSAGES[14]),
+        13302 => Some(&EOBI_MESSAGES[15]),
+        13400 => Some(&EOBI_MESSAGES[16]),
+        13401 => Some(&EOBI_MESSAGES[17]),
+        13402 => Some(&EOBI_MESSAGES[18]),
+        13500 => Some(&EOBI_MESSAGES[19]),
+        13501 => Some(&EOBI_MESSAGES[20]),
+        13502 => Some(&EOBI_MESSAGES[21]),
+        13503 => Some(&EOBI_MESSAGES[22]),
+        13504 => Some(&EOBI_MESSAGES[23]),
+        13600 => Some(&EOBI_MESSAGES[24]),
+        13601 => Some(&EOBI_MESSAGES[25]),
+        13602 => Some(&EOBI_MESSAGES[26]),
+        _ => None,
+    }
 }
 
 pub fn validate_eobi_schema() -> Result<(), String> {

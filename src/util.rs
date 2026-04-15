@@ -105,6 +105,12 @@ pub fn mach_absolute_to_nanos(ticks: u64) -> u64 {
         }
     });
     let (numer, denom) = *TIMEBASE;
+    if numer == denom {
+        return ticks;
+    }
+    if denom == 1 {
+        return ticks.saturating_mul(numer);
+    }
     ((ticks as u128).saturating_mul(numer as u128) / denom as u128).min(u64::MAX as u128) as u64
 }
 

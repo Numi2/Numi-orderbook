@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use hashbrown::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,22 +19,21 @@ pub struct Publisher {
     inner: Arc<Inner>,
 }
 
-#[derive(Clone)]
 pub struct Subscription {
     inner: Arc<Inner>,
     next_global: u64,
 }
 
 struct Inner {
-    // ring of (global_seq, frame)
     ring: Mutex<Ring>,
     cv: Condvar,
+    subscriber_count: AtomicUsize,
     // per-instrument sequence state
     per_instr_seq: Mutex<HashMap<u64, u64>>, // instrument_id -> next_seq
 }
 
 struct Ring {
-    buf: VecDeque<(u64, Bytes)>,
+    buf: VecDeque<Bytes>,
     cap: usize,
     next_global: u64,
 }
@@ -53,6 +53,7 @@ impl Bus {
         let inner = Inner {
             ring: Mutex::new(ring),
             cv: Condvar::new(),
+            subscriber_count: AtomicUsize::new(0),
             per_instr_seq: Mutex::new(HashMap::new()),
         };
         Self {
@@ -67,6 +68,7 @@ impl Bus {
     }
     pub fn subscribe(&self) -> Subscription {
         let next = self.inner.ring.lock().unwrap().next_global;
+        self.inner.subscriber_count.fetch_add(1, Ordering::Relaxed);
         Subscription {
             inner: self.inner.clone(),
             next_global: next,
@@ -109,9 +111,11 @@ impl Publisher {
         if ring.buf.len() == ring.cap {
             ring.buf.pop_front();
         }
-        ring.buf.push_back((g, bytes));
+        ring.buf.push_back(bytes);
         drop(ring);
-        self.inner.cv.notify_all();
+        if self.inner.subscriber_count.load(Ordering::Relaxed) != 0 {
+            self.inner.cv.notify_all();
+        }
         g
     }
 
@@ -127,6 +131,22 @@ impl Publisher {
     #[inline]
     pub fn next_global_sequence(&self) -> u64 {
         self.inner.ring.lock().unwrap().next_global
+    }
+}
+
+impl Clone for Subscription {
+    fn clone(&self) -> Self {
+        self.inner.subscriber_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+            next_global: self.next_global,
+        }
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        self.inner.subscriber_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -175,7 +195,7 @@ impl Subscription {
                     to: guard.next_global.saturating_sub(1),
                 });
             }
-            let (_g, bytes) = guard.buf[offset].clone();
+            let bytes = guard.buf[offset].clone();
             self.next_global = self.next_global.wrapping_add(1);
             return Ok(bytes);
         }
@@ -200,7 +220,7 @@ impl Subscription {
                         to: guard.next_global.saturating_sub(1),
                     });
                 }
-                let (_g, bytes) = guard.buf[offset].clone();
+                let bytes = guard.buf[offset].clone();
                 self.next_global = self.next_global.wrapping_add(1);
                 return Ok(Some(bytes));
             }

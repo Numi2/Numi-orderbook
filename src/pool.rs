@@ -37,8 +37,7 @@ impl PacketPool {
 
     #[inline]
     pub fn get(&self) -> BytesMut {
-        if let Some(mut b) = self.inner.pop() {
-            b.truncate(0);
+        if let Some(b) = self.inner.pop() {
             b
         } else {
             crate::metrics::inc_packet_pool_miss();

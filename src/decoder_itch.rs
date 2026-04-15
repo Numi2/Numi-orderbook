@@ -74,7 +74,7 @@ impl MessageDecoder for Itch50Decoder {
         let st: &mut Inner = unsafe { &mut *self.inner.get() };
 
         while off + 3 <= payload.len() {
-            let msg_len = be_u16(&payload[off..off + 2]) as usize;
+            let msg_len = read_be_u16_at(payload, off) as usize;
             if msg_len < 1 {
                 // length must at least contain message type
                 break;
@@ -109,8 +109,18 @@ impl MessageDecoder for Itch50Decoder {
 }
 
 #[inline]
-fn be_u16(b: &[u8]) -> u16 {
-    u16::from_be_bytes([b[0], b[1]])
+fn read_be_u16_at(b: &[u8], off: usize) -> u16 {
+    unsafe { u16::from_be((b.as_ptr().add(off) as *const u16).read_unaligned()) }
+}
+
+#[inline]
+fn read_be_u32_at(b: &[u8], off: usize) -> u32 {
+    unsafe { u32::from_be((b.as_ptr().add(off) as *const u32).read_unaligned()) }
+}
+
+#[inline]
+fn read_be_u64_at(b: &[u8], off: usize) -> u64 {
+    unsafe { u64::from_be((b.as_ptr().add(off) as *const u64).read_unaligned()) }
 }
 
 #[inline]
@@ -158,19 +168,11 @@ fn on_add(body: &[u8], st: &mut Inner, out: &mut Vec<Event>, with_mpid: bool) {
     if body.len() < min_len {
         return;
     }
-    let mut o = 0usize;
-    let locate = read_u16(body, &mut o).unwrap();
-    o += 2 + 6; // tracking + timestamp
-    let order_ref = read_u64(body, &mut o).unwrap();
-    let side_ch = body[o];
-    o += 1;
-    let shares = read_u32(body, &mut o).unwrap() as i64;
-    // stock symbol (ignored for book logic)
-    let _stock = read_fixed::<8>(body, &mut o).unwrap();
-    let price = read_u32(body, &mut o).unwrap() as i64;
-    if with_mpid {
-        // Ignore MPID bytes; no further fields are read here so no need to advance offset
-    }
+    let locate = read_be_u16_at(body, 0);
+    let order_ref = read_be_u64_at(body, 10);
+    let side_ch = body[18];
+    let shares = read_be_u32_at(body, 19) as i64;
+    let price = read_be_u32_at(body, 31) as i64;
 
     let side = if side_ch == b'B' {
         Side::Bid
@@ -251,11 +253,8 @@ fn on_cancel(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     if body.len() < 2 + 2 + 6 + 8 + 4 {
         return;
     }
-    let mut o = 0usize;
-    let _locate = read_u16(body, &mut o).unwrap();
-    o += 2 + 6;
-    let order_ref = read_u64(body, &mut o).unwrap();
-    let canceled = read_u32(body, &mut o).unwrap() as i64;
+    let order_ref = read_be_u64_at(body, 10);
+    let canceled = read_be_u32_at(body, 18) as i64;
 
     if let Some(ent) = st.orders.get_mut(&order_ref) {
         ent.qty = (ent.qty - canceled).max(0);
@@ -278,10 +277,7 @@ fn on_delete(body: &[u8], st: &mut Inner, out: &mut Vec<Event>) {
     if body.len() < 2 + 2 + 6 + 8 {
         return;
     }
-    let mut o = 0usize;
-    let _locate = read_u16(body, &mut o).unwrap();
-    o += 2 + 6;
-    let order_ref = read_u64(body, &mut o).unwrap();
+    let order_ref = read_be_u64_at(body, 10);
 
     if st.orders.remove(&order_ref).is_some() {
         out.push(Event::Del {
