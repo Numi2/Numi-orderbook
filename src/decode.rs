@@ -12,6 +12,8 @@ use crate::util::{now_nanos, BarrierFlag};
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use log::{info, warn};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zerocopy::AsBytes;
@@ -20,13 +22,18 @@ pub struct DecodeConfig {
     pub max_depth: usize,
     pub snapshot_interval_ms: u64,
     pub consume_trades: bool,
-    pub snapshot_tx: Option<Sender<crate::orderbook::BookExport>>,
+    pub default_slab_capacity: usize,
+    pub default_tick: i64,
+    pub grid_span: usize,
+    pub instrument_ticks: Vec<(u32, i64)>,
+    pub snapshot_tx: Option<Sender<crate::snapshot::SnapshotImage>>,
     pub initial_book: Option<OrderBook>,
     pub snapshot_trigger_rx: Option<Receiver<()>>,
     pub obo_publisher: Option<OboPublisher>,
+    pub journal_path: Option<String>,
+    pub journal_record_state_hash: bool,
 }
 
-// TODO: Group arguments into a DecodeConfig struct to reduce parameter count.
 pub fn decode_loop(
     q_in: Arc<SpscQueue<Pkt>>,
     pool: Arc<PacketPool>,
@@ -34,15 +41,56 @@ pub fn decode_loop(
     shutdown: Arc<BarrierFlag>,
     cfg: DecodeConfig,
 ) -> anyhow::Result<()> {
-    let mut book = cfg
-        .initial_book
-        .unwrap_or_else(|| OrderBook::new(cfg.max_depth));
-    book.set_consume_trades(cfg.consume_trades);
+    let DecodeConfig {
+        max_depth,
+        snapshot_interval_ms,
+        consume_trades,
+        default_slab_capacity,
+        default_tick,
+        grid_span,
+        instrument_ticks,
+        snapshot_tx,
+        initial_book,
+        snapshot_trigger_rx,
+        obo_publisher,
+        journal_path,
+        journal_record_state_hash,
+    } = cfg;
+
+    let mut book = initial_book.unwrap_or_else(|| {
+        OrderBook::new_with_tick_table(
+            max_depth,
+            consume_trades,
+            default_slab_capacity,
+            default_tick,
+            grid_span,
+            instrument_ticks.iter().copied(),
+        )
+        .unwrap_or_else(|e| {
+            warn!("invalid book tick table ({e}); falling back to default book config");
+            OrderBook::new(max_depth)
+        })
+    });
+    if let Err(e) = book.set_instrument_ticks(instrument_ticks.iter().copied()) {
+        warn!("invalid book tick table for loaded book: {e}");
+    }
+    book.set_consume_trades(consume_trades);
     // Cache sizing to avoid per-packet re-evaluations
     let max_msgs = parser.max_messages_per_packet;
     let mut events = Vec::with_capacity(max_msgs);
     let mut last_snap = Instant::now();
-    let snap_every = Duration::from_millis(cfg.snapshot_interval_ms);
+    let snap_every = Duration::from_millis(snapshot_interval_ms);
+    let mut journal = if let Some(path) = journal_path {
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(file) => Some(BufWriter::new(file)),
+            Err(e) => {
+                warn!("failed to open journal {path}: {e:?}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut processed_pkts: u64 = 0;
     let mut processed_msgs: u64 = 0;
@@ -61,6 +109,7 @@ pub fn decode_loop(
             let cap_before = events.capacity();
             parser.decode_into(payload, &mut events);
             if events.capacity() > cap_before {
+                metrics::inc_decode_event_vec_realloc();
                 warn!(
                     "decode events vector reallocated: old_cap={} new_cap={} len={}",
                     cap_before,
@@ -82,27 +131,51 @@ pub fn decode_loop(
                 }
             }
 
-            for ev in &events {
+            for (event_index, ev) in events.iter().enumerate() {
+                let instr_before_apply = match *ev {
+                    crate::parser::Event::Mod { order_id, .. }
+                    | crate::parser::Event::Del { order_id } => book.instrument_for_order(order_id),
+                    _ => None,
+                };
+
                 book.apply(ev);
-                if let Some(pubh) = &cfg.obo_publisher {
+                let journal_write_result = if let Some(writer) = journal.as_mut() {
+                    let state_hash_after = journal_record_state_hash.then(|| book.state_hash());
+                    let event_index = u16::try_from(event_index).unwrap_or(u16::MAX);
+                    let record = crate::journal::JournalRecord::new_at(
+                        pkt.seq,
+                        event_index,
+                        ev,
+                        state_hash_after,
+                    );
+                    Some(crate::journal::append_record(writer, &record))
+                } else {
+                    None
+                };
+                if let Some(Err(e)) = journal_write_result {
+                    warn!("disabling journal after write failure: {e:?}");
+                    journal = None;
+                }
+                if let Some(pubh) = &obo_publisher {
                     let (maybe_instr, maybe_obo) = map_event_to_obo_parts(ev);
                     if let Some(obo_ev) = maybe_obo {
                         // Determine instrument id for this event
-                        let instr_opt: Option<u32> = if let Some(i) = maybe_instr {
-                            Some(i)
-                        } else {
-                            match *ev {
-                                crate::parser::Event::Mod { order_id, .. } => {
-                                    book.instrument_for_order(order_id)
-                                }
-                                crate::parser::Event::Del { order_id } => {
-                                    book.instrument_for_order(order_id)
-                                }
+                        let instr_opt: Option<u32> =
+                            maybe_instr.or_else(|| match *ev {
+                                crate::parser::Event::Mod { order_id, .. } => instr_before_apply
+                                    .or_else(|| book.instrument_for_order(order_id)),
+                                crate::parser::Event::Del { order_id } => instr_before_apply
+                                    .or_else(|| book.instrument_for_order(order_id)),
                                 crate::parser::Event::Trade { instr, .. } => Some(instr),
                                 _ => None,
-                            }
+                            });
+                        let Some(instr) = instr_opt.map(u64::from) else {
+                            warn!(
+                                "skipping OBO publish for event without instrument: {:?}",
+                                ev
+                            );
+                            continue;
                         };
-                        let instr = instr_opt.unwrap_or(0) as u64;
                         let (msg_ty, payload_bytes) = match obo_ev {
                             OboEventV1::Add(p) => (msg_type::OBO_ADD, p.as_bytes().to_vec()),
                             OboEventV1::Modify(p) => (msg_type::OBO_MODIFY, p.as_bytes().to_vec()),
@@ -129,7 +202,7 @@ pub fn decode_loop(
 
             let mut should_snapshot = last_snap.elapsed() >= snap_every;
             if !should_snapshot {
-                if let Some(ref rx) = cfg.snapshot_trigger_rx {
+                if let Some(ref rx) = snapshot_trigger_rx {
                     if rx.try_recv().is_ok() {
                         should_snapshot = true;
                     }
@@ -137,9 +210,14 @@ pub fn decode_loop(
             }
             if should_snapshot {
                 metrics::set_live_orders(book.order_count());
-                if let Some(ref tx) = cfg.snapshot_tx {
-                    let export = book.export();
-                    let _ = tx.try_send(export);
+                if let Some(ref tx) = snapshot_tx {
+                    let image = crate::snapshot::SnapshotImage {
+                        export: book.export(),
+                        replay_from: obo_publisher
+                            .as_ref()
+                            .map(|pubh| pubh.next_global_sequence()),
+                    };
+                    let _ = tx.try_send(image);
                 }
                 let (bbo_bid, bbo_ask) = book.bbo();
                 info!(
@@ -150,11 +228,17 @@ pub fn decode_loop(
                     bbo_bid,
                     bbo_ask
                 );
+                if let Some(writer) = journal.as_mut() {
+                    let _ = writer.flush();
+                }
                 last_snap = Instant::now();
             }
         } else {
             crate::util::adaptive_wait(&mut idle_iters, 64);
         }
+    }
+    if let Some(mut writer) = journal {
+        let _ = writer.flush();
     }
     Ok(())
 }

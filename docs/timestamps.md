@@ -4,7 +4,10 @@ Timestamp strategy
 Canonical path
 --------------
 - Use UDP `recvmmsg` + `SO_TIMESTAMPING` (SYS/HW/RAW) as the canonical timestamped RX path.
-- AF_XDP is used for throughput; until mlx5 exposes RX timestamps to XSK in your kernel, AF_XDP frames are stamped with local TSC.
+- The PACKET_MMAP fallback is used for throughput experiments and is stamped from the packet-ring timestamp.
+- AF_XDP/XSK is a separate receive path. Until NIC/driver timestamp support is
+  explicitly wired and calibrated for that path, treat AF_XDP timestamps as
+  ingress-observation timestamps, not exchange-to-decode latency truth.
 
 Unification
 -----------
@@ -15,10 +18,18 @@ Unification
 
 Calibration
 -----------
-- If AF_XDP is used for e2e timing, calibrate TSC->PHC offset via `ptp4l`/`phc2sys` and record drift as a gauge (future work).
+- If AF_XDP is used for e2e timing, calibrate TSC->PHC offset via
+  `ptp4l`/`phc2sys` and record drift as a gauge.
+- Record the timestamp source with every packet: `HwRaw` only when the NIC
+  timestamp is available on the actual RX path, `HwSys` only after PHC-to-system
+  conversion, and `Sw` for userspace observation time.
+- Do not compare UDP hardware timestamp SLOs against AF_XDP software timestamps;
+  report them as separate latency classes.
 
 Next steps for mlx5/XSK
 -----------------------
-- If your kernel+mlx5 support HW timestamps to AF_XDP, wire it and switch canonical path to XDP. Otherwise keep UDP canonical.
-
-
+- If your kernel+mlx5 support hardware timestamps to AF_XDP, wire timestamp
+  extraction into the XSK descriptor side channel and switch the canonical path
+  only after drift and monotonicity checks pass.
+- If hardware timestamps are unavailable for XSK, keep UDP hardware timestamping
+  as the canonical latency measurement path while using AF_XDP for throughput.

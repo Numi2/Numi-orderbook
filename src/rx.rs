@@ -25,7 +25,6 @@ pub struct RxConfig {
     pub ts_mode: Option<crate::config::TimestampingMode>,
 }
 
-// TODO: Group arguments into an RxConfig struct to reduce parameter count.
 pub fn rx_loop(
     chan_name: &str,
     sock: &UdpSocket,

@@ -46,6 +46,13 @@ max_pending_packets = 131072
 max_depth = 50
 snapshot_interval_ms = 1000
 consume_trades = false
+default_tick = 1
+grid_span = 16384
+order_slab_capacity = 1048576
+instrument_ticks = []
+# Optional CSV reference data. Header aliases: instr/instrument_id/security_id
+# and tick/tick_size/minimum_price_increment.
+# instrument_ticks_path = "/var/lib/t7_like/instrument_ticks.csv"
 
 [cpu]
 a_rx_core = 2
@@ -62,11 +69,47 @@ path = "/var/lib/t7_like/book.snap"
 load_on_start = true
 enable_writer = true
 
+[journal]
+path = "/var/lib/t7_like/book.journal"
+enable_writer = false
+record_state_hash = true
+
 [recovery]
 enable_injector = false
 endpoint = "127.0.0.1:9000"
+retry_attempts = 3
+retry_backoff_ms = 10
+min_request_interval_ms = 0
+slo_ms = 100
+unrecoverable_policy = "log"
+request_timeout_ms = 250
+# REPLAY request + [len, seq, payload] response frames.
+replay_protocol = "len_seq_payload"
 
 [afxdp]
 enable = false
 ifname = "eth0"
-queue_id = 0
+queues = 1
+
+[packet_mmap]
+enable = false
+ifname = "eth0"
+queues = 1
+frame_size = 2048
+frames_per_block = 1024
+block_count = 4
+
+[feeds]
+enabled = false
+pops = []
+
+[feeds.obo]
+enabled = false
+client_write_timeout_ms = 250
+client_handshake_timeout_ms = 1000
+client_heartbeat_interval_ms = 1000
+client_max_connections = 1024
+client_nodelay = true
+
+[feeds.obo.buffers]
+pub_queue = 65536

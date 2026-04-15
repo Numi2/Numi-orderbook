@@ -1,7 +1,6 @@
 // src/pool.rs
 use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
-use std::slice;
 use std::sync::Arc;
 
 pub struct PacketPool {
@@ -12,15 +11,28 @@ pub struct PacketPool {
 impl PacketPool {
     pub fn new(pool_size: usize, max_packet_size: usize) -> anyhow::Result<Self> {
         let q = Arc::new(ArrayQueue::new(pool_size));
-        // Pre-allocate the entire pool to warm caches and avoid runtime allocations
+        // Pre-allocate and touch the entire pool so pages are faulted in during startup,
+        // not on the RX hot path.
         let prealloc = pool_size;
         for _ in 0..prealloc {
-            let _ = q.push(BytesMut::with_capacity(max_packet_size));
+            let _ = q.push(Self::preallocated_buffer(max_packet_size));
         }
+        crate::metrics::set_packet_pool_preallocated_bytes(
+            pool_size.saturating_mul(max_packet_size),
+        );
         Ok(Self {
             inner: q,
             max_packet_size,
         })
+    }
+
+    fn preallocated_buffer(max_packet_size: usize) -> BytesMut {
+        let mut b = BytesMut::with_capacity(max_packet_size);
+        if max_packet_size > 0 {
+            b.resize(max_packet_size, 0);
+            b.truncate(0);
+        }
+        b
     }
 
     #[inline]
@@ -29,6 +41,7 @@ impl PacketPool {
             b.truncate(0);
             b
         } else {
+            crate::metrics::inc_packet_pool_miss();
             BytesMut::with_capacity(self.max_packet_size)
         }
     }
@@ -36,7 +49,9 @@ impl PacketPool {
     #[inline]
     pub fn put(&self, mut buf: BytesMut) {
         buf.truncate(0);
-        let _ = self.inner.push(buf);
+        if self.inner.push(buf).is_err() {
+            crate::metrics::inc_packet_pool_return_drop();
+        }
     }
 }
 
@@ -53,12 +68,6 @@ pub enum TsKind {
 #[derive(Debug)]
 pub enum PktBuf {
     Bytes(BytesMut),
-    #[allow(dead_code)]
-    Umem {
-        ptr: *mut u8,
-        len: usize,
-        frame_idx: u32,
-    },
 }
 
 #[derive(Debug)]
@@ -73,19 +82,11 @@ pub struct Pkt {
     pub merge_emit_ns: u64,
 }
 
-// Safety: Packet buffers are transferred across threads via SPSC queues.
-// BytesMut is Send. The UMEM pointer represents a frame owned by the runtime
-// which is reclaimed out of band; we treat it as Send here.
-unsafe impl Send for Pkt {}
-
 impl Pkt {
     #[inline]
     pub fn payload(&self) -> &[u8] {
         match &self.buf {
             PktBuf::Bytes(b) => &b[..self.len],
-            PktBuf::Umem { ptr, len, .. } => unsafe {
-                slice::from_raw_parts(*ptr as *const u8, *len)
-            },
         }
     }
 
@@ -93,7 +94,6 @@ impl Pkt {
     pub fn recycle(self, pool: &PacketPool) {
         match self.buf {
             PktBuf::Bytes(b) => pool.put(b),
-            PktBuf::Umem { .. } => { /* TODO: return to UMEM completion ring */ }
         }
     }
 }

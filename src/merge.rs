@@ -17,7 +17,6 @@ pub struct MergeConfig {
     pub reorder_window_max: u64,
 }
 
-// TODO: Group arguments into a MergeConfig struct to reduce parameter count.
 pub fn merge_loop(
     q_a_list: Vec<Arc<SpscQueue<Pkt>>>,
     q_b_list: Vec<Arc<SpscQueue<Pkt>>>,
@@ -35,7 +34,12 @@ pub fn merge_loop(
         adaptive,
         reorder_window_max,
     } = cfg;
-    let cap: usize = (reorder_window as usize).saturating_add(1);
+    let ring_window = if adaptive {
+        reorder_window_max.max(reorder_window)
+    } else {
+        reorder_window
+    };
+    let cap: usize = (ring_window as usize).saturating_add(1);
     let mut ring: Vec<Option<(u64, Pkt)>> = (0..cap).map(|_| None).collect();
     let mut pending_count: usize = 0;
 
@@ -76,6 +80,7 @@ pub fn merge_loop(
                         forward(&q_out, pkt);
                         metrics::inc_merge_forward_chan("R");
                         next_seq = next_seq.wrapping_add(1);
+                        forwarded_since_check = forwarded_since_check.saturating_add(1);
                         moved = true;
                         // Drain contiguous buffered packets
                         loop {
@@ -112,7 +117,6 @@ pub fn merge_loop(
                                         metrics::inc_merge_dup();
                                     } else if *seq_in_slot < next_seq {
                                         ring[idx] = Some((s, pkt));
-                                        pending_count += 1;
                                     } else {
                                         metrics::inc_merge_dup();
                                     }
@@ -162,6 +166,7 @@ pub fn merge_loop(
                     forward(&q_out, pkt);
                     metrics::inc_merge_forward_chan(chan);
                     next_seq = next_seq.wrapping_add(1);
+                    forwarded_since_check = forwarded_since_check.saturating_add(1);
                     moved = true;
                     // Drain contiguous buffered packets
                     loop {
@@ -230,7 +235,6 @@ pub fn merge_loop(
                                 } else if *seq_in_slot < next_seq {
                                     // stale slot from an old window; replace
                                     ring[idx] = Some((s, pkt));
-                                    pending_count += 1;
                                 } else {
                                     // different seq still in-window shouldn't alias due to cap, but guard anyway
                                     metrics::inc_merge_dup();
@@ -322,6 +326,18 @@ fn forward(q_out: &Arc<SpscQueue<Pkt>>, mut pkt: Pkt) {
 mod tests {
     use super::*;
     use bytes::BytesMut;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingRecovery {
+        gaps: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl crate::recovery::Replayer for RecordingRecovery {
+        fn notify_gap(&self, from: u64, to: u64) {
+            self.gaps.lock().unwrap().push((from, to));
+        }
+    }
 
     fn pkt(seq: u64, chan: u8) -> Pkt {
         Pkt {
@@ -335,6 +351,51 @@ mod tests {
         }
     }
 
+    fn collect_until(q_out: &Arc<SpscQueue<Pkt>>, expected: usize) -> Vec<u64> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while q_out.len() < expected && std::time::Instant::now() < deadline {
+            crate::util::spin_wait(1000);
+        }
+
+        let mut seqs = Vec::new();
+        while let Some(p) = q_out.pop() {
+            seqs.push(p.seq);
+        }
+        seqs
+    }
+
+    fn spawn_merge_fixture(
+        q_a: Arc<SpscQueue<Pkt>>,
+        q_b: Arc<SpscQueue<Pkt>>,
+        q_out: Arc<SpscQueue<Pkt>>,
+        shutdown: Arc<crate::util::BarrierFlag>,
+        recovery: Option<RecoveryClient>,
+        q_recovery: Option<Arc<SpscQueue<Pkt>>>,
+        reorder_window: u64,
+        adaptive: bool,
+        reorder_window_max: u64,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let cfg = MergeConfig {
+                next_seq: 1,
+                reorder_window,
+                max_pending: 64,
+                dwell_ns: 0,
+                adaptive,
+                reorder_window_max,
+            };
+            let _ = merge_loop(
+                vec![q_a],
+                vec![q_b],
+                q_out,
+                cfg,
+                shutdown,
+                recovery,
+                q_recovery,
+            );
+        })
+    }
+
     #[test]
     fn merge_reorders_in_window_and_drops_dupes() {
         let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
@@ -342,21 +403,17 @@ mod tests {
         let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
         let shutdown = Arc::new(crate::util::BarrierFlag::default());
 
-        let qa = q_a.clone();
-        let qb = q_b.clone();
-        let qo = q_out.clone();
-        let sd = shutdown.clone();
-        let t = std::thread::spawn(move || {
-            let cfg = MergeConfig {
-                next_seq: 1,
-                reorder_window: 4,
-                max_pending: 64,
-                dwell_ns: 0,
-                adaptive: false,
-                reorder_window_max: 8,
-            };
-            let _ = merge_loop(vec![qa], vec![qb], qo, cfg, sd, None, None);
-        });
+        let t = spawn_merge_fixture(
+            q_a.clone(),
+            q_b.clone(),
+            q_out.clone(),
+            shutdown.clone(),
+            None,
+            None,
+            4,
+            false,
+            8,
+        );
 
         // Feed out-of-order within window and duplicates across channels
         let _ = q_a.push(pkt(1, b'A'));
@@ -365,18 +422,147 @@ mod tests {
         let _ = q_b.push(pkt(2, b'B')); // duplicate
         let _ = q_a.push(pkt(4, b'A'));
 
-        // wait until we see at least 4 outputs or timeout
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-        while q_out.len() < 4 && std::time::Instant::now() < deadline {
+        let seqs = collect_until(&q_out, 4);
+        shutdown.raise();
+        let _ = t.join();
+
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn merge_continues_on_b_when_a_stops() {
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+
+        let t = spawn_merge_fixture(
+            q_a.clone(),
+            q_b.clone(),
+            q_out.clone(),
+            shutdown.clone(),
+            None,
+            None,
+            4,
+            false,
+            8,
+        );
+
+        let _ = q_a.push(pkt(1, b'A'));
+        let _ = q_b.push(pkt(1, b'B'));
+        let _ = q_b.push(pkt(2, b'B'));
+        let _ = q_b.push(pkt(3, b'B'));
+        let _ = q_b.push(pkt(4, b'B'));
+
+        let seqs = collect_until(&q_out, 4);
+        shutdown.raise();
+        let _ = t.join();
+
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn merge_recovers_out_of_window_gap_from_recovery_queue() {
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_rec: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+
+        let t = spawn_merge_fixture(
+            q_a.clone(),
+            q_b.clone(),
+            q_out.clone(),
+            shutdown.clone(),
+            None,
+            Some(q_rec.clone()),
+            2,
+            false,
+            4,
+        );
+
+        let _ = q_a.push(pkt(1, b'A'));
+        let first = collect_until(&q_out, 1);
+        assert_eq!(first, vec![1]);
+
+        let _ = q_b.push(pkt(5, b'B')); // beyond window, should be recovered instead
+        let _ = q_rec.push(pkt(2, b'R'));
+        let _ = q_rec.push(pkt(3, b'R'));
+        let _ = q_rec.push(pkt(4, b'R'));
+        let _ = q_rec.push(pkt(5, b'R'));
+
+        let seqs = collect_until(&q_out, 4);
+        shutdown.raise();
+        let _ = t.join();
+
+        assert_eq!(seqs, vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn merge_notifies_recovery_for_out_of_window_gap() {
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+        let recovery = Arc::new(RecordingRecovery::default());
+        let recovery_client: RecoveryClient = recovery.clone();
+
+        let t = spawn_merge_fixture(
+            q_a.clone(),
+            q_b.clone(),
+            q_out.clone(),
+            shutdown.clone(),
+            Some(recovery_client),
+            None,
+            2,
+            false,
+            4,
+        );
+
+        let _ = q_a.push(pkt(1, b'A'));
+        let first = collect_until(&q_out, 1);
+        assert_eq!(first, vec![1]);
+        let _ = q_b.push(pkt(5, b'B'));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        while recovery.gaps.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
             crate::util::spin_wait(1000);
         }
         shutdown.raise();
         let _ = t.join();
 
-        let mut seqs = Vec::new();
-        while let Some(p) = q_out.pop() {
-            seqs.push(p.seq);
+        assert_eq!(recovery.gaps.lock().unwrap().as_slice(), &[(2, 4)]);
+    }
+
+    #[test]
+    fn adaptive_window_can_buffer_up_to_configured_max() {
+        let q_a: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_b: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(64));
+        let q_out: Arc<SpscQueue<Pkt>> = Arc::new(SpscQueue::new(256));
+        let shutdown = Arc::new(crate::util::BarrierFlag::default());
+
+        let t = spawn_merge_fixture(
+            q_a.clone(),
+            q_b.clone(),
+            q_out.clone(),
+            shutdown.clone(),
+            None,
+            None,
+            8,
+            true,
+            64,
+        );
+
+        let _ = q_a.push(pkt(1, b'A'));
+        for seq in 3..=10 {
+            let _ = q_b.push(pkt(seq, b'B'));
         }
-        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        let _ = q_a.push(pkt(2, b'A'));
+
+        let seqs = collect_until(&q_out, 10);
+        shutdown.raise();
+        let _ = t.join();
+
+        assert_eq!(seqs, (1..=10).collect::<Vec<_>>());
     }
 }

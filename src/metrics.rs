@@ -42,6 +42,36 @@ static RX_DROPS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+static PACKET_POOL_MISSES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "packet_pool_misses_total",
+        "Runtime packet buffer allocations because the preallocated pool was empty",
+    )
+    .expect("packet_pool_misses_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static PACKET_POOL_RETURN_DROPS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "packet_pool_return_drops_total",
+        "Returned packet buffers dropped because the preallocated pool was full",
+    )
+    .expect("packet_pool_return_drops_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static PACKET_POOL_PREALLOC_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new(
+        "packet_pool_preallocated_bytes",
+        "Bytes reserved and page-touched during packet pool startup",
+    )
+    .expect("packet_pool_preallocated_bytes");
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
 static MERGE_DUPS: Lazy<IntCounter> = Lazy::new(|| {
     let c = IntCounter::new("merge_duplicates", "Duplicate packets filtered by merge")
         .expect("merge_duplicates");
@@ -113,6 +143,107 @@ static MERGE_PREFERRED_IS_A: Lazy<IntGauge> = Lazy::new(|| {
     g
 });
 
+static RECOVERY_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new("recovery_requests_total", "Recovery ranges requested")
+        .expect("recovery_requests_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_RETRIES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_retries_total",
+        "Recovery replay retry attempts after fetch failures",
+    )
+    .expect("recovery_retries_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_DROPPED_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_dropped_requests_total",
+        "Recovery requests dropped because the request queue was full or disconnected",
+    )
+    .expect("recovery_dropped_requests_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_FAILURES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_failures_total",
+        "Recovery ranges that exhausted retry attempts",
+    )
+    .expect("recovery_failures_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_UNRECOVERABLE_GAPS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_unrecoverable_gaps_total",
+        "Recovery ranges escalated as unrecoverable",
+    )
+    .expect("recovery_unrecoverable_gaps_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_FETCHED: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_fetched_ranges_total",
+        "Recovery ranges fetched successfully",
+    )
+    .expect("recovery_fetched_ranges_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_INJECTED_PACKETS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_injected_packets_total",
+        "Replay packets injected into the merge recovery queue",
+    )
+    .expect("recovery_injected_packets_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_STALE_PACKETS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_stale_packets_total",
+        "Replay packets rejected because their sequence is outside the requested range",
+    )
+    .expect("recovery_stale_packets_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_SLO_VIOLATIONS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "recovery_slo_violations_total",
+        "Recovery ranges that exceeded the configured SLO",
+    )
+    .expect("recovery_slo_violations_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static RECOVERY_RANGE_LATENCY: Lazy<Histogram> = Lazy::new(|| {
+    let buckets = vec![1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0, 5.0];
+    let h = Histogram::with_opts(
+        HistogramOpts::new(
+            "recovery_range_seconds",
+            "Time from coalesced recovery request to fetched or failed status",
+        )
+        .buckets(buckets),
+    )
+    .expect("recovery_range_seconds");
+    REGISTRY.register(Box::new(h.clone())).ok();
+    h
+});
+
 static DECODE_PKTS: Lazy<IntCounter> = Lazy::new(|| {
     let c =
         IntCounter::new("decode_packets", "Packets processed by decoder").expect("decode_packets");
@@ -127,12 +258,72 @@ static DECODE_MSGS: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+static DECODE_EVENT_VEC_REALLOCS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "decode_event_vec_reallocs_total",
+        "Decode event vector capacity growth events",
+    )
+    .expect("decode_event_vec_reallocs_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
 static BOOK_LIVE_ORDERS: Lazy<IntGauge> = Lazy::new(|| {
     let g = IntGauge::new(
         "book_live_orders",
         "Number of live orders across all instruments",
     )
     .expect("book_live_orders");
+    REGISTRY.register(Box::new(g.clone())).ok();
+    g
+});
+
+static ORDERBOOK_SLAB_GROWS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "orderbook_slab_grows_total",
+        "Order-book slab capacity growth events",
+    )
+    .expect("orderbook_slab_grows_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static ORDERBOOK_DEPTH_VEC_GROWS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "orderbook_depth_vec_grows_total",
+        "Cold-path depth assembly vector capacity growth events",
+    )
+    .expect("orderbook_depth_vec_grows_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static ORDERBOOK_EXPORT_VEC_GROWS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "orderbook_export_vec_grows_total",
+        "Snapshot export vector capacity growth events",
+    )
+    .expect("orderbook_export_vec_grows_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static SNAPSHOT_PAYLOAD_VEC_GROWS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "snapshot_payload_vec_grows_total",
+        "Snapshot writer payload vector capacity growth events",
+    )
+    .expect("snapshot_payload_vec_grows_total");
+    REGISTRY.register(Box::new(c.clone())).ok();
+    c
+});
+
+static SNAPSHOT_PAYLOAD_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new(
+        "snapshot_payload_bytes",
+        "Most recent serialized snapshot payload size in bytes",
+    )
+    .expect("snapshot_payload_bytes");
     REGISTRY.register(Box::new(g.clone())).ok();
     g
 });
@@ -253,6 +444,18 @@ pub fn inc_rx_drop(chan: &str) {
     RX_DROPS.with_label_values(&[chan]).inc();
 }
 
+pub fn inc_packet_pool_miss() {
+    PACKET_POOL_MISSES.inc();
+}
+
+pub fn inc_packet_pool_return_drop() {
+    PACKET_POOL_RETURN_DROPS.inc();
+}
+
+pub fn set_packet_pool_preallocated_bytes(n: usize) {
+    PACKET_POOL_PREALLOC_BYTES.set(n as i64);
+}
+
 pub fn inc_merge_dup() {
     MERGE_DUPS.inc();
 }
@@ -276,6 +479,38 @@ pub fn set_merge_preferred_is_a(is_a: bool) {
     MERGE_PREFERRED_IS_A.set(if is_a { 1 } else { 0 });
 }
 
+pub fn inc_recovery_request() {
+    RECOVERY_REQUESTS.inc();
+}
+pub fn inc_recovery_retry() {
+    RECOVERY_RETRIES.inc();
+}
+pub fn inc_recovery_dropped_request() {
+    RECOVERY_DROPPED_REQUESTS.inc();
+}
+pub fn inc_recovery_failure() {
+    RECOVERY_FAILURES.inc();
+}
+pub fn inc_recovery_unrecoverable_gap() {
+    RECOVERY_UNRECOVERABLE_GAPS.inc();
+}
+pub fn inc_recovery_fetched() {
+    RECOVERY_FETCHED.inc();
+}
+pub fn inc_recovery_injected_packets(n: u64) {
+    RECOVERY_INJECTED_PACKETS.inc_by(n);
+}
+pub fn inc_recovery_stale_packet() {
+    RECOVERY_STALE_PACKETS.inc();
+}
+pub fn inc_recovery_slo_violation() {
+    RECOVERY_SLO_VIOLATIONS.inc();
+}
+pub fn observe_recovery_range_ns(ns: u64) {
+    let secs = (ns as f64) / 1_000_000_000.0;
+    RECOVERY_RANGE_LATENCY.observe(secs);
+}
+
 pub fn inc_decode_pkts() {
     DECODE_PKTS.inc();
 }
@@ -283,8 +518,32 @@ pub fn inc_decode_msgs(n: u64) {
     DECODE_MSGS.inc_by(n);
 }
 
+pub fn inc_decode_event_vec_realloc() {
+    DECODE_EVENT_VEC_REALLOCS.inc();
+}
+
 pub fn set_live_orders(n: usize) {
     BOOK_LIVE_ORDERS.set(n as i64);
+}
+
+pub fn inc_orderbook_slab_grow() {
+    ORDERBOOK_SLAB_GROWS.inc();
+}
+
+pub fn inc_orderbook_depth_vec_grow() {
+    ORDERBOOK_DEPTH_VEC_GROWS.inc();
+}
+
+pub fn inc_orderbook_export_vec_grow() {
+    ORDERBOOK_EXPORT_VEC_GROWS.inc();
+}
+
+pub fn inc_snapshot_payload_vec_grow() {
+    SNAPSHOT_PAYLOAD_VEC_GROWS.inc();
+}
+
+pub fn set_snapshot_payload_bytes(n: usize) {
+    SNAPSHOT_PAYLOAD_BYTES.set(n as i64);
 }
 
 pub fn observe_latency_ns(ns: u64) {
@@ -325,7 +584,7 @@ pub fn set_queue_len(queue: &'static str, len: usize) {
     }
 }
 
-// Outbound (WS/H3) -----
+// Outbound WebSocket feed -----
 
 static WS_CLIENTS: Lazy<IntGauge> = Lazy::new(|| {
     let g =
@@ -348,8 +607,11 @@ static OUT_BYTES: Lazy<IntCounter> = Lazy::new(|| {
 });
 
 static DROPPED_CLIENTS: Lazy<IntCounter> = Lazy::new(|| {
-    let c = IntCounter::new("dropped_clients_total", "Clients dropped due to lag/gap")
-        .expect("dropped_clients_total");
+    let c = IntCounter::new(
+        "dropped_clients_total",
+        "Clients dropped due to lag, gap, or write failure",
+    )
+    .expect("dropped_clients_total");
     REGISTRY.register(Box::new(c.clone())).ok();
     c
 });

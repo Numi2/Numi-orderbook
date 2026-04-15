@@ -3,7 +3,7 @@
 // to the engine's Event model. This is not a full Eurex spec, but follows
 // SBE framing and common order-flow templates. Hot-path does zero heap allocs.
 
-//
+use crate::decoder_schema::{eobi_message, EventTemplate, EOBI_SCHEMA_ID, EOBI_SCHEMA_VERSION};
 use crate::parser::{Event, MessageDecoder, Side};
 
 #[derive(Default, Clone)]
@@ -24,9 +24,9 @@ impl MessageDecoder for EobiSbeDecoder {
             off += 2;
             let template_id = le_u16(&payload[off..off + 2]);
             off += 2;
-            let _schema_id = le_u16(&payload[off..off + 2]);
+            let schema_id = le_u16(&payload[off..off + 2]);
             off += 2;
-            let _version = le_u16(&payload[off..off + 2]);
+            let version = le_u16(&payload[off..off + 2]);
             off += 2;
 
             if off + block_len > payload.len() {
@@ -35,12 +35,21 @@ impl MessageDecoder for EobiSbeDecoder {
             let body = &payload[off..off + block_len];
             off += block_len;
 
-            match template_id {
-                1001 => decode_add(body, out),
-                1002 => decode_mod(body, out),
-                1003 => decode_del(body, out),
-                1004 => decode_trade(body, out),
-                _ => { /* skip unknown template */ }
+            if schema_id != EOBI_SCHEMA_ID || version != EOBI_SCHEMA_VERSION {
+                continue;
+            }
+
+            let Some(desc) = eobi_message(template_id) else {
+                continue;
+            };
+            if block_len < desc.min_block_len {
+                continue;
+            }
+            match desc.event_template {
+                EventTemplate::Add => decode_add(body, out),
+                EventTemplate::Mod => decode_mod(body, out),
+                EventTemplate::Del => decode_del(body, out),
+                EventTemplate::Trade => decode_trade(body, out),
             }
         }
     }
@@ -92,7 +101,7 @@ fn read_le_i64_checked(b: &[u8], off: usize) -> Option<i64> {
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_add(body: &[u8], out: &mut Vec<Event>) {
-    const LEN: usize = 8 + 4 + 1 + 8 + 8;
+    const LEN: usize = 29;
     if body.len() < LEN {
         return;
     }
@@ -131,7 +140,7 @@ fn decode_add(body: &[u8], out: &mut Vec<Event>) {
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_mod(body: &[u8], out: &mut Vec<Event>) {
-    const LEN: usize = 8 + 8;
+    const LEN: usize = 16;
     if body.len() < LEN {
         return;
     }
@@ -160,7 +169,7 @@ fn decode_del(body: &[u8], out: &mut Vec<Event>) {
 #[inline]
 #[allow(dead_code)] // Called from decode_messages
 fn decode_trade(body: &[u8], out: &mut Vec<Event>) {
-    const LEN: usize = 4 + 8 + 8 + 8 + 1;
+    const LEN: usize = 29;
     if body.len() < LEN {
         return;
     }
@@ -295,6 +304,42 @@ mod tests {
             }
             _ => panic!("expected trade event"),
         }
+    }
+
+    #[test]
+    fn rejects_wrong_schema_or_version() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&123u64.to_le_bytes());
+        body.extend_from_slice(&(42u32).to_le_bytes());
+        body.push(0u8);
+        body.extend_from_slice(&(1000i64).to_le_bytes());
+        body.extend_from_slice(&(10i64).to_le_bytes());
+
+        let dec = EobiSbeDecoder::new();
+        for (schema, version) in [(2, 1), (1, 2)] {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&hdr(body.len() as u16, 1001, schema, version));
+            buf.extend_from_slice(&body);
+            let mut out = Vec::new();
+            dec.decode_messages(&buf, &mut out);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejects_short_schema_block() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&123u64.to_le_bytes());
+        body.extend_from_slice(&(42u32).to_le_bytes());
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&hdr(body.len() as u16, 1001, 1, 1));
+        buf.extend_from_slice(&body);
+
+        let dec = EobiSbeDecoder::new();
+        let mut out = Vec::new();
+        dec.decode_messages(&buf, &mut out);
+        assert!(out.is_empty());
     }
 
     proptest! {

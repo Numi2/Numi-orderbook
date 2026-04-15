@@ -6,8 +6,8 @@ mod decode;
 mod decoder_eobi;
 mod decoder_fast;
 mod decoder_itch;
-#[cfg(feature = "h3")]
-mod h3_server;
+mod decoder_schema;
+mod journal;
 mod merge;
 mod metrics;
 mod net;
@@ -17,8 +17,9 @@ mod parser;
 mod pool;
 mod pubsub;
 mod recovery;
+mod refdata;
 mod rx;
-mod rx_afxdp;
+mod rx_packet_mmap;
 mod snapshot;
 mod spsc;
 mod util;
@@ -77,12 +78,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Lock memory (optional) before spinning up threads
-    lock_all_memory_if(cfg.general.mlock_all);
+    lock_all_memory_if(cfg.general.mlock_all)?;
 
-    // NUMA advisories for AF_XDP path: ensure threads/cores align to NIC node
-    if let Some(ax) = &cfg.afxdp {
-        if ax.enable {
-            let node = crate::util::iface_numa_node(&ax.ifname);
+    // NUMA advisories for PACKET_MMAP path: ensure threads/cores align to NIC node
+    if let Some(pm) = &cfg.packet_mmap {
+        if pm.enable {
+            let node = crate::util::iface_numa_node(&pm.ifname);
             if let Some(n) = node {
                 if let Some(list) = crate::util::node_cpulist(n) {
                     let check = |name: &str, core: Option<usize>| {
@@ -104,7 +105,7 @@ fn main() -> anyhow::Result<()> {
                     check("decode_core", cfg.cpu.decode_core);
                 }
             } else {
-                log::warn!("NUMA: could not read NUMA node for iface {}", ax.ifname);
+                log::warn!("NUMA: could not read NUMA node for iface {}", pm.ifname);
             }
         }
     }
@@ -123,7 +124,18 @@ fn main() -> anyhow::Result<()> {
     )?);
 
     // Queues
-    let a_workers = cfg.channels.a.workers.unwrap_or(1).max(1);
+    let packet_mmap_queues = cfg
+        .packet_mmap
+        .as_ref()
+        .filter(|c| c.enable)
+        .and_then(|c| c.queues)
+        .unwrap_or(1)
+        .max(1);
+    let a_workers = if cfg.packet_mmap.as_ref().map(|c| c.enable).unwrap_or(false) {
+        packet_mmap_queues
+    } else {
+        cfg.channels.a.workers.unwrap_or(1).max(1)
+    };
     let b_workers = cfg.channels.b.workers.unwrap_or(1).max(1);
     let mut q_rx_a_list: Vec<Arc<crate::spsc::SpscQueue<crate::pool::Pkt>>> =
         Vec::with_capacity(a_workers);
@@ -155,11 +167,31 @@ fn main() -> anyhow::Result<()> {
         cfg.parser.max_messages_per_packet,
     )?;
 
+    let mut instrument_ticks: Vec<(u32, i64)> =
+        if let Some(path) = cfg.book.instrument_ticks_path.as_ref() {
+            let ticks = refdata::load_instrument_ticks(PathBuf::from(path).as_path())?;
+            info!("loaded {} instrument ticks from {}", ticks.len(), path);
+            ticks
+                .into_iter()
+                .map(|tick| (tick.instr, tick.tick))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    instrument_ticks.extend(
+        cfg.book
+            .instrument_ticks
+            .iter()
+            .map(|tick| (tick.instr, tick.tick)),
+    );
+
     // Sockets (support multi-worker via SO_REUSEPORT)
     let mut socks_a = Vec::with_capacity(a_workers);
     let mut socks_b = Vec::with_capacity(b_workers);
-    for _ in 0..a_workers {
-        socks_a.push(net::build_mcast_socket(&cfg.channels.a)?);
+    if !cfg.packet_mmap.as_ref().map(|c| c.enable).unwrap_or(false) {
+        for _ in 0..a_workers {
+            socks_a.push(net::build_mcast_socket(&cfg.channels.a)?);
+        }
     }
     for _ in 0..b_workers {
         socks_b.push(net::build_mcast_socket(&cfg.channels.b)?);
@@ -212,6 +244,15 @@ fn main() -> anyhow::Result<()> {
                 q_recovery.clone(),
                 pool.clone(),
                 rcfg.backlog_path.clone(),
+                recovery::RecoveryOptions {
+                    retry_attempts: rcfg.retry_attempts.unwrap_or(3),
+                    retry_backoff_ms: rcfg.retry_backoff_ms.unwrap_or(10),
+                    min_request_interval_ms: rcfg.min_request_interval_ms.unwrap_or(0),
+                    slo_ms: rcfg.slo_ms.unwrap_or(100),
+                    unrecoverable_policy: rcfg.unrecoverable_policy.unwrap_or_default(),
+                    request_timeout_ms: rcfg.request_timeout_ms.unwrap_or(250),
+                    replay_protocol: rcfg.replay_protocol.unwrap_or_default(),
+                },
             );
             (cli, handle, Some(q_recovery))
         } else {
@@ -225,10 +266,10 @@ fn main() -> anyhow::Result<()> {
 
     // RX threads
 
-    let t_rx_a = if cfg.afxdp.as_ref().map(|c| c.enable).unwrap_or(false) {
-        // Spawn one AF_PACKET/AF_XDP-like worker per requested queue
-        let ifname = cfg.afxdp.as_ref().unwrap().ifname.clone();
-        let queues = cfg.afxdp.as_ref().unwrap().queues.unwrap_or(1).max(1);
+    let t_rx_a = if cfg.packet_mmap.as_ref().map(|c| c.enable).unwrap_or(false) {
+        // Spawn one PACKET_RX_RING worker per requested queue.
+        let ifname = cfg.packet_mmap.as_ref().unwrap().ifname.clone();
+        let queues = packet_mmap_queues;
         let mut joins = Vec::with_capacity(queues);
         for (i, q_ai) in q_rx_a_list.iter().take(queues).enumerate() {
             let rx_a_shutdown_i = shutdown.clone();
@@ -237,21 +278,27 @@ fn main() -> anyhow::Result<()> {
             let parser_ai = parser.clone();
             let cfg = cfg.clone();
             let ifn = ifname.clone();
-            let qid = i as u32; // queue id hint
-            let name = format!("afxdp-A-{i}");
+            let pm = cfg.packet_mmap.as_ref().unwrap();
+            let opts = rx_packet_mmap::PacketMmapOptions {
+                queue_id: i as u32,
+                frame_size: pm.frame_size,
+                frames_per_block: pm.frames_per_block,
+                block_count: pm.block_count,
+            };
+            let name = format!("packet-mmap-A-{i}");
             let t = thread::Builder::new().name(name).spawn(move || {
                 crate::util::pin_to_core_with_offset(cfg.cpu.a_rx_core, i);
                 set_realtime_priority_if(cfg.cpu.rt_priority);
-                if let Err(e) = rx_afxdp::afxdp_loop(
+                if let Err(e) = rx_packet_mmap::packet_mmap_loop(
                     &ifn,
-                    qid,
+                    opts,
                     parser_ai.seq_extractor(),
                     "A",
                     q_ai,
                     pool_ai,
                     rx_a_shutdown_i,
                 ) {
-                    error!("afxdp failed: {e:?}");
+                    error!("packet_mmap failed: {e:?}");
                 }
             })?;
             joins.push(t);
@@ -377,7 +424,7 @@ fn main() -> anyhow::Result<()> {
 
     // Decode thread
     let decode_shutdown = shutdown.clone();
-    // Feeds / Publishers setup (WS A/B; H3 pending)
+    // Feeds / Publishers setup (WS A/B)
     let feeds_cfg = cfg.feeds.clone();
     let obo_enabled = feeds_cfg
         .as_ref()
@@ -390,6 +437,31 @@ fn main() -> anyhow::Result<()> {
         .and_then(|o| o.buffers.as_ref())
         .map(|b| b.pub_queue)
         .unwrap_or(65536);
+    let client_write_timeout_ms = feeds_cfg
+        .as_ref()
+        .and_then(|f| f.obo.as_ref())
+        .map(|o| o.client_write_timeout_ms)
+        .unwrap_or(250);
+    let client_handshake_timeout_ms = feeds_cfg
+        .as_ref()
+        .and_then(|f| f.obo.as_ref())
+        .map(|o| o.client_handshake_timeout_ms)
+        .unwrap_or(1_000);
+    let client_heartbeat_interval_ms = feeds_cfg
+        .as_ref()
+        .and_then(|f| f.obo.as_ref())
+        .map(|o| o.client_heartbeat_interval_ms)
+        .unwrap_or(1_000);
+    let client_max_connections = feeds_cfg
+        .as_ref()
+        .and_then(|f| f.obo.as_ref())
+        .map(|o| o.client_max_connections)
+        .unwrap_or(1024);
+    let client_nodelay = feeds_cfg
+        .as_ref()
+        .and_then(|f| f.obo.as_ref())
+        .map(|o| o.client_nodelay)
+        .unwrap_or(true);
     let obo_bus = if obo_enabled {
         Some(pubsub::Bus::new(pub_queue))
     } else {
@@ -411,6 +483,11 @@ fn main() -> anyhow::Result<()> {
                                 pop.ws_endpoints[1].clone(),
                                 snap_path,
                                 feeds.auth_token.clone(),
+                                client_write_timeout_ms,
+                                client_handshake_timeout_ms,
+                                client_heartbeat_interval_ms,
+                                client_max_connections,
+                                client_nodelay,
                             );
                             hs.push(h);
                         }
@@ -423,43 +500,6 @@ fn main() -> anyhow::Result<()> {
         } else {
             Vec::new()
         };
-
-    // H3 endpoints per POP (identical payloads)
-    #[cfg(feature = "h3")]
-    let h3_handles: Vec<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)> =
-        if let Some(feeds) = &feeds_cfg {
-            if feeds.enabled {
-                let mut hs = Vec::new();
-                for pop in &feeds.pops {
-                    if pop.h3_endpoints.len() >= 2 {
-                        if let Some(bus) = &obo_bus {
-                            let (cert, key) = feeds
-                                .tls
-                                .as_ref()
-                                .map(|t| (Some(t.cert_path.clone()), Some(t.key_path.clone())))
-                                .unwrap_or((None, None));
-                            let snap_path = cfg.snapshot.as_ref().map(|s| s.path.clone());
-                            let h = h3_server::spawn_pair(
-                                bus.clone(),
-                                pop.h3_endpoints[0].clone(),
-                                pop.h3_endpoints[1].clone(),
-                                cert,
-                                key,
-                                snap_path,
-                            );
-                            hs.push(h);
-                        }
-                    }
-                }
-                hs
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-    #[cfg(not(feature = "h3"))]
-    let h3_handles: Vec<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)> = Vec::new();
 
     let obo_pub_for_decode = obo_bus.as_ref().map(|b| b.publisher());
 
@@ -477,10 +517,24 @@ fn main() -> anyhow::Result<()> {
                     max_depth: cfg.book.max_depth,
                     snapshot_interval_ms: cfg.book.snapshot_interval_ms,
                     consume_trades: cfg.book.consume_trades,
+                    default_slab_capacity: cfg.book.order_slab_capacity,
+                    default_tick: cfg.book.default_tick,
+                    grid_span: cfg.book.grid_span,
+                    instrument_ticks,
                     snapshot_tx,
                     initial_book,
                     snapshot_trigger_rx: Some(snaptr_rx),
                     obo_publisher: obo_pub_for_decode,
+                    journal_path: cfg
+                        .journal
+                        .as_ref()
+                        .filter(|j| j.enable_writer)
+                        .map(|j| j.path.clone()),
+                    journal_record_state_hash: cfg
+                        .journal
+                        .as_ref()
+                        .map(|j| j.record_state_hash)
+                        .unwrap_or(true),
                 },
             ) {
                 error!("decode failed: {e:?}");
@@ -502,10 +556,6 @@ fn main() -> anyhow::Result<()> {
     }
     // WS handles
     for (a, b) in ws_handles {
-        let _ = a.join();
-        let _ = b.join();
-    }
-    for (a, b) in h3_handles {
         let _ = a.join();
         let _ = b.join();
     }

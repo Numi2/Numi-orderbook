@@ -4,6 +4,12 @@ use std::time::Instant;
 #[path = "../orderbook.rs"]
 mod orderbook;
 
+mod metrics {
+    pub fn inc_orderbook_slab_grow() {}
+    pub fn inc_orderbook_depth_vec_grow() {}
+    pub fn inc_orderbook_export_vec_grow() {}
+}
+
 // Minimal parser types to satisfy orderbook interfaces
 mod parser {
     use serde::{Deserialize, Serialize};
@@ -32,8 +38,10 @@ mod parser {
         },
         Trade {
             instr: u32,
+            px: i64,
             qty: i64,
             maker_order_id: Option<u64>,
+            taker_side: Option<Side>,
         },
         Heartbeat,
     }
@@ -148,10 +156,12 @@ fn main() {
     // Exercise rarely-used variants once to ensure full enum coverage in this bench
     // without impacting the measured hot path.
     book.apply(&Event::Heartbeat);
-    let _ = book.apply(&Event::Trade {
+    book.apply(&Event::Trade {
         instr: 0,
+        px: 0,
         qty: 1,
         maker_order_id: None,
+        taker_side: None,
     });
 
     // Touch additional OrderBook APIs to avoid dead code in this bin

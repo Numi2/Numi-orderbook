@@ -1,6 +1,6 @@
 // src/orderbook.rs Numan Thabit: extended with export/import
 use crate::parser::{Event, Side};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use slab::Slab;
 use smallvec::SmallVec;
@@ -10,6 +10,8 @@ use std::num::NonZeroUsize;
 type Handle = usize;
 type Bbo = (Option<(i64, i64)>, Option<(i64, i64)>);
 type Depth32 = SmallVec<[(i64, i64); 32]>;
+const BOOK_HASH_OFFSET: u64 = 0xcbf29ce484222325;
+const BOOK_HASH_PRIME: u64 = 0x00000100000001b3;
 
 #[inline(always)]
 fn to_nz(h: Handle) -> NonZeroUsize {
@@ -18,6 +20,42 @@ fn to_nz(h: Handle) -> NonZeroUsize {
 #[inline(always)]
 fn from_nz(nz: NonZeroUsize) -> Handle {
     nz.get() - 1
+}
+
+#[inline]
+fn hash_u8(h: &mut u64, v: u8) {
+    *h ^= u64::from(v);
+    *h = h.wrapping_mul(BOOK_HASH_PRIME);
+}
+
+#[inline]
+fn hash_u32(h: &mut u64, v: u32) {
+    for b in v.to_le_bytes() {
+        hash_u8(h, b);
+    }
+}
+
+#[inline]
+fn hash_u64(h: &mut u64, v: u64) {
+    for b in v.to_le_bytes() {
+        hash_u8(h, b);
+    }
+}
+
+#[inline]
+fn hash_i64(h: &mut u64, v: i64) {
+    hash_u64(h, v as u64);
+}
+
+#[inline]
+fn hash_side(h: &mut u64, side: Side) {
+    hash_u8(
+        h,
+        match side {
+            Side::Bid => 1,
+            Side::Ask => 2,
+        },
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +329,12 @@ impl InstrumentBook {
             return overflow.entry(price).or_default();
         }
 
+        if overflow.contains_key(&price) {
+            return overflow
+                .get_mut(&price)
+                .expect("overflow contains price checked above");
+        }
+
         Self::recenter_grid(grid, overflow, price);
 
         if grid.price_to_idx(price).is_some() {
@@ -447,7 +491,11 @@ impl InstrumentBook {
 
     #[inline]
     fn add(&mut self, price: i64, qty: i64, side: Side) -> Handle {
+        let capacity_before = self.orders.capacity();
         let h = self.orders.insert(Node::new(price, qty, side));
+        if self.orders.capacity() > capacity_before {
+            crate::metrics::inc_orderbook_slab_grow();
+        }
         // Obtain previous tail without holding the level borrow across order mutations
         let prev_tail: Option<NonZeroUsize> = {
             let lvl = self.ensure_level_mut(side, price);
@@ -476,7 +524,11 @@ impl InstrumentBook {
         if let Some(new_total) = new_total_opt {
             match side {
                 Side::Bid => {
-                    if self.best_bid.is_none_or(|b| price > b) {
+                    let improves_best = match self.best_bid {
+                        Some(b) => price > b,
+                        None => true,
+                    };
+                    if improves_best {
                         self.best_bid = Some(price);
                         self.best_bid_qty = new_total;
                     } else if self.best_bid == Some(price) {
@@ -484,7 +536,11 @@ impl InstrumentBook {
                     }
                 }
                 Side::Ask => {
-                    if self.best_ask.is_none_or(|a| price < a) {
+                    let improves_best = match self.best_ask {
+                        Some(a) => price < a,
+                        None => true,
+                    };
+                    if improves_best {
                         self.best_ask = Some(price);
                         self.best_ask_qty = new_total;
                     } else if self.best_ask == Some(price) {
@@ -594,47 +650,265 @@ impl InstrumentBook {
     fn top_n(&self, n: usize) -> (Depth32, Depth32) {
         let mut bids = SmallVec::<[(i64, i64); 32]>::new();
         let mut asks = SmallVec::<[(i64, i64); 32]>::new();
-        // Bids: grid high->low, then overflow high->low
+
+        let mut bid_levels = Vec::with_capacity(n.min(32));
         for i in (0..self.bids_grid.slots.len()).rev() {
             if let Some(l) = &self.bids_grid.slots[i] {
                 if !l.is_empty() {
                     let p = self.bids_grid.start_price + (i as i64) * self.bids_grid.tick;
-                    bids.push((p, l.total_qty));
-                    if bids.len() >= n {
-                        break;
-                    }
+                    push_depth_level(&mut bid_levels, (p, l.total_qty));
                 }
             }
         }
-        if bids.len() < n {
-            for (p, l) in self.bids_overflow.iter().rev() {
-                bids.push((*p, l.total_qty));
-                if bids.len() >= n {
-                    break;
-                }
+        for (p, l) in self.bids_overflow.iter().rev() {
+            if !l.is_empty() {
+                push_depth_level(&mut bid_levels, (*p, l.total_qty));
             }
         }
-        // Asks: grid low->high, then overflow low->high
+        bid_levels.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        bids.extend(bid_levels.into_iter().take(n));
+
+        let mut ask_levels = Vec::with_capacity(n.min(32));
         for i in 0..self.asks_grid.slots.len() {
             if let Some(l) = &self.asks_grid.slots[i] {
                 if !l.is_empty() {
                     let p = self.asks_grid.start_price + (i as i64) * self.asks_grid.tick;
-                    asks.push((p, l.total_qty));
-                    if asks.len() >= n {
-                        break;
-                    }
+                    push_depth_level(&mut ask_levels, (p, l.total_qty));
                 }
             }
         }
-        if asks.len() < n {
-            for (p, l) in self.asks_overflow.iter() {
-                asks.push((*p, l.total_qty));
-                if asks.len() >= n {
-                    break;
-                }
+        for (p, l) in self.asks_overflow.iter() {
+            if !l.is_empty() {
+                push_depth_level(&mut ask_levels, (*p, l.total_qty));
             }
         }
+        ask_levels.sort_unstable_by_key(|(price, _)| *price);
+        asks.extend(ask_levels.into_iter().take(n));
+
         (bids, asks)
+    }
+
+    fn validate_invariants(
+        &self,
+        instr: u32,
+        reverse_index: &HashMap<(u32, Handle), u64>,
+        visited: &mut HashSet<(u32, Handle)>,
+    ) -> Result<(), String> {
+        let mut seen_levels = HashSet::new();
+        for i in 0..self.bids_grid.slots.len() {
+            if let Some(level) = &self.bids_grid.slots[i] {
+                let price = self.bids_grid.start_price + (i as i64) * self.bids_grid.tick;
+                Self::validate_unique_level(instr, Side::Bid, price, &mut seen_levels)?;
+                self.validate_level(instr, Side::Bid, price, level, reverse_index, visited)?;
+            }
+        }
+        for (price, level) in &self.bids_overflow {
+            Self::validate_unique_level(instr, Side::Bid, *price, &mut seen_levels)?;
+            self.validate_level(instr, Side::Bid, *price, level, reverse_index, visited)?;
+        }
+        for i in 0..self.asks_grid.slots.len() {
+            if let Some(level) = &self.asks_grid.slots[i] {
+                let price = self.asks_grid.start_price + (i as i64) * self.asks_grid.tick;
+                Self::validate_unique_level(instr, Side::Ask, price, &mut seen_levels)?;
+                self.validate_level(instr, Side::Ask, price, level, reverse_index, visited)?;
+            }
+        }
+        for (price, level) in &self.asks_overflow {
+            Self::validate_unique_level(instr, Side::Ask, *price, &mut seen_levels)?;
+            self.validate_level(instr, Side::Ask, *price, level, reverse_index, visited)?;
+        }
+
+        let visited_for_instr = visited
+            .iter()
+            .filter(|(seen_instr, _)| *seen_instr == instr)
+            .count();
+        if visited_for_instr != self.orders.len() {
+            return Err(format!(
+                "instr {instr}: visited order count does not match slab len: visited={} slab={}",
+                visited_for_instr,
+                self.orders.len(),
+            ));
+        }
+
+        for (handle, node) in self.orders.iter() {
+            if !visited.contains(&(instr, handle)) {
+                return Err(format!(
+                    "instr {instr}: slab handle {handle} at price {} side {:?} is not linked from any level",
+                    node.price, node.side
+                ));
+            }
+        }
+
+        let expected_bid = match (
+            self.bids_grid.best_bid_candidate(),
+            self.bids_overflow
+                .iter()
+                .next_back()
+                .map(|(price, level)| (*price, level.total_qty)),
+        ) {
+            (Some(grid), Some(overflow)) => {
+                Some(if grid.0 >= overflow.0 { grid } else { overflow })
+            }
+            (Some(grid), None) => Some(grid),
+            (None, Some(overflow)) => Some(overflow),
+            (None, None) => None,
+        };
+        let expected_ask = match (
+            self.asks_grid.best_ask_candidate(),
+            self.asks_overflow
+                .iter()
+                .next()
+                .map(|(price, level)| (*price, level.total_qty)),
+        ) {
+            (Some(grid), Some(overflow)) => {
+                Some(if grid.0 <= overflow.0 { grid } else { overflow })
+            }
+            (Some(grid), None) => Some(grid),
+            (None, Some(overflow)) => Some(overflow),
+            (None, None) => None,
+        };
+        let expected = (expected_bid, expected_ask);
+        if self.bbo() != expected {
+            return Err(format!(
+                "instr {instr}: cached bbo {:?} does not match depth {:?}",
+                self.bbo(),
+                expected
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_unique_level(
+        instr: u32,
+        side: Side,
+        price: i64,
+        seen_levels: &mut HashSet<(u8, i64)>,
+    ) -> Result<(), String> {
+        let side_key = match side {
+            Side::Bid => 0,
+            Side::Ask => 1,
+        };
+        if !seen_levels.insert((side_key, price)) {
+            return Err(format!(
+                "instr {instr}: duplicate level at price {price} side {side:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_level(
+        &self,
+        instr: u32,
+        side: Side,
+        price: i64,
+        level: &Level,
+        reverse_index: &HashMap<(u32, Handle), u64>,
+        visited: &mut HashSet<(u32, Handle)>,
+    ) -> Result<(), String> {
+        if level.is_empty() {
+            return Err(format!(
+                "instr {instr}: empty level retained at price {price} side {side:?}"
+            ));
+        }
+
+        let mut count = 0usize;
+        let mut total_qty = 0i64;
+        let mut prev = None;
+        let mut cur = level.head;
+        let mut tail = None;
+
+        while let Some(nz) = cur {
+            let handle = from_nz(nz);
+            let node = self.orders.get(handle).ok_or_else(|| {
+                format!("instr {instr}: level references missing handle {handle}")
+            })?;
+
+            if node.prev != prev {
+                return Err(format!(
+                    "instr {instr}: handle {handle} has prev {:?}, expected {:?}",
+                    node.prev, prev
+                ));
+            }
+            if node.price != price || node.side != side {
+                return Err(format!(
+                    "instr {instr}: handle {handle} is at price {} side {:?}, expected price {price} side {side:?}",
+                    node.price, node.side
+                ));
+            }
+            if node.qty <= 0 {
+                return Err(format!(
+                    "instr {instr}: handle {handle} has non-positive qty {}",
+                    node.qty
+                ));
+            }
+            if !reverse_index.contains_key(&(instr, handle)) {
+                return Err(format!(
+                    "instr {instr}: handle {handle} is linked but missing from order id index"
+                ));
+            }
+            if !visited.insert((instr, handle)) {
+                return Err(format!(
+                    "instr {instr}: handle {handle} is linked from more than one level"
+                ));
+            }
+
+            count += 1;
+            total_qty += node.qty;
+            if count > self.orders.len() {
+                return Err(format!(
+                    "instr {instr}: cycle detected at price {price} side {side:?}"
+                ));
+            }
+            prev = Some(nz);
+            tail = Some(nz);
+            cur = node.next;
+        }
+
+        if count != level.count {
+            return Err(format!(
+                "instr {instr}: level price {price} side {side:?} count {} != walked {count}",
+                level.count
+            ));
+        }
+        if total_qty != level.total_qty {
+            return Err(format!(
+                "instr {instr}: level price {price} side {side:?} qty {} != walked {total_qty}",
+                level.total_qty
+            ));
+        }
+        if level.tail != tail {
+            return Err(format!(
+                "instr {instr}: level price {price} side {side:?} tail {:?} != walked {:?}",
+                level.tail, tail
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+fn push_depth_level(levels: &mut Vec<(i64, i64)>, level: (i64, i64)) {
+    let cap_before = levels.capacity();
+    levels.push(level);
+    if levels.capacity() > cap_before {
+        crate::metrics::inc_orderbook_depth_vec_grow();
+    }
+}
+
+fn push_export_order(orders: &mut Vec<OrderExport>, order: OrderExport) {
+    let cap_before = orders.capacity();
+    orders.push(order);
+    if orders.capacity() > cap_before {
+        crate::metrics::inc_orderbook_export_vec_grow();
+    }
+}
+
+fn push_export_instrument(instruments: &mut Vec<InstrumentExport>, instrument: InstrumentExport) {
+    let cap_before = instruments.capacity();
+    instruments.push(instrument);
+    if instruments.capacity() > cap_before {
+        crate::metrics::inc_orderbook_export_vec_grow();
     }
 }
 
@@ -647,6 +921,7 @@ pub struct OrderBook {
     default_slab_capacity: usize,
     grid_tick: i64,
     grid_span: usize,
+    instrument_ticks: HashMap<u32, i64>,
 }
 
 impl OrderBook {
@@ -660,6 +935,7 @@ impl OrderBook {
             default_slab_capacity: 1 << 20,
             grid_tick: 1,
             grid_span: 16384,
+            instrument_ticks: HashMap::new(),
         }
     }
 
@@ -674,6 +950,7 @@ impl OrderBook {
             default_slab_capacity: 1 << 20,
             grid_tick: 1,
             grid_span: 16384,
+            instrument_ticks: HashMap::new(),
         }
     }
 
@@ -692,6 +969,7 @@ impl OrderBook {
             default_slab_capacity,
             grid_tick: 1,
             grid_span: 16384,
+            instrument_ticks: HashMap::new(),
         }
     }
 
@@ -712,6 +990,7 @@ impl OrderBook {
             default_slab_capacity,
             grid_tick,
             grid_span,
+            instrument_ticks: HashMap::new(),
         }
     }
 
@@ -719,14 +998,90 @@ impl OrderBook {
         self.consume_trades = v;
     }
 
+    pub fn set_instrument_tick(&mut self, instr: u32, tick: i64) -> Result<(), String> {
+        if tick <= 0 {
+            return Err(format!("instrument {instr}: tick must be > 0, got {tick}"));
+        }
+        self.instrument_ticks.insert(instr, tick);
+        Ok(())
+    }
+
+    pub fn set_instrument_ticks<I>(&mut self, ticks: I) -> Result<(), String>
+    where
+        I: IntoIterator<Item = (u32, i64)>,
+    {
+        for (instr, tick) in ticks {
+            self.set_instrument_tick(instr, tick)?;
+        }
+        Ok(())
+    }
+
+    pub fn new_with_tick_table<I>(
+        depth_for_reporting: usize,
+        consume_trades: bool,
+        default_slab_capacity: usize,
+        default_grid_tick: i64,
+        grid_span: usize,
+        ticks: I,
+    ) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = (u32, i64)>,
+    {
+        if default_grid_tick <= 0 {
+            return Err(format!(
+                "default grid tick must be > 0, got {default_grid_tick}"
+            ));
+        }
+        if grid_span == 0 {
+            return Err("grid span must be > 0".to_string());
+        }
+        let mut book = Self::new_with_grid(
+            depth_for_reporting,
+            consume_trades,
+            default_slab_capacity,
+            default_grid_tick,
+            grid_span,
+        );
+        book.set_instrument_ticks(ticks)?;
+        Ok(book)
+    }
+
     #[inline]
     fn book_mut(&mut self, instr: u32) -> &mut InstrumentBook {
-        let tick = self.grid_tick;
+        let tick = self
+            .instrument_ticks
+            .get(&instr)
+            .copied()
+            .unwrap_or(self.grid_tick);
         let span = self.grid_span;
         let cap = self.default_slab_capacity;
         self.books
             .entry(instr)
             .or_insert_with(|| InstrumentBook::with_params(cap, tick, span))
+    }
+
+    #[inline]
+    fn remove_order_by_id(&mut self, order_id: u64) -> Option<u32> {
+        if let Some((instr, h)) = self.index.remove(&order_id) {
+            let book = self.book_mut(instr);
+            book.cancel(h);
+            self.last_instr = Some(instr);
+            Some(instr)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn add_order(&mut self, order_id: u64, instr: u32, px: i64, qty: i64, side: Side) {
+        // Venue reconnects, replay, or synthetic tests can deliver a repeated
+        // order id. Replace atomically from the public book's point of view so
+        // the old node does not remain live but unreachable from `index`.
+        self.remove_order_by_id(order_id);
+        let book = self.book_mut(instr);
+        let h = book.add(px, qty, side);
+        self.index.insert(order_id, (instr, h));
+        self.last_instr = Some(instr);
     }
 
     #[inline]
@@ -739,10 +1094,7 @@ impl OrderBook {
                 qty,
                 side,
             } => {
-                let book = self.book_mut(instr);
-                let h = book.add(px, qty, side);
-                self.index.insert(order_id, (instr, h));
-                self.last_instr = Some(instr);
+                self.add_order(order_id, instr, px, qty, side);
             }
             Event::Mod { order_id, qty } => {
                 if let Some((instr, h)) = self.index.get(&order_id).copied() {
@@ -757,11 +1109,7 @@ impl OrderBook {
                 }
             }
             Event::Del { order_id } => {
-                if let Some((instr, h)) = self.index.remove(&order_id) {
-                    let book = self.book_mut(instr);
-                    book.cancel(h);
-                    self.last_instr = Some(instr);
-                }
+                self.remove_order_by_id(order_id);
             }
             Event::Trade {
                 instr,
@@ -806,12 +1154,7 @@ impl OrderBook {
                     qty,
                     side,
                 } if ev_instr == instr => {
-                    let h = {
-                        let b = self.book_mut(instr);
-                        b.add(px, qty, side)
-                    };
-                    self.index.insert(order_id, (instr, h));
-                    self.last_instr = Some(instr);
+                    self.add_order(order_id, instr, px, qty, side);
                 }
                 Event::Mod { order_id, qty } => {
                     if let Some((mi, h)) = self.index.get(&order_id).copied() {
@@ -831,15 +1174,15 @@ impl OrderBook {
                     }
                 }
                 Event::Del { order_id } => {
-                    if let Some((mi, h)) = self.index.remove(&order_id) {
-                        if mi == instr {
-                            let b = self.book_mut(instr);
-                            b.cancel(h);
-                            self.last_instr = Some(instr);
-                        } else {
-                            self.index.insert(order_id, (mi, h));
-                            self.apply(e);
-                        }
+                    if self
+                        .index
+                        .get(&order_id)
+                        .map(|(mi, _)| *mi == instr)
+                        .unwrap_or(false)
+                    {
+                        self.remove_order_by_id(order_id);
+                    } else {
+                        self.apply(e);
                     }
                 }
                 Event::Trade {
@@ -906,6 +1249,44 @@ impl OrderBook {
         self.index.get(&order_id).map(|(instr, _)| *instr)
     }
 
+    #[allow(dead_code)]
+    pub fn validate_invariants(&self) -> Result<(), String> {
+        let mut reverse_index: HashMap<(u32, Handle), u64> =
+            HashMap::with_capacity(self.index.len());
+        for (order_id, (instr, handle)) in &self.index {
+            if reverse_index.insert((*instr, *handle), *order_id).is_some() {
+                return Err(format!(
+                    "duplicate index mapping for instr {instr} handle {handle}"
+                ));
+            }
+            let book = self
+                .books
+                .get(instr)
+                .ok_or_else(|| format!("order {order_id}: missing instrument book {instr}"))?;
+            let node = book.orders.get(*handle).ok_or_else(|| {
+                format!("order {order_id}: missing slab handle {handle} for instr {instr}")
+            })?;
+            if node.qty <= 0 {
+                return Err(format!("order {order_id}: non-positive qty {}", node.qty));
+            }
+        }
+
+        let mut visited = HashSet::with_capacity(self.index.len());
+        for (instr, book) in &self.books {
+            book.validate_invariants(*instr, &reverse_index, &mut visited)?;
+        }
+
+        if visited.len() != self.index.len() {
+            return Err(format!(
+                "visited handle count {} != index count {}",
+                visited.len(),
+                self.index.len()
+            ));
+        }
+
+        Ok(())
+    }
+
     // ---------- Snapshot Export/Import ----------
 
     pub fn export(&self) -> BookExport {
@@ -917,7 +1298,12 @@ impl OrderBook {
         for (oid, (ins, h)) in self.index.iter() {
             handle_to_id.insert((*ins, *h), *oid);
         }
-        for (instr, book) in self.books.iter() {
+        let mut instrs: Vec<u32> = self.books.keys().copied().collect();
+        instrs.sort_unstable();
+        for instr in instrs {
+            let Some(book) = self.books.get(&instr) else {
+                continue;
+            };
             let mut orders = Vec::with_capacity(book.orders.len());
             // Bids: best->worst (desc), FIFO per level
             for i in (0..book.bids_grid.slots.len()).rev() {
@@ -926,13 +1312,16 @@ impl OrderBook {
                         let price = book.bids_grid.start_price + (i as i64) * book.bids_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
-                            if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                                orders.push(OrderExport {
-                                    order_id: oid,
-                                    price,
-                                    qty: n.qty,
-                                    side: Side::Bid,
-                                });
+                            if let Some(&oid) = handle_to_id.get(&(instr, h)) {
+                                push_export_order(
+                                    &mut orders,
+                                    OrderExport {
+                                        order_id: oid,
+                                        price,
+                                        qty: n.qty,
+                                        side: Side::Bid,
+                                    },
+                                );
                             }
                         }
                     }
@@ -941,13 +1330,16 @@ impl OrderBook {
             for (price, lvl) in book.bids_overflow.iter().rev() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                        orders.push(OrderExport {
-                            order_id: oid,
-                            price: *price,
-                            qty: n.qty,
-                            side: Side::Bid,
-                        });
+                    if let Some(&oid) = handle_to_id.get(&(instr, h)) {
+                        push_export_order(
+                            &mut orders,
+                            OrderExport {
+                                order_id: oid,
+                                price: *price,
+                                qty: n.qty,
+                                side: Side::Bid,
+                            },
+                        );
                     }
                 }
             }
@@ -958,13 +1350,16 @@ impl OrderBook {
                         let price = book.asks_grid.start_price + (i as i64) * book.asks_grid.tick;
                         for h in lvl.iter_fifo(&book.orders) {
                             let n = &book.orders[h];
-                            if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                                orders.push(OrderExport {
-                                    order_id: oid,
-                                    price,
-                                    qty: n.qty,
-                                    side: Side::Ask,
-                                });
+                            if let Some(&oid) = handle_to_id.get(&(instr, h)) {
+                                push_export_order(
+                                    &mut orders,
+                                    OrderExport {
+                                        order_id: oid,
+                                        price,
+                                        qty: n.qty,
+                                        side: Side::Ask,
+                                    },
+                                );
                             }
                         }
                     }
@@ -973,20 +1368,20 @@ impl OrderBook {
             for (price, lvl) in book.asks_overflow.iter() {
                 for h in lvl.iter_fifo(&book.orders) {
                     let n = &book.orders[h];
-                    if let Some(&oid) = handle_to_id.get(&(*instr, h)) {
-                        orders.push(OrderExport {
-                            order_id: oid,
-                            price: *price,
-                            qty: n.qty,
-                            side: Side::Ask,
-                        });
+                    if let Some(&oid) = handle_to_id.get(&(instr, h)) {
+                        push_export_order(
+                            &mut orders,
+                            OrderExport {
+                                order_id: oid,
+                                price: *price,
+                                qty: n.qty,
+                                side: Side::Ask,
+                            },
+                        );
                     }
                 }
             }
-            instruments.push(InstrumentExport {
-                instr: *instr,
-                orders,
-            });
+            push_export_instrument(&mut instruments, InstrumentExport { instr, orders });
         }
         BookExport {
             version: 1,
@@ -1007,14 +1402,38 @@ impl OrderBook {
         ob
     }
 
+    #[allow(dead_code)]
+    pub fn state_hash(&self) -> u64 {
+        let mut h = BOOK_HASH_OFFSET;
+        let export = self.export();
+        hash_u32(&mut h, export.version);
+        hash_u64(&mut h, export.instruments.len() as u64);
+        for instrument in export.instruments {
+            hash_u32(&mut h, instrument.instr);
+            hash_u64(&mut h, instrument.orders.len() as u64);
+            for order in instrument.orders {
+                hash_u64(&mut h, order.order_id);
+                hash_i64(&mut h, order.price);
+                hash_i64(&mut h, order.qty);
+                hash_side(&mut h, order.side);
+            }
+        }
+        h
+    }
+
     /// Export aggregated depth snapshots (top N) per instrument (not per-order).
     #[allow(dead_code)]
     pub fn export_depth(&self, depth: usize) -> DepthSnapshotExport {
         let mut instruments = Vec::with_capacity(self.books.len());
-        for (instr, book) in self.books.iter() {
+        let mut instrs: Vec<u32> = self.books.keys().copied().collect();
+        instrs.sort_unstable();
+        for instr in instrs {
+            let Some(book) = self.books.get(&instr) else {
+                continue;
+            };
             let (bids, asks) = book.top_n(depth);
             instruments.push(InstrumentDepthExport {
-                instr: *instr,
+                instr,
                 bids: bids.into_iter().collect(),
                 asks: asks.into_iter().collect(),
             });
@@ -1057,6 +1476,277 @@ mod tests {
         let h1 = b.add(101, 10, Side::Ask);
         b.cancel(h1);
         assert!(b.get_level(Side::Ask, 101).is_none());
+    }
+
+    #[test]
+    fn duplicate_add_replaces_existing_order() {
+        let mut ob = OrderBook::new(10);
+        ob.apply(&Event::Add {
+            order_id: 10,
+            instr: 7,
+            px: 100,
+            qty: 11,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Add {
+            order_id: 10,
+            instr: 7,
+            px: 101,
+            qty: 22,
+            side: Side::Bid,
+        });
+
+        assert_eq!(ob.order_count(), 1);
+        let (bids, asks) = ob.top_n_of(7, 10).unwrap();
+        assert_eq!(bids.as_slice(), &[(101, 22)]);
+        assert!(asks.is_empty());
+        assert_eq!(ob.bbo(), (Some((101, 22)), None));
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn duplicate_add_can_move_between_instruments() {
+        let mut ob = OrderBook::new(10);
+        ob.apply(&Event::Add {
+            order_id: 10,
+            instr: 1,
+            px: 100,
+            qty: 11,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Add {
+            order_id: 10,
+            instr: 2,
+            px: 200,
+            qty: 33,
+            side: Side::Ask,
+        });
+
+        assert_eq!(ob.order_count(), 1);
+        let (old_bids, old_asks) = ob.top_n_of(1, 10).unwrap();
+        assert!(old_bids.is_empty());
+        assert!(old_asks.is_empty());
+
+        let (new_bids, new_asks) = ob.top_n_of(2, 10).unwrap();
+        assert!(new_bids.is_empty());
+        assert_eq!(new_asks.as_slice(), &[(200, 33)]);
+        assert_eq!(ob.instrument_for_order(10), Some(2));
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn batched_duplicate_add_replaces_existing_order() {
+        let mut ob = OrderBook::new(10);
+        let events = [
+            Event::Add {
+                order_id: 10,
+                instr: 7,
+                px: 100,
+                qty: 11,
+                side: Side::Bid,
+            },
+            Event::Add {
+                order_id: 10,
+                instr: 7,
+                px: 101,
+                qty: 22,
+                side: Side::Bid,
+            },
+        ];
+        ob.apply_many_for_instr(7, &events);
+
+        assert_eq!(ob.order_count(), 1);
+        let (bids, asks) = ob.top_n_of(7, 10).unwrap();
+        assert_eq!(bids.as_slice(), &[(101, 22)]);
+        assert!(asks.is_empty());
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn top_n_sorts_grid_and_overflow_together() {
+        let mut ob = OrderBook::new_with_grid(10, false, 64, 1, 4);
+        ob.apply(&Event::Add {
+            order_id: 1,
+            instr: 9,
+            px: 1000,
+            qty: 10,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Add {
+            order_id: 2,
+            instr: 9,
+            px: 0,
+            qty: 20,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Add {
+            order_id: 3,
+            instr: 9,
+            px: 1000,
+            qty: 5,
+            side: Side::Bid,
+        });
+
+        let (bids, asks) = ob.top_n_of(9, 10).unwrap();
+        assert_eq!(bids.as_slice(), &[(1000, 15), (0, 20)]);
+        assert!(asks.is_empty());
+        assert_eq!(ob.bbo(), (Some((1000, 15)), None));
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn deterministic_event_sequence_preserves_invariants_and_snapshot() {
+        let mut ob = OrderBook::new_with_options(10, true);
+        let events = [
+            Event::Add {
+                order_id: 1,
+                instr: 42,
+                px: 100,
+                qty: 10,
+                side: Side::Bid,
+            },
+            Event::Add {
+                order_id: 2,
+                instr: 42,
+                px: 100,
+                qty: 20,
+                side: Side::Bid,
+            },
+            Event::Add {
+                order_id: 3,
+                instr: 42,
+                px: 101,
+                qty: 30,
+                side: Side::Ask,
+            },
+            Event::Mod {
+                order_id: 2,
+                qty: 15,
+            },
+            Event::Trade {
+                instr: 42,
+                px: 100,
+                qty: 4,
+                maker_order_id: Some(1),
+                taker_side: Some(Side::Ask),
+            },
+            Event::Del { order_id: 3 },
+            Event::Add {
+                order_id: 2,
+                instr: 42,
+                px: 99,
+                qty: 12,
+                side: Side::Bid,
+            },
+        ];
+
+        for event in &events {
+            ob.apply(event);
+            ob.validate_invariants().unwrap();
+        }
+
+        assert_eq!(ob.order_count(), 2);
+        let (bids, asks) = ob.top_n_of(42, 10).unwrap();
+        assert_eq!(bids.as_slice(), &[(100, 6), (99, 12)]);
+        assert!(asks.is_empty());
+        assert_eq!(ob.bbo(), (Some((100, 6)), None));
+
+        let restored = OrderBook::from_export(ob.export());
+        restored.validate_invariants().unwrap();
+        assert_eq!(restored.order_count(), ob.order_count());
+        assert_eq!(restored.top_n_of(42, 10), ob.top_n_of(42, 10));
+        assert_eq!(restored.state_hash(), ob.state_hash());
+    }
+
+    #[test]
+    fn export_and_hash_are_stable_across_instrument_insertion_order() {
+        let mut a = OrderBook::new(10);
+        let mut b = OrderBook::new(10);
+
+        let events_a = [
+            Event::Add {
+                order_id: 1,
+                instr: 2,
+                px: 200,
+                qty: 20,
+                side: Side::Ask,
+            },
+            Event::Add {
+                order_id: 2,
+                instr: 1,
+                px: 100,
+                qty: 10,
+                side: Side::Bid,
+            },
+        ];
+        let events_b = [events_a[1].clone(), events_a[0].clone()];
+
+        for event in &events_a {
+            a.apply(event);
+        }
+        for event in &events_b {
+            b.apply(event);
+        }
+
+        let export_a = a.export();
+        let export_b = b.export();
+        assert_eq!(
+            export_a
+                .instruments
+                .iter()
+                .map(|instrument| instrument.instr)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            export_b
+                .instruments
+                .iter()
+                .map(|instrument| instrument.instr)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(a.state_hash(), b.state_hash());
+        assert_eq!(
+            OrderBook::from_export(export_a).state_hash(),
+            a.state_hash()
+        );
+        assert_eq!(
+            OrderBook::from_export(export_b).state_hash(),
+            b.state_hash()
+        );
+    }
+
+    #[test]
+    fn instrument_tick_table_configures_new_books() {
+        let mut ob = OrderBook::new_with_tick_table(10, false, 64, 1, 8, [(9, 5)])
+            .expect("valid tick table");
+        ob.apply(&Event::Add {
+            order_id: 1,
+            instr: 9,
+            px: 1000,
+            qty: 10,
+            side: Side::Bid,
+        });
+        ob.apply(&Event::Add {
+            order_id: 2,
+            instr: 10,
+            px: 1000,
+            qty: 10,
+            side: Side::Bid,
+        });
+
+        assert_eq!(ob.books.get(&9).unwrap().bids_grid.tick, 5);
+        assert_eq!(ob.books.get(&10).unwrap().bids_grid.tick, 1);
+        ob.validate_invariants().unwrap();
+    }
+
+    #[test]
+    fn instrument_tick_table_rejects_non_positive_ticks() {
+        assert!(OrderBook::new_with_tick_table(10, false, 64, 1, 8, [(9, 0)]).is_err());
+        assert!(OrderBook::new_with_tick_table(10, false, 64, 1, 0, [(9, 1)]).is_err());
+        let mut ob = OrderBook::new(10);
+        assert!(ob.set_instrument_tick(9, -1).is_err());
     }
 }
 

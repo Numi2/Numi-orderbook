@@ -21,6 +21,7 @@ pub mod channel_id {
 // Message type identifiers (u16)
 pub mod msg_type {
     // Control
+    pub const HEARTBEAT: u16 = 1;
     pub const GAP: u16 = 2;
     pub const SNAPSHOT_START: u16 = 3;
     pub const SNAPSHOT_END: u16 = 4;
@@ -43,6 +44,7 @@ pub struct FrameHeaderV1 {
     pub channel_id: u32,
     pub instrument_id: u64,
     pub sequence: u64,
+    pub global_sequence: u64,
     pub send_time_ns: u64,
     pub payload_len: u32,
 }
@@ -100,4 +102,33 @@ pub struct OboExecuteV1 {
 pub struct FullBookSnapshotHdrV1 {
     pub level_count: u32,
     pub total_orders: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zerocopy::AsBytes;
+
+    #[test]
+    fn frame_header_v1_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<FrameHeaderV1>(), 48);
+        let hdr = FrameHeaderV1 {
+            magic: MAGIC,
+            version: VERSION_V1,
+            codec: codec::RAW_V1,
+            message_type: msg_type::OBO_ADD,
+            channel_id: channel_id::OBO_L3,
+            instrument_id: 0x0102_0304_0506_0708,
+            sequence: 0x1112_1314_1516_1718,
+            global_sequence: 0x2122_2324_2526_2728,
+            send_time_ns: 0x3132_3334_3536_3738,
+            payload_len: 0x4142_4344,
+        };
+        let bytes = hdr.as_bytes();
+        assert_eq!(&bytes[0..4], b"OBv1");
+        assert_eq!(&bytes[12..20], &0x0102_0304_0506_0708_u64.to_le_bytes());
+        assert_eq!(&bytes[20..28], &0x1112_1314_1516_1718_u64.to_le_bytes());
+        assert_eq!(&bytes[28..36], &0x2122_2324_2526_2728_u64.to_le_bytes());
+        assert_eq!(&bytes[44..48], &0x4142_4344_u32.to_le_bytes());
+    }
 }

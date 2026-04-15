@@ -8,11 +8,11 @@ my experimeent in building an exchange‑style market‑data stack. inspired hea
 - **In‑memory full‑depth order book** with price–time semantics
 - **Snapshots** (export/import) and **Prometheus metrics**
 - **Recovery injector** (TCP) that feeds recovered sequences into the same pipeline
-- **Kernel-bypass style RX**: optional AF_XDP path with high-performance PACKET_MMAP ring fallback
+- **PACKET_MMAP RX fallback**: optional AF_PACKET/TPACKET_V2 receive path for high-throughput Linux ingest
 
 ### Architecture
 
-1. RX A / RX B (UDP or AF_XDP)
+1. RX A / RX B (UDP or PACKET_MMAP fallback)
 2. Merge (sequence order, windowed buffering, gap notification)
 3. Decode (payload → `Event` vector; zero‑copy slices; pre‑sized buffers)
 4. Order book apply (price–time, per‑instrument)
@@ -47,7 +47,7 @@ rx_queue_capacity = 65536
 merge_queue_capacity = 65536
 spin_loops_per_yield = 64
 rx_recvmmsg_batch = 32        # repeated recv/recvmsg per loop (>=1)
-mlock_all = true              # mlockall current+future pages (Linux)
+mlock_all = true              # fail fast unless current+future pages are locked (Linux)
 json_logs = false             # structured JSON logs to stdout
 
 [sequence]
@@ -90,6 +90,11 @@ max_pending_packets = 131072
 max_depth = 50
 snapshot_interval_ms = 1000
 consume_trades = false        # set true if your feed omits Mod/Del after trades
+default_tick = 1
+grid_span = 16384
+order_slab_capacity = 1048576
+instrument_ticks = []         # e.g. [{ instr = 1001, tick = 5 }]
+# instrument_ticks_path = "/var/lib/t7_like/instrument_ticks.csv"
 
 [cpu]
 a_rx_core = 2
@@ -106,20 +111,63 @@ path = "/var/lib/t7_like/book.snap"
 load_on_start = true
 enable_writer = true
 
+[journal]
+path = "/var/lib/t7_like/book.journal"
+enable_writer = false
+record_state_hash = true
+
 [recovery]
 enable_injector = false
 endpoint = "127.0.0.1:9000"  # venue‑specific replay endpoint (if enabled)
 backlog_path = "/var/lib/t7_like/recovery.log"  # optional append-only gap log
+retry_attempts = 3
+retry_backoff_ms = 10
+min_request_interval_ms = 0
+slo_ms = 100
+unrecoverable_policy = "log" # log, panic, or exit
+request_timeout_ms = 250
+replay_protocol = "len_seq_payload" # REPLAY request + [len, seq, payload] response frames
 
 [afxdp]
-enable = false                # if true, replaces channel A socket RX with AF_XDP
+enable = false                # disabled until a real AF_XDP/XSK backend is integrated
 ifname = "eth0"
-queue_id = 0
+queues = 1
+
+[packet_mmap]
+enable = false                # if true, replaces channel A socket RX with PACKET_RX_RING
+ifname = "eth0"
+queues = 1
+frame_size = 2048
+frames_per_block = 1024
+block_count = 4
+
+[feeds]
+enabled = false
+pops = []
+
+[feeds.obo]
+enabled = false
+client_write_timeout_ms = 250 # slow WS clients are evicted instead of blocking publisher threads
+client_handshake_timeout_ms = 1000
+client_heartbeat_interval_ms = 1000
+client_max_connections = 1024
+client_nodelay = true
+
+[feeds.obo.buffers]
+pub_queue = 65536
 ```
 
 ### Feed semantics: `consume_trades`
 
 Some venues do not send explicit Mod/Del updates after a trade. If your feed has that behavior, set `book.consume_trades = true` to reduce maker orders directly on `Trade` events. Leave it `false` when your feed sends the normal Mod/Del updates.
+
+### Snapshot feed semantics
+
+Snapshots written by this process include the global live-feed replay cursor that
+immediately follows the image. A WebSocket client using `snapshot=1` receives the
+image first and then live frames from that cursor. Legacy snapshots without this
+cursor, and snapshots whose cursor is older than retained live replay, are
+rejected for client snapshot-on-connect.
 
 ### Performance tuning checklist (Linux)
 
@@ -133,7 +181,7 @@ Some venues do not send explicit Mod/Del updates after a trade. If your feed has
 
 
 - `src/rx.rs` — UDP receive (timestamping, batching)
-- `src/rx_afxdp.rs` — AF_XDP receive loop
+- `src/rx_packet_mmap.rs` — PACKET_MMAP receive loop; real AF_XDP/XSK is intentionally unavailable until a real backend is integrated
 - `src/merge.rs` — sequence merge, gap detection, recovery signaling
 - `src/decode.rs` — decode thread and event dispatch to the book
 - `src/parser.rs` — `Event` model, sequence extractor, parser builder
@@ -143,8 +191,11 @@ Some venues do not send explicit Mod/Del updates after a trade. If your feed has
 - `src/recovery.rs` — logger and TCP replay injector
 - `src/snapshot.rs` — snapshot load/save
 - `src/metrics.rs` — Prometheus exporter
+- `src/bin/pool_soak.rs` — packet-pool allocation soak harness
 - `src/net.rs` — socket setup and Linux socket tuning
 
 ### Notes
 
 This code favors clarity on the cold path and extreme efficiency on the hot path. The hot loops avoid heap allocations, hold no locks beyond single‑writer state, and reuse pre‑sized buffers. Configure `max_messages_per_packet` to right‑size per‑packet event vectors.
+
+See `docs/ROADMAP.md` for the staged path from the current implementation to a production-grade A/B multicast receiver and price-time order book.

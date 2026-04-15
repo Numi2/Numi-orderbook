@@ -35,10 +35,48 @@ sudo IFACE=eth0 ./ops/steering.sh add 239.10.10.1 5001 0  # A -> RXQ0
 sudo IFACE=eth0 ./ops/steering.sh add 239.10.10.2 5002 1  # B -> RXQ1
 ```
 
+PACKET_MMAP queue plan
+----------------------
+
+`[packet_mmap] enable = true` replaces channel A socket receive with
+PACKET_RX_RING workers. Channel A spawns one worker per `packet_mmap.queues`.
+Each worker joins the same PACKET_FANOUT group for the configured interface and
+channel, so NIC steering should send feed A traffic only to the queues intended
+for those workers.
+
+Before enabling PACKET_MMAP:
+
+- Program NIC steering so feed A multicast packets land only on the queues used
+  by the PACKET_MMAP workers.
+- Pin `cpu.a_rx_core + N` to the same NUMA node as queue `N`.
+- Size `packet_mmap.frame_size`, `packet_mmap.frames_per_block`, and
+  `packet_mmap.block_count` so the ring can absorb scheduler jitter without
+  adding unnecessary cache and TLB pressure.
+- Do not share an RX queue between UDP socket receive and PACKET_MMAP consumers.
+- Keep `afxdp.enable = false`; config validation rejects AF_XDP until a real
+  XSK/UMEM backend is integrated.
+
+Example queue split:
+
+```bash
+sudo IFACE=eth0 ./ops/steering.sh add 239.10.10.1 5001 0
+sudo IFACE=eth0 ./ops/steering.sh add 239.10.10.1 5001 1
+```
+
+AF_XDP/XSK readiness
+--------------------
+
+AF_XDP is intentionally unavailable in the current binary. Do not enable
+`afxdp.enable` in production configs; validation fails by design. A real backend
+must add XSK socket binding, UMEM fill/completion ownership, zero-copy packet
+handoff, queue-local memory, and timestamp calibration before it can replace the
+canonical UDP timestamped path.
+
 NUMA
 ----
 
-Ensure NIC, UMEM, and threads are on the same NUMA node. Check NIC node:
+Ensure NIC queues, packet rings, and hot threads are on the same NUMA node. Check
+NIC node:
 
 ```bash
 cat /sys/class/net/eth0/device/numa_node
@@ -53,10 +91,11 @@ Set `performance` governor; limit C-states to C1 for hot cores. Disable turbo fl
 Ring sizing cheatsheet
 ----------------------
 
-- AF_XDP per RXQ UMEM: 256 MB with 2 KB frames (~128K frames)
-- Rings per queue: RX 2048, FILL 8192, CQ 4096, TX 512
-- Target batch: 32–64 frames/poll cycle
-
-
-
+- PACKET_MMAP default per worker: 4 blocks * 1024 frames/block * 2048 bytes =
+  8 MiB mapped ring.
+- Increase `packet_mmap.block_count` before increasing frame size when handling
+  burst absorption for normal Ethernet MTU traffic.
+- Future AF_XDP/XSK target: per-RXQ UMEM around 256 MiB with 2 KiB frames
+  (~128K frames), RX ring 2048, fill ring 8192, completion ring 4096.
+- Target receive batch: 32-64 frames/poll cycle.
 

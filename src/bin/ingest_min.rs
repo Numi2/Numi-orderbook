@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::from_file(&cfg_path)?;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    lock_all_memory_if(cfg.general.mlock_all);
+    lock_all_memory_if(cfg.general.mlock_all)?;
     // Touch NUMA helpers to avoid dead code warnings in this bin
     let _ = util::iface_numa_node("lo");
     let _ = util::node_cpulist(0);
@@ -84,8 +84,13 @@ fn main() -> anyhow::Result<()> {
     // Touch recovery paths to avoid dead code in that module
     let (_rc_cli, _rc_handle) = recovery::spawn_logger();
     let q_recovery_touch = Arc::new(SpscQueue::new(64));
-    let (rc2_cli, _rc2_handle) =
-        recovery::spawn_tcp_injector("127.0.0.1:9", q_recovery_touch.clone(), pool.clone(), None);
+    let (rc2_cli, _rc2_handle) = recovery::spawn_tcp_injector(
+        "127.0.0.1:9",
+        q_recovery_touch.clone(),
+        pool.clone(),
+        None,
+        recovery::RecoveryOptions::default(),
+    );
     rc2_cli.notify_gap(1, 1);
 
     // Queues

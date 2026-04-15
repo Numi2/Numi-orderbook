@@ -67,18 +67,36 @@ pub fn now_nanos() -> u64 {
 }
 
 #[inline]
-pub fn lock_all_memory_if(cfg: bool) {
-    if !cfg {}
+pub fn lock_all_memory_if(cfg: bool) -> anyhow::Result<()> {
+    if !cfg {
+        return Ok(());
+    }
+
     #[cfg(target_os = "linux")]
     unsafe {
-        // Best-effort raise RLIMIT_MEMLOCK
-        let mut lim = libc::rlimit {
+        let lim = libc::rlimit {
             rlim_cur: libc::RLIM_INFINITY,
             rlim_max: libc::RLIM_INFINITY,
         };
-        let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim);
+        if libc::setrlimit(libc::RLIMIT_MEMLOCK, &lim) != 0 {
+            anyhow::bail!(
+                "setrlimit(RLIMIT_MEMLOCK) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
         let flags = libc::MCL_CURRENT | libc::MCL_FUTURE;
-        let _ = libc::mlockall(flags);
+        if libc::mlockall(flags) != 0 {
+            anyhow::bail!(
+                "mlockall(MCL_CURRENT|MCL_FUTURE) failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        anyhow::bail!("general.mlock_all is only supported on Linux");
     }
 }
 
