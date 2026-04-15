@@ -134,24 +134,34 @@ NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet
 cargo run --release --bin pool_soak -- 65536 2048 10000 64
 cargo run --release --bin rx_probe -- 100000 64 32 software 0
 cargo run --release --bin bench_pipeline -- local-core
+cargo run --release --bin bench_pipeline -- rx-proof --packets 512 --artifact-dir target/bench-artifacts
 ```
 
 `pool_soak` must report `misses=0` and `return_drops=0` for production pool
 sizing. `bench_pipeline -- local-core` reports a single machine-readable
 `key=value` line and must show `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`,
-`event_vec_reallocs=0`, and `pool_available=pool_size`. Local throughput and
-latency samples are smoke signals only; production latency claims must come
-from pinned target hardware with the target NIC, kernel, timestamp source, and
-clock sync.
+`event_vec_reallocs=0`, and `pool_available=pool_size`. `rx-proof` extends the
+same path through deterministic EOBI wire replay, OBO raw-v1 publication, and
+journal replay; it must also report `expected_hash_match=true`,
+`journal_hash_match=true`, `decoder_sequence_gap_events=0`, and non-zero
+`obo_frames`. Local throughput and latency samples are smoke signals only;
+production latency claims must come from pinned target hardware with the target
+NIC, kernel, timestamp source, and clock sync.
 
 Additional benchmark profiles:
 
 ```bash
 cargo run --release --bin bench_pipeline -- local-distribution
+cargo run --release --bin bench_pipeline -- rx-proof --capture licensed-or-sim.pcap --artifact-dir target/bench-artifacts
 cargo run --release --bin bench_pipeline -- target-rx --config config.toml --duration-sec 60 --packets 892800000
 cargo run --release --bin bench_pipeline -- target-failover-recovery
 cargo run --release --bin bench_pipeline -- target-persistence --packets 1024
 ```
+
+When `--artifact-dir` is set, each benchmark run creates
+`<profile>-<timestamp>-<git_sha>/summary.kv`, `manifest.kv`, and `proof.txt`.
+`summary.kv` is the exact machine-readable result line printed to stdout;
+`proof.txt` records the assertions made by the profile.
 
 `target-rx` binds the configured multicast sockets and expects production-like
 traffic to already be present; use `mcast_burst` or `pcap_replay` from another

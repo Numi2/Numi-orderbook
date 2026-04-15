@@ -37,6 +37,11 @@ This project loosely follows the Keep a Changelog format.
 - Added a shared UDP receive dispatcher and `rx_probe` loopback integrity probe
   so the main binary, `ingest_min`, and local smoke tests exercise the correct
   platform receive path.
+- Added `bench_pipeline -- rx-proof` for deterministic EOBI replay through the
+  packet pool, merge, decoder, order book, raw-v1 OBO publication, and journal
+  replay, with durable `summary.kv`, `manifest.kv`, and `proof.txt` artifacts.
+- Benchmark reports now carry a `report_schema` field and can write
+  machine-readable artifacts with `--artifact-dir`.
 
 ### Fixed
 - RX queue-full drops recycle rejected packet buffers instead of leaking pooled
@@ -59,6 +64,7 @@ This project loosely follows the Keep a Changelog format.
 - `cargo run --release --bin pool_soak -- 65536 2048 10000 64`
 - `NUMI_BENCH_SMOKE=1 cargo bench --bench hot_paths -- --quiet`
 - `cargo run --release --bin bench_pipeline -- local-core`
+- `cargo run --release --bin bench_pipeline -- rx-proof --packets 512 --artifact-dir target/bench-artifacts`
 - `docker build -t numi-orderbook:local .`
 
 - 2025-11-01

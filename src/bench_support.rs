@@ -1,10 +1,11 @@
 use crate::codec_raw::{OboAddV1, OboCancelV1, OboExecuteV1, OboModifyV1};
+use crate::decoder_eobi::EobiSbeDecoder;
 use crate::decoder_schema::{
     full_order_execution, order_add, order_delete, order_modify_same_prio, packet_header,
     partial_order_execution,
 };
 use crate::orderbook::{OrderBook, OrderBookCapacity};
-use crate::parser::{Event, Side};
+use crate::parser::{Event, MessageDecoder, Side};
 use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -45,10 +46,11 @@ pub struct BenchmarkFixtures {
 impl BenchmarkFixtures {
     pub fn new(cfg: FixtureConfig) -> Self {
         let events = mixed_l3_events(cfg);
-        let expected_state_hash = state_hash_after_events(cfg, &events);
+        let eobi_packets = eobi_packets(cfg);
+        let expected_state_hash = expected_eobi_replay(cfg, &eobi_packets).state_hash;
         Self {
             events,
-            eobi_packets: eobi_packets(cfg),
+            eobi_packets,
             itch_payload: itch_payload(cfg),
             fast_payload: fast_payload(cfg),
             raw_obo_payloads: raw_obo_payloads(),
@@ -129,6 +131,43 @@ pub fn state_hash_after_events(cfg: FixtureConfig, events: &[Event]) -> u64 {
         book.apply(event);
     }
     book.state_hash()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EobiReplayExpected {
+    pub packets: usize,
+    pub events: usize,
+    pub sequence_gap_events: usize,
+    pub state_hash: u64,
+    pub live_orders: usize,
+}
+
+pub fn expected_eobi_replay(cfg: FixtureConfig, payloads: &[Vec<u8>]) -> EobiReplayExpected {
+    let decoder = EobiSbeDecoder::new();
+    let mut book = benchmark_order_book(cfg);
+    let mut events = Vec::with_capacity(cfg.messages_per_packet.max(1) + 1);
+    let mut decoded_events = 0usize;
+    let mut sequence_gap_events = 0usize;
+
+    for payload in payloads {
+        events.clear();
+        decoder.decode_messages(payload, &mut events);
+        decoded_events += events.len();
+        for event in &events {
+            if matches!(event, Event::SequenceGap { .. }) {
+                sequence_gap_events += 1;
+            }
+            book.apply(event);
+        }
+    }
+
+    EobiReplayExpected {
+        packets: payloads.len(),
+        events: decoded_events,
+        sequence_gap_events,
+        state_hash: book.state_hash(),
+        live_orders: book.order_count(),
+    }
 }
 
 pub fn read_capture_payloads(path: &Path, limit: usize) -> std::io::Result<Vec<Vec<u8>>> {
@@ -682,8 +721,12 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, Event::Add { .. })));
-        let hash = state_hash_after_events(cfg, &fixtures.events);
-        assert_eq!(hash, fixtures.expected_state_hash);
+        let expected = expected_eobi_replay(cfg, &fixtures.eobi_packets);
+        assert_eq!(expected.packets, fixtures.eobi_packets.len());
+        assert!(expected.events > 0);
+        assert_eq!(expected.sequence_gap_events, 0);
+        assert_eq!(expected.state_hash, fixtures.expected_state_hash);
+        assert_ne!(state_hash_after_events(cfg, &fixtures.events), 0);
     }
 
     #[test]

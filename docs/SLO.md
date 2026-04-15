@@ -45,6 +45,11 @@ Local development gates
 - `cargo run --release --bin bench_pipeline -- local-core` must report
   `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`, `event_vec_reallocs=0`, and
   `pool_available=pool_size`.
+- `cargo run --release --bin bench_pipeline -- rx-proof --packets 512
+  --artifact-dir target/bench-artifacts` must report `status=ok`,
+  `expected_hash_match=true`, `journal_hash_match=true`,
+  `decoder_sequence_gap_events=0`, and non-zero `obo_frames`. The artifact
+  directory must contain `summary.kv`, `manifest.kv`, and `proof.txt`.
 - `cargo run --release --bin pool_soak -- 65536 2048 10000 64` must report
   `misses=0` and `return_drops=0`.
 - `cargo run --release --bin rx_probe -- 100000 64 32 software 0` must report
@@ -67,8 +72,9 @@ Target-hardware benchmark gates
 - `cargo run --release --bin bench_pipeline -- target-persistence --packets
   1024` must report `status=ok`, `anchored=true`, no non-monotonic journal
   records, and matching final/restored state hashes.
-- Target results must record git SHA, rustc, allocator, OS/kernel, CPU, NIC,
-  timestamp source, config path, and config hash from the benchmark output.
+- Target results must record git SHA, git dirty state, rustc, allocator,
+  OS/kernel, CPU, NIC, timestamp source, config path, config hash, and artifact
+  path when `--artifact-dir` is used.
 
 Verification record
 -------------------
@@ -88,6 +94,11 @@ Verification record
 - 2026-04-15: `cargo run --release --bin bench_pipeline -- local-core --packets
   512` reported `status=ok`, `sequence_gaps=0`, `dup_or_ooo=0`,
   `event_vec_reallocs=0`, and `pool_available=pool_size`.
+- 2026-04-15: `cargo run --release --bin bench_pipeline -- rx-proof --packets
+  512 --artifact-dir target/bench-artifacts` reported `status=ok`,
+  `expected_hash_match=true`, `journal_hash_match=true`,
+  `decoder_sequence_gap_events=0`, and created `summary.kv`, `manifest.kv`, and
+  `proof.txt`.
 - 2026-04-15: `cargo run --release --bin bench_pipeline --
   target-failover-recovery` reported `status=ok` for a 1,000-message gap with
   `pool_available=pool_size`.

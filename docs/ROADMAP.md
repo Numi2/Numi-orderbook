@@ -123,6 +123,9 @@ Completed in current working tree:
 - `bench_pipeline` now provides local core/distribution smoke profiles plus
   target RX, failover/recovery, and persistence benchmark profiles with
   machine-readable metadata output.
+- `bench_pipeline -- rx-proof` now proves deterministic EOBI wire replay through
+  pool, merge, decode, book apply, OBO raw-v1 publication, and journal replay,
+  and can emit durable benchmark artifacts with `--artifact-dir`.
 - Cold-path depth assembly vector growth is counted with
   `orderbook_depth_vec_grows_total`.
 - Snapshot export vector growth is counted with `orderbook_export_vec_grows_total`.
@@ -222,7 +225,7 @@ Completed in current working tree:
   message-sequence gap detection.
 
 Remaining:
-- Add certification artifacts from exchange conformance captures when licensed
+- Run `rx-proof --capture` against licensed exchange conformance captures when
   production/simulation feed samples are available.
 
 M5: Kernel-Bypass Receive Path

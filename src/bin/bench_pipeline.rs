@@ -1,13 +1,13 @@
 use orderbook::bench_support::{
-    benchmark_order_book, format_kv_line, read_capture_payloads, stable_config_hash,
-    BenchmarkFixtures, FixtureConfig,
+    benchmark_order_book, expected_eobi_replay, format_kv_line, read_capture_payloads,
+    stable_config_hash, BenchmarkFixtures, FixtureConfig,
 };
 use orderbook::codec_raw::{channel_id, msg_type};
 use orderbook::config::{AppConfig, Endian, ParserKind, TimestampingMode};
-use orderbook::journal::{append_record, replay_after_snapshot, JournalRecord};
+use orderbook::journal::{append_record, replay_after_snapshot, replay_reader, JournalRecord};
 use orderbook::obo::{map_event_to_obo_parts, OboEventV1};
 use orderbook::orderbook::OrderBook;
-use orderbook::parser::{build_parser, Event, Parser, SeqCfg};
+use orderbook::parser::{build_parser, Event, Parser, SeqCfg, SeqExtractor};
 use orderbook::pool::{PacketPool, Pkt, PktBuf, TsKind};
 use orderbook::pubsub::{Bus, Publisher};
 use orderbook::recovery::Replayer;
@@ -31,13 +31,17 @@ struct Args {
     packets: usize,
     duration: Duration,
     capture_path: Option<PathBuf>,
+    artifact_dir: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     match args.profile.as_str() {
-        "local-core" => run_local_pipeline(&args, false),
-        "local-distribution" => run_local_pipeline(&args, true),
+        "local-core" => run_local_pipeline(&args, "local-core", false, false),
+        "local-distribution" => run_local_pipeline(&args, "local-distribution", true, false),
+        "rx-proof" | "rx_proof" | "eobi-replay" | "eobi_replay" => {
+            run_local_pipeline(&args, "rx-proof", true, true)
+        }
         "target-rx" => run_target_rx(&args),
         "target-failover-recovery" => run_target_failover_recovery(&args),
         "target-persistence" => run_target_persistence(&args),
@@ -66,6 +70,7 @@ impl Args {
             packets: 4096,
             duration: Duration::from_secs(10),
             capture_path: None,
+            artifact_dir: None,
         };
 
         while let Some(flag) = args.next() {
@@ -95,6 +100,13 @@ impl Args {
                             .ok_or_else(|| anyhow::anyhow!("--capture requires a path"))?,
                     );
                 }
+                "--artifact-dir" => {
+                    parsed.artifact_dir = Some(
+                        args.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| anyhow::anyhow!("--artifact-dir requires a path"))?,
+                    );
+                }
                 other => anyhow::bail!("unknown argument {other:?}"),
             }
         }
@@ -105,18 +117,26 @@ impl Args {
 
 fn usage() {
     eprintln!(
-        "usage: bench_pipeline <local-core|local-distribution|target-rx|target-failover-recovery|target-persistence> [--config config.toml] [--packets N] [--duration-sec N] [--capture file.pcap]"
+        "usage: bench_pipeline <local-core|local-distribution|rx-proof|target-rx|target-failover-recovery|target-persistence> [--config config.toml] [--packets N] [--duration-sec N] [--capture file.pcap] [--artifact-dir dir]"
     );
 }
 
-fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
-    let profile = if distribution {
-        "local-distribution"
-    } else {
-        "local-core"
-    };
+fn run_local_pipeline(
+    args: &Args,
+    profile: &'static str,
+    distribution: bool,
+    proof_mode: bool,
+) -> anyhow::Result<()> {
     let cfg = fixture_config(args.packets);
     let payloads = load_payloads(args, cfg)?;
+    let parser = default_eobi_parser()?;
+    let seq_extractor = parser.seq_extractor();
+    let expected = if proof_mode {
+        let ordered_payloads = payloads_in_sequence_order(&payloads, seq_extractor.as_ref());
+        Some(expected_eobi_replay(cfg, &ordered_payloads))
+    } else {
+        None
+    };
     let packet_count = payloads.len().max(1);
     let max_packet_size = payloads
         .iter()
@@ -160,8 +180,6 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
             })?
     };
 
-    let parser = default_eobi_parser()?;
-    let seq_extractor = parser.seq_extractor();
     for (idx, payload) in payloads.iter().enumerate() {
         let seq = seq_extractor
             .extract_seq(payload)
@@ -176,12 +194,18 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
         }
     }
 
-    let bus = distribution.then(|| Bus::new(packet_count + 1024));
+    let bus = (distribution || proof_mode).then(|| Bus::new(packet_count + 1024));
     let publisher = bus.as_ref().map(Bus::publisher);
     let mut book = benchmark_order_book(cfg);
+    let mut proof_journal = if proof_mode {
+        Some(ProofJournal::create(profile)?)
+    } else {
+        None
+    };
     let mut events = Vec::with_capacity(128);
     let mut seen = SequenceStats::default();
     let mut decoded_events = 0usize;
+    let mut decoder_sequence_gap_events = 0usize;
     let mut event_vec_reallocs = 0usize;
     let start = Instant::now();
     let deadline = start + Duration::from_secs(10);
@@ -215,7 +239,10 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
             }
             decoded_events += events.len();
 
-            for event in &events {
+            for (event_index, event) in events.iter().enumerate() {
+                if matches!(event, Event::SequenceGap { .. }) {
+                    decoder_sequence_gap_events += 1;
+                }
                 let instr_before_apply = match *event {
                     Event::Mod { order_id, .. }
                     | Event::Del { order_id }
@@ -223,6 +250,13 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
                     _ => None,
                 };
                 book.apply(event);
+                if let Some(proof_journal) = proof_journal.as_mut() {
+                    proof_journal.append(
+                        pkt.seq,
+                        u16::try_from(event_index).unwrap_or(u16::MAX),
+                        event,
+                    )?;
+                }
                 if let Some(publisher) = &publisher {
                     publish_obo_event(publisher, &book, instr_before_apply, event);
                 }
@@ -239,21 +273,60 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
 
     let elapsed = start.elapsed();
     let pool_available = pool.available();
+    let state_hash = book.state_hash();
+    let journal_proof = if let Some(proof_journal) = proof_journal.take() {
+        Some(proof_journal.finish_and_replay(cfg)?)
+    } else {
+        None
+    };
+    let expected_hash_match = expected
+        .as_ref()
+        .map(|expected| {
+            expected.state_hash == state_hash
+                && expected.events == decoded_events
+                && expected.sequence_gap_events == decoder_sequence_gap_events
+        })
+        .unwrap_or(true);
+    let journal_hash_match = journal_proof
+        .as_ref()
+        .map(|journal| {
+            journal.matched
+                && journal.final_hash == state_hash
+                && journal.non_monotonic_sequences == 0
+        })
+        .unwrap_or(true);
+    let obo_frames = publisher
+        .as_ref()
+        .map(Publisher::next_global_sequence)
+        .unwrap_or(0);
+    let proof_ok = if proof_mode {
+        expected_hash_match
+            && journal_hash_match
+            && decoder_sequence_gap_events == 0
+            && obo_frames > 0
+    } else {
+        true
+    };
     let status = if seen.sequence_gaps == 0
         && seen.duplicate_or_ooo == 0
         && event_vec_reallocs == 0
         && pool_available == pool_size
         && decoded_events > 0
+        && proof_ok
     {
         "ok"
     } else {
         "fail"
     };
-    let fields = report_fields(profile, status, None, None, "software", "synthetic")
+    let mut fields = report_fields(profile, status, None, None, "software", "synthetic")
         .into_iter()
         .chain([
             ("packets".to_string(), seen.forwarded.to_string()),
             ("events".to_string(), decoded_events.to_string()),
+            (
+                "decoder_sequence_gap_events".to_string(),
+                decoder_sequence_gap_events.to_string(),
+            ),
             ("elapsed_ms".to_string(), millis(elapsed)),
             ("throughput_mpps".to_string(), mpps(seen.forwarded, elapsed)),
             ("sequence_gaps".to_string(), seen.sequence_gaps.to_string()),
@@ -265,29 +338,69 @@ fn run_local_pipeline(args: &Args, distribution: bool) -> anyhow::Result<()> {
             ("pool_available".to_string(), pool_available.to_string()),
             ("pool_size".to_string(), pool_size.to_string()),
             ("live_orders".to_string(), book.order_count().to_string()),
-            ("state_hash".to_string(), book.state_hash().to_string()),
-            (
-                "obo_frames".to_string(),
-                publisher
-                    .as_ref()
-                    .map(Publisher::next_global_sequence)
-                    .unwrap_or(0)
-                    .to_string(),
-            ),
+            ("state_hash".to_string(), state_hash.to_string()),
+            ("obo_frames".to_string(), obo_frames.to_string()),
         ])
         .collect::<Vec<_>>();
-    println!("{}", format_kv_line(fields));
+    fields.extend(input_metadata(args));
+    if let Some(expected) = expected {
+        fields.extend([
+            ("expected_packets".to_string(), expected.packets.to_string()),
+            ("expected_events".to_string(), expected.events.to_string()),
+            (
+                "expected_sequence_gap_events".to_string(),
+                expected.sequence_gap_events.to_string(),
+            ),
+            (
+                "expected_state_hash".to_string(),
+                expected.state_hash.to_string(),
+            ),
+            (
+                "expected_live_orders".to_string(),
+                expected.live_orders.to_string(),
+            ),
+            (
+                "expected_hash_match".to_string(),
+                expected_hash_match.to_string(),
+            ),
+        ]);
+    }
+    if let Some(journal) = &journal_proof {
+        fields.extend([
+            ("journal_records".to_string(), journal.records.to_string()),
+            ("journal_bytes".to_string(), journal.bytes.to_string()),
+            (
+                "journal_final_hash".to_string(),
+                journal.final_hash.to_string(),
+            ),
+            (
+                "journal_non_monotonic_sequences".to_string(),
+                journal.non_monotonic_sequences.to_string(),
+            ),
+            ("journal_matched".to_string(), journal.matched.to_string()),
+            (
+                "journal_hash_match".to_string(),
+                journal_hash_match.to_string(),
+            ),
+        ]);
+    }
+    let proof_lines =
+        local_proof_lines(proof_mode, expected_hash_match, journal_hash_match, &fields);
+    emit_report(args, profile, fields, proof_lines)?;
 
     if status != "ok" {
         anyhow::bail!(
-            "{} failed: sequence_gaps={} dup_or_ooo={} event_vec_reallocs={} pool_available={}/{} decoded_events={}",
+            "{} failed: sequence_gaps={} dup_or_ooo={} event_vec_reallocs={} pool_available={}/{} decoded_events={} expected_hash_match={} journal_hash_match={} decoder_sequence_gap_events={}",
             profile,
             seen.sequence_gaps,
             seen.duplicate_or_ooo,
             event_vec_reallocs,
             pool_available,
             pool_size,
-            decoded_events
+            decoded_events,
+            expected_hash_match,
+            journal_hash_match,
+            decoder_sequence_gap_events
         );
     }
     Ok(())
@@ -311,6 +424,141 @@ fn load_payloads(args: &Args, cfg: FixtureConfig) -> anyhow::Result<Vec<Vec<u8>>
     } else {
         Ok(BenchmarkFixtures::new(cfg).eobi_packets)
     }
+}
+
+fn input_metadata(args: &Args) -> Vec<(String, String)> {
+    if let Some(path) = &args.capture_path {
+        let capture_hash = fs::read(path)
+            .map(|bytes| stable_config_hash(&bytes))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        vec![
+            ("input_source".to_string(), "capture".to_string()),
+            ("capture_path".to_string(), path.display().to_string()),
+            ("capture_hash".to_string(), capture_hash),
+        ]
+    } else {
+        vec![("input_source".to_string(), "synthetic".to_string())]
+    }
+}
+
+fn payloads_in_sequence_order(
+    payloads: &[Vec<u8>],
+    seq_extractor: &dyn SeqExtractor,
+) -> Vec<Vec<u8>> {
+    let mut indexed = payloads
+        .iter()
+        .enumerate()
+        .map(|(idx, payload)| {
+            (
+                seq_extractor
+                    .extract_seq(payload)
+                    .unwrap_or(idx as u64 + 1)
+                    .max(1),
+                idx,
+                payload.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    indexed.sort_by_key(|(seq, idx, _)| (*seq, *idx));
+    indexed.into_iter().map(|(_, _, payload)| payload).collect()
+}
+
+#[derive(Debug)]
+struct JournalProof {
+    records: usize,
+    bytes: u64,
+    final_hash: u64,
+    non_monotonic_sequences: usize,
+    matched: bool,
+}
+
+struct ProofJournal {
+    dir: PathBuf,
+    path: PathBuf,
+    writer: BufWriter<File>,
+    records: usize,
+}
+
+impl ProofJournal {
+    fn create(profile: &str) -> anyhow::Result<Self> {
+        let dir = std::env::temp_dir().join(format!(
+            "numi-orderbook-{}-{}-{}",
+            sanitize_component(profile),
+            std::process::id(),
+            now_nanos()
+        ));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("proof.journal");
+        let writer = BufWriter::new(File::create(&path)?);
+        Ok(Self {
+            dir,
+            path,
+            writer,
+            records: 0,
+        })
+    }
+
+    fn append(&mut self, seq: u64, event_index: u16, event: &Event) -> anyhow::Result<()> {
+        append_record(
+            &mut self.writer,
+            &JournalRecord::new_at(seq, event_index, event, None),
+        )?;
+        self.records += 1;
+        Ok(())
+    }
+
+    fn finish_and_replay(mut self, cfg: FixtureConfig) -> anyhow::Result<JournalProof> {
+        self.writer.flush()?;
+        drop(self.writer);
+
+        let bytes = fs::metadata(&self.path)?.len();
+        let mut replayed = benchmark_order_book(cfg);
+        let mut reader = BufReader::new(File::open(&self.path)?);
+        let report = replay_reader(&mut reader, &mut replayed)?;
+        let proof = JournalProof {
+            records: self.records,
+            bytes,
+            final_hash: report.final_hash,
+            non_monotonic_sequences: report.non_monotonic_sequences,
+            matched: report.matched,
+        };
+
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.dir);
+        Ok(proof)
+    }
+}
+
+fn local_proof_lines(
+    proof_mode: bool,
+    expected_hash_match: bool,
+    journal_hash_match: bool,
+    fields: &[(String, String)],
+) -> Vec<String> {
+    if !proof_mode {
+        return vec!["proof_scope=local_smoke".to_string()];
+    }
+
+    vec![
+        "proof_scope=rx_pool_merge_eobi_decode_book_obo_journal".to_string(),
+        format!(
+            "wire_replay_hash_match={} state_hash={} expected_state_hash={}",
+            expected_hash_match,
+            field_value(fields, "state_hash").unwrap_or("missing"),
+            field_value(fields, "expected_state_hash").unwrap_or("missing")
+        ),
+        format!(
+            "journal_replay_hash_match={} journal_final_hash={} journal_records={}",
+            journal_hash_match,
+            field_value(fields, "journal_final_hash").unwrap_or("missing"),
+            field_value(fields, "journal_records").unwrap_or("missing")
+        ),
+        format!(
+            "venue_sequence_gap_events={} obo_frames={}",
+            field_value(fields, "decoder_sequence_gap_events").unwrap_or("missing"),
+            field_value(fields, "obo_frames").unwrap_or("missing")
+        ),
+    ]
 }
 
 fn run_target_rx(args: &Args) -> anyhow::Result<()> {
@@ -426,7 +674,12 @@ fn run_target_rx(args: &Args) -> anyhow::Result<()> {
         ("pool_available".to_string(), pool.available().to_string()),
     ])
     .collect::<Vec<_>>();
-    println!("{}", format_kv_line(fields));
+    emit_report(
+        args,
+        "target-rx",
+        fields,
+        vec!["proof_scope=target_udp_rx".to_string()],
+    )?;
 
     if status != "ok" {
         anyhow::bail!(
@@ -556,7 +809,12 @@ fn run_target_failover_recovery(args: &Args) -> anyhow::Result<()> {
         ("pool_size".to_string(), pool_size.to_string()),
     ])
     .collect::<Vec<_>>();
-    println!("{}", format_kv_line(fields));
+    emit_report(
+        args,
+        "target-failover-recovery",
+        fields,
+        vec!["proof_scope=merge_failover_gap_replay".to_string()],
+    )?;
 
     if status != "ok" {
         anyhow::bail!("target-failover-recovery failed");
@@ -644,7 +902,12 @@ fn run_target_persistence(args: &Args) -> anyhow::Result<()> {
         ("restored_hash".to_string(), restored_hash.to_string()),
     ])
     .collect::<Vec<_>>();
-    println!("{}", format_kv_line(fields));
+    emit_report(
+        args,
+        "target-persistence",
+        fields,
+        vec!["proof_scope=snapshot_journal_restart".to_string()],
+    )?;
 
     if status != "ok" {
         anyhow::bail!("target-persistence failed");
@@ -917,12 +1180,14 @@ fn report_fields(
         .map(stable_config_hash)
         .unwrap_or_else(|| "synthetic".to_string());
     vec![
+        ("report_schema".to_string(), "bench_pipeline.v1".to_string()),
         ("profile".to_string(), profile.to_string()),
         ("status".to_string(), status.to_string()),
         (
             "git_sha".to_string(),
             command_output("git", &["rev-parse", "--short=12", "HEAD"]).unwrap_or("unknown".into()),
         ),
+        ("git_dirty".to_string(), git_dirty().to_string()),
         (
             "rustc".to_string(),
             command_output("rustc", &["--version"]).unwrap_or("unknown".into()),
@@ -949,12 +1214,114 @@ fn report_fields(
     ]
 }
 
+fn emit_report(
+    args: &Args,
+    profile: &str,
+    mut fields: Vec<(String, String)>,
+    proof_lines: Vec<String>,
+) -> anyhow::Result<()> {
+    if let Some(root) = &args.artifact_dir {
+        let git_sha = field_value(&fields, "git_sha")
+            .unwrap_or("unknown")
+            .to_string();
+        let dir = root.join(format!(
+            "{}-{}-{}",
+            sanitize_component(profile),
+            now_nanos(),
+            sanitize_component(&git_sha)
+        ));
+        fs::create_dir_all(&dir)?;
+        fields.push(("artifact_dir".to_string(), dir.display().to_string()));
+        write_artifact_files(&dir, &fields, &proof_lines)?;
+    }
+
+    println!("{}", format_kv_line(fields));
+    Ok(())
+}
+
+fn write_artifact_files(
+    dir: &Path,
+    fields: &[(String, String)],
+    proof_lines: &[String],
+) -> anyhow::Result<()> {
+    let summary = format_kv_line(
+        fields
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    fs::write(dir.join("summary.kv"), format!("{summary}\n"))?;
+
+    let manifest = format_kv_line([
+        ("artifact_schema", "bench_pipeline_artifact.v1".to_string()),
+        (
+            "profile",
+            field_value(fields, "profile")
+                .unwrap_or("unknown")
+                .to_string(),
+        ),
+        (
+            "status",
+            field_value(fields, "status")
+                .unwrap_or("unknown")
+                .to_string(),
+        ),
+        (
+            "git_sha",
+            field_value(fields, "git_sha")
+                .unwrap_or("unknown")
+                .to_string(),
+        ),
+        (
+            "git_dirty",
+            field_value(fields, "git_dirty")
+                .unwrap_or("unknown")
+                .to_string(),
+        ),
+        ("created_ns", now_nanos().to_string()),
+    ]);
+    fs::write(dir.join("manifest.kv"), format!("{manifest}\n"))?;
+
+    let mut proof = String::new();
+    for line in proof_lines {
+        proof.push_str(line);
+        proof.push('\n');
+    }
+    fs::write(dir.join("proof.txt"), proof)?;
+    Ok(())
+}
+
+fn field_value<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(field_key, _)| field_key == key)
+        .map(|(_, value)| value.as_str())
+}
+
+fn sanitize_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_dirty() -> bool {
+    command_output("git", &["status", "--porcelain"])
+        .map(|status| !status.is_empty())
+        .unwrap_or(true)
 }
 
 fn allocator_label() -> &'static str {
