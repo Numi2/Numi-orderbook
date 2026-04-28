@@ -205,7 +205,14 @@ cargo run --release --bin absorption_sidecar -- \
 The sidecar emits each signal as tagged JSON and exposes:
 
 - `GET /stats`: frames, duplicates, parse errors, connection attempts, and
-  per-signal counters.
+  per-signal counters, including a diagnostics snapshot.
+- `GET /diagnostics`: session signal diagnostics: counts, max/average score,
+  top scoring components, first/last signal timestamps, and a conservative
+  regime label (`balance`, `absorption`, `spoof_risk`, or `initiative_flow`).
+- `GET /features`: latest z-scored microstructure feature snapshot per
+  instrument when the sidecar is started with `--enable-features`, including
+  book imbalance, OFI, touch activity, volume, momentum, slope, and day-of-week
+  context.
 - `GET /signals`: recent retained participant signals.
 - `GET /signals/absorption`: recent absorption signals.
 - `GET /signals/iceberg`: recent iceberg/replenishment candidates.
@@ -225,7 +232,17 @@ Validate each signal family against the same recording:
 cargo run --release --bin absorption_replay -- /tmp/numi-obo.frames
 cargo run --release --bin iceberg_replay -- /tmp/numi-obo.frames
 cargo run --release --bin liquidity_pull_replay -- /tmp/numi-obo.frames
+cargo run --release --bin participant_replay -- /tmp/numi-obo.frames
 ```
+
+`participant_replay` runs all participant detectors together and is the
+backtest-oriented path for the combined session diagnostics and regime label.
+
+Feature collection is disabled by default on the sidecar hot path. Start with
+`--enable-features` to populate `/features`. Feature z-score baselines are
+per-instrument EWMA normalizers in the sidecar; use `--feature-depth-levels`,
+`--feature-z-alpha`, `--feature-z-min-samples`, and `--feature-z-clip` to tune
+the sampled depth and normalization behavior.
 
 The signal definitions, evidence fields, thresholds, and interpretation limits
 are documented in [`docs/participant_insights.md`](docs/participant_insights.md).

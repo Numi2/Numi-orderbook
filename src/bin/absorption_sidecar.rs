@@ -2,17 +2,19 @@ use anyhow::Context;
 use crossbeam_channel::{bounded, Sender};
 use orderbook::insights::{
     parse_obo_frame, AbsorptionConfig, AbsorptionDetector, IcebergConfig, IcebergDetector,
-    LiquidityPullConfig, LiquidityPullDetector, OboLiveDedupe, ParticipantSignal,
+    LiquidityPullConfig, LiquidityPullDetector, MicrostructureFeatureConfig,
+    MicrostructureFeatureEngine, MicrostructureFeatureSnapshot, OboLiveDedupe, ParticipantSignal,
+    SignalDiagnostics, SignalDiagnosticsAccumulator, SignalOutcomeSummary, SignalOutcomeTracker,
 };
 use orderbook::util::now_nanos;
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tungstenite::Message;
 
 const DEFAULT_LISTEN: &str = "127.0.0.1:9201";
@@ -31,11 +33,17 @@ struct Args {
     absorption: AbsorptionConfig,
     iceberg: IcebergConfig,
     liquidity_pull: LiquidityPullConfig,
+    collect_features: bool,
+    features: MicrostructureFeatureConfig,
 }
 
 #[derive(Debug)]
 struct SidecarState {
     retain_signals: usize,
+    absorption: AbsorptionConfig,
+    iceberg: IcebergConfig,
+    liquidity_pull: LiquidityPullConfig,
+    collect_features: bool,
     started_at_ns: u64,
     frames_received: u64,
     control_frames: u64,
@@ -49,10 +57,15 @@ struct SidecarState {
     connection_attempts: u64,
     websocket_errors: u64,
     record_write_errors: u64,
+    feature_snapshots: u64,
     last_frame_ns: Option<u64>,
     last_signal_ns: Option<u64>,
+    last_feature_ns: Option<u64>,
     last_error: Option<String>,
     recent_signals: VecDeque<ParticipantSignal>,
+    diagnostics: SignalDiagnosticsAccumulator,
+    outcomes: SignalOutcomeTracker,
+    latest_features: HashMap<u64, MicrostructureFeatureSnapshot>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,15 +83,33 @@ struct StatsResponse {
     connection_attempts: u64,
     websocket_errors: u64,
     record_write_errors: u64,
+    feature_collection_enabled: bool,
+    feature_snapshots: u64,
+    feature_instruments: usize,
     last_frame_ns: Option<u64>,
     last_signal_ns: Option<u64>,
+    last_feature_ns: Option<u64>,
     recent_signal_count: usize,
+    diagnostics: SignalDiagnostics,
+    outcomes: SignalOutcomeSummary,
     last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 struct SignalsResponse {
     signals: Vec<ParticipantSignal>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeaturesResponse {
+    feature_collection_enabled: bool,
+    features: Vec<MicrostructureFeatureSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutcomesResponse {
+    feature_collection_enabled: bool,
+    outcomes: SignalOutcomeSummary,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,7 +122,13 @@ enum SignalKindFilter {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse()?;
-    let state = Arc::new(Mutex::new(SidecarState::new(args.retain_signals)));
+    let state = Arc::new(Mutex::new(SidecarState::new(
+        args.retain_signals,
+        args.absorption,
+        args.iceberg,
+        args.liquidity_pull,
+        args.collect_features,
+    )));
     let _api = spawn_http(args.listen.clone(), state.clone())?;
     let (tx, rx) = bounded::<Vec<u8>>(FRAME_QUEUE_CAPACITY);
 
@@ -109,6 +146,9 @@ fn main() -> anyhow::Result<()> {
     let mut absorption_detector = AbsorptionDetector::new(args.absorption);
     let mut iceberg_detector = IcebergDetector::new(args.iceberg);
     let mut liquidity_pull_detector = LiquidityPullDetector::new(args.liquidity_pull);
+    let mut feature_engine = args
+        .collect_features
+        .then(|| MicrostructureFeatureEngine::new(args.features));
     let mut dedupe = OboLiveDedupe::new();
     let mut recorder = match args.record_frames {
         Some(path) => {
@@ -138,6 +178,7 @@ fn main() -> anyhow::Result<()> {
             &mut absorption_detector,
             &mut iceberg_detector,
             &mut liquidity_pull_detector,
+            &mut feature_engine,
             &mut dedupe,
             state.as_ref(),
         );
@@ -157,6 +198,8 @@ impl Args {
             absorption: AbsorptionConfig::default(),
             iceberg: IcebergConfig::default(),
             liquidity_pull: LiquidityPullConfig::default(),
+            collect_features: false,
+            features: MicrostructureFeatureConfig::default(),
         };
 
         let mut args = std::env::args().skip(1);
@@ -175,6 +218,20 @@ impl Args {
                 "--record-frames" => {
                     parsed.record_frames =
                         Some(PathBuf::from(next_value(&mut args, "--record-frames")?))
+                }
+                "--enable-features" => parsed.collect_features = true,
+                "--feature-depth-levels" => {
+                    parsed.features.depth_levels = parse_next(&mut args, "--feature-depth-levels")?
+                }
+                "--feature-z-alpha" => {
+                    parsed.features.z_alpha = parse_next(&mut args, "--feature-z-alpha")?
+                }
+                "--feature-z-min-samples" => {
+                    parsed.features.z_min_samples =
+                        parse_next(&mut args, "--feature-z-min-samples")?
+                }
+                "--feature-z-clip" => {
+                    parsed.features.z_clip = parse_next(&mut args, "--feature-z-clip")?
                 }
                 "--window-ms" => {
                     parsed.absorption.window_ns =
@@ -300,7 +357,13 @@ options:\n\
   --listen ADDR                         HTTP API bind address (default {DEFAULT_LISTEN})\n\
   --auth-token TOKEN                    bearer token for upstream WebSocket feeds\n\
   --retain-signals N                    recent signals retained by /signals (default {DEFAULT_RETAIN_SIGNALS})\n\
-  --record-frames PATH                  write length-prefixed raw-v1 frames for absorption_replay\n\
+  --record-frames PATH                  write length-prefixed raw-v1 frames for replay tools\n\
+  feature snapshots:\n\
+  --enable-features                     collect latest /features snapshots (disabled by default)\n\
+  --feature-depth-levels N              book levels used by weighted imbalance/slope (default 10)\n\
+  --feature-z-alpha X                   EWMA alpha for feature z-score baselines (default 0.01)\n\
+  --feature-z-min-samples N             samples before z-scores activate (default 30)\n\
+  --feature-z-clip X                    absolute z-score clamp (default 20)\n\
   absorption thresholds:\n\
   --window-ms N                         rolling observation window\n\
   --min-executed-qty N                  minimum executed quantity\n\
@@ -435,6 +498,7 @@ fn process_frame(
     absorption_detector: &mut AbsorptionDetector,
     iceberg_detector: &mut IcebergDetector,
     liquidity_pull_detector: &mut LiquidityPullDetector,
+    feature_engine: &mut Option<MicrostructureFeatureEngine>,
     dedupe: &mut OboLiveDedupe,
     state: &Mutex<SidecarState>,
 ) {
@@ -454,26 +518,44 @@ fn process_frame(
             with_state(state, |s| {
                 s.parsed_events = s.parsed_events.saturating_add(1);
             });
+            let feature_snapshot = feature_engine.as_mut().and_then(|feature_engine| {
+                feature_engine.observe_parsed(&parsed, current_unix_time_nanos())
+            });
+            if let Some(snapshot) = feature_snapshot.as_ref() {
+                record_feature_snapshot(snapshot.clone(), state);
+            }
             if let Some(signal) = absorption_detector.observe_obo(
                 parsed.send_time_ns,
                 parsed.instrument_id,
                 parsed.event,
             ) {
-                emit_signal(ParticipantSignal::Absorption(signal), state);
+                emit_signal(
+                    ParticipantSignal::Absorption(signal),
+                    feature_snapshot.as_ref(),
+                    state,
+                );
             }
             if let Some(signal) = iceberg_detector.observe_obo(
                 parsed.send_time_ns,
                 parsed.instrument_id,
                 parsed.event,
             ) {
-                emit_signal(ParticipantSignal::Iceberg(signal), state);
+                emit_signal(
+                    ParticipantSignal::Iceberg(signal),
+                    feature_snapshot.as_ref(),
+                    state,
+                );
             }
             if let Some(signal) = liquidity_pull_detector.observe_obo(
                 parsed.send_time_ns,
                 parsed.instrument_id,
                 parsed.event,
             ) {
-                emit_signal(ParticipantSignal::LiquidityPull(signal), state);
+                emit_signal(
+                    ParticipantSignal::LiquidityPull(signal),
+                    feature_snapshot.as_ref(),
+                    state,
+                );
             }
         }
         Ok(None) => {
@@ -490,11 +572,24 @@ fn process_frame(
     }
 }
 
-fn emit_signal(signal: ParticipantSignal, state: &Mutex<SidecarState>) {
+fn emit_signal(
+    signal: ParticipantSignal,
+    snapshot: Option<&MicrostructureFeatureSnapshot>,
+    state: &Mutex<SidecarState>,
+) {
     if let Ok(line) = serde_json::to_string(&signal) {
         println!("{line}");
     }
-    with_state(state, |s| s.push_signal(signal));
+    with_state(state, |s| s.push_signal(signal, snapshot));
+}
+
+fn record_feature_snapshot(snapshot: MicrostructureFeatureSnapshot, state: &Mutex<SidecarState>) {
+    with_state(state, |s| s.push_feature_snapshot(snapshot));
+}
+
+fn current_unix_time_nanos() -> Option<u64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(duration.as_nanos()).ok()
 }
 
 fn spawn_http(
@@ -517,7 +612,7 @@ fn respond(req: tiny_http::Request, state: &Mutex<SidecarState>) {
     let path = req.url().split('?').next().unwrap_or(req.url());
     match path {
         "/" => {
-            let body = "endpoints: /healthz /ready /stats /signals /signals/absorption /signals/iceberg /signals/liquidity_pull\n";
+            let body = "endpoints: /healthz /ready /stats /diagnostics /outcomes /features /signals /signals/absorption /signals/iceberg /signals/liquidity_pull\n";
             let _ = req.respond(tiny_http::Response::from_string(body).with_status_code(200));
         }
         "/healthz" => {
@@ -532,6 +627,18 @@ fn respond(req: tiny_http::Request, state: &Mutex<SidecarState>) {
         "/stats" => {
             let stats = with_state_result(state, SidecarState::stats);
             let _ = req.respond(json_response(&stats));
+        }
+        "/diagnostics" => {
+            let diagnostics = with_state_result(state, SidecarState::diagnostics);
+            let _ = req.respond(json_response(&diagnostics));
+        }
+        "/outcomes" => {
+            let outcomes = with_state_result(state, SidecarState::outcomes_response);
+            let _ = req.respond(json_response(&outcomes));
+        }
+        "/features" => {
+            let features = with_state_result(state, SidecarState::features_response);
+            let _ = req.respond(json_response(&features));
         }
         "/signals" => {
             let signals = with_state_result(state, |s| s.signals(None));
@@ -567,9 +674,19 @@ fn json_response<T: Serialize>(value: &T) -> tiny_http::Response<std::io::Cursor
 }
 
 impl SidecarState {
-    fn new(retain_signals: usize) -> Self {
+    fn new(
+        retain_signals: usize,
+        absorption: AbsorptionConfig,
+        iceberg: IcebergConfig,
+        liquidity_pull: LiquidityPullConfig,
+        collect_features: bool,
+    ) -> Self {
         Self {
             retain_signals,
+            absorption,
+            iceberg,
+            liquidity_pull,
+            collect_features,
             started_at_ns: now_nanos(),
             frames_received: 0,
             control_frames: 0,
@@ -583,14 +700,23 @@ impl SidecarState {
             connection_attempts: 0,
             websocket_errors: 0,
             record_write_errors: 0,
+            feature_snapshots: 0,
             last_frame_ns: None,
             last_signal_ns: None,
+            last_feature_ns: None,
             last_error: None,
             recent_signals: VecDeque::with_capacity(retain_signals),
+            diagnostics: SignalDiagnosticsAccumulator::default(),
+            outcomes: SignalOutcomeTracker::default(),
+            latest_features: HashMap::new(),
         }
     }
 
-    fn push_signal(&mut self, signal: ParticipantSignal) {
+    fn push_signal(
+        &mut self,
+        signal: ParticipantSignal,
+        snapshot: Option<&MicrostructureFeatureSnapshot>,
+    ) {
         self.signals_emitted = self.signals_emitted.saturating_add(1);
         match &signal {
             ParticipantSignal::Absorption(_) => {
@@ -603,11 +729,28 @@ impl SidecarState {
                 self.liquidity_pull_signals = self.liquidity_pull_signals.saturating_add(1)
             }
         }
+        self.diagnostics.record_signal(
+            &signal,
+            &self.absorption,
+            &self.iceberg,
+            &self.liquidity_pull,
+        );
+        if let Some(snapshot) = snapshot {
+            self.outcomes.track_signal(&signal, snapshot);
+        }
         self.last_signal_ns = Some(signal.window_end_ns());
         if self.recent_signals.len() == self.retain_signals {
             self.recent_signals.pop_front();
         }
         self.recent_signals.push_back(signal);
+    }
+
+    fn push_feature_snapshot(&mut self, snapshot: MicrostructureFeatureSnapshot) {
+        self.feature_snapshots = self.feature_snapshots.saturating_add(1);
+        self.last_feature_ns = Some(snapshot.ts_ns);
+        self.outcomes.observe_snapshot(&snapshot);
+        self.latest_features
+            .insert(snapshot.instrument_id, snapshot);
     }
 
     fn stats(&self) -> StatsResponse {
@@ -625,10 +768,36 @@ impl SidecarState {
             connection_attempts: self.connection_attempts,
             websocket_errors: self.websocket_errors,
             record_write_errors: self.record_write_errors,
+            feature_collection_enabled: self.collect_features,
+            feature_snapshots: self.feature_snapshots,
+            feature_instruments: self.latest_features.len(),
             last_frame_ns: self.last_frame_ns,
             last_signal_ns: self.last_signal_ns,
+            last_feature_ns: self.last_feature_ns,
             recent_signal_count: self.recent_signals.len(),
+            diagnostics: self.diagnostics.snapshot(),
+            outcomes: self.outcomes.snapshot(),
             last_error: self.last_error.clone(),
+        }
+    }
+
+    fn diagnostics(&self) -> SignalDiagnostics {
+        self.diagnostics.snapshot()
+    }
+
+    fn outcomes_response(&self) -> OutcomesResponse {
+        OutcomesResponse {
+            feature_collection_enabled: self.collect_features,
+            outcomes: self.outcomes.snapshot(),
+        }
+    }
+
+    fn features_response(&self) -> FeaturesResponse {
+        let mut features = self.latest_features.values().cloned().collect::<Vec<_>>();
+        features.sort_by_key(|snapshot| snapshot.instrument_id);
+        FeaturesResponse {
+            feature_collection_enabled: self.collect_features,
+            features,
         }
     }
 

@@ -161,11 +161,69 @@ and serves:
 - `GET /healthz`: process liveness.
 - `GET /ready`: ready after at least one upstream frame has been received.
 - `GET /stats`: counters for frames, parsed events, duplicates, parse errors,
-  connection attempts, and emitted signals.
+  connection attempts, emitted signals, and a diagnostics snapshot.
+- `GET /diagnostics`: session-level signal health and regime diagnostics:
+  signal counts, max/average score, first/last signal timestamps, and top
+  scoring components by total contribution.
+- `GET /features`: latest z-scored microstructure feature snapshot per
+  instrument when the sidecar is started with `--enable-features`, including
+  book imbalance, OFI, touch activity, volume, momentum, slope, and day-of-week
+  context.
 - `GET /signals`: recent retained participant signals.
 - `GET /signals/absorption`: recent retained absorption signals.
 - `GET /signals/iceberg`: recent retained iceberg/replenishment candidates.
 - `GET /signals/liquidity_pull`: recent retained liquidity pull candidates.
+
+The diagnostics regime is intentionally conservative:
+
+- `balance`: no participant insight signals have fired for the retained session.
+- `absorption`: absorption or iceberg/replenishment evidence dominates.
+- `spoof_risk`: liquidity-pull signals dominate with high score. This is a risk
+  label only; it does not claim illegal spoofing intent.
+- `initiative_flow`: signals are present, but neither passive absorption nor
+  liquidity-pull risk dominates.
+
+Microstructure Feature Snapshots
+--------------------------------
+
+`GET /features` returns the latest feature snapshot per instrument when feature
+collection is enabled with `--enable-features`. Feature collection is disabled by
+default to keep the sidecar hot path focused on signal detection. This feature
+engine reconstructs lightweight depth from the same raw-v1 OBO stream as the
+detectors. Snapshot `OBO_ADD` frames update book state but do not count as live
+order flow, so reconnect snapshots do not manufacture OFI, volume, or cancel
+pressure.
+
+Each snapshot includes raw values and z-scored fields. Z-scores use an online
+EWMA baseline per instrument and feature. Defaults are conservative: 10 book
+levels, EWMA alpha `0.01`, 30 warmup samples before non-zero z-scores, and an
+absolute z-score clamp of 20. Tune with `--feature-depth-levels`,
+`--feature-z-alpha`, `--feature-z-min-samples`, and `--feature-z-clip`.
+
+Feature definitions:
+
+- `depth3_imb_z`: z-score of `(top3_bid_qty - top3_ask_qty) /
+  (top3_bid_qty + top3_ask_qty)`.
+- `weighted_book_imb_z`: same shape as depth imbalance, but levels closer to
+  touch get larger weight.
+- `imbalance_l3_z`: z-score of the level-3-only bid/ask quantity imbalance.
+- `ask_sz_l1_z`: z-score of visible best-ask quantity.
+- `touch_depth_ratio_bid_z`: z-score of best-bid quantity divided by total
+  sampled bid depth.
+- `cancel_touch_bid_qty_15s_z`: z-score of live bid-touch cancel/reduce quantity
+  over 15 seconds.
+- `ofi_z`: z-score of 15-second order-flow imbalance. Bid additions and ask
+  removals are positive; ask additions and bid removals are negative.
+- `trade_cnt_imb_300s_z`: z-score of 300-second aggressive buy/sell trade count
+  imbalance.
+- `trade_touch_buy_qty_15s_z`: z-score of aggressive buy quantity executing at
+  the best ask over 15 seconds.
+- `trade_vol_120s_z` and `trade_vol_300s_z`: z-scores of traded quantity over
+  the named windows.
+- `mom_15s_z` and `mom_60s_z`: z-scores of mid-price change over the named
+  windows.
+- `slope_z`: z-score of near-touch liquidity density across sampled levels.
+- `dow_sin`: day-of-week sine from wall clock time. It is context, not z-scored.
 
 Use `--record-frames /path/to/absorption.frames` to write a replayable raw-v1
 frame recording. The file format is repeated little-endian `u32` frame length
@@ -190,6 +248,12 @@ Validate liquidity pulls on the same recording:
 
 ```bash
 cargo run --release --bin liquidity_pull_replay -- /path/to/absorption.frames
+```
+
+Run all participant detectors together and emit combined session diagnostics:
+
+```bash
+cargo run --release --bin participant_replay -- /path/to/absorption.frames
 ```
 
 Replay runs the same frame sequence through each detector twice, dedupes live
